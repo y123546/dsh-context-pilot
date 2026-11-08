@@ -7,12 +7,12 @@
 
 | 基础要求 | 现状 | 取证 / 处置 |
 | --- | --- | --- |
-| **公开 GitHub 仓库**（私有仓库爬不到） | ✅ 公开 | 匿名 API：`Invoke-WebRequest https://api.github.com/repos/Shuffle-1992/dsh-context-pilot` → `visibility: public`、`private: false` |
+| **公开 GitHub 仓库**（私有仓库爬不到） | ✅ 公开 | 匿名 API：`Invoke-WebRequest https://api.github.com/repos/y123546/dsh-context-pilot` → `visibility: public`、`private: false` |
 | **Topic `dsh-plugin`** | ✅ 已加 | 同上 API 的 `topics` 数组 |
 | **Topic `deepseek-harness`**（Cordis 插件建议） | ✅ 已加 | 同上 |
 | 附带：`cordis-plugin` / `context-compression` / `context-management` / `reasoning-effort` / `dsh` / `deepseek` / `llm-agent` | ✅ 共 9 个 | 同上 |
 | `dsh-skill` / `agent-skills` | ⛔ **不需要** | 这两个是 **Skill 包** 用的；本插件是 **Cordis Bundle**，加了反而误导 |
-| **README 有可直接复制的安装命令** | ✅ 已补（README「安装」段） | `dsh plugin --profile web add github:Shuffle-1992/dsh-context-pilot`（**git 规格**；本项目不分发 npm，见 §2） |
+| **README 有可直接复制的安装命令** | ✅ 已补（README「安装」段） | `dsh plugin --profile web add github:y123546/dsh-context-pilot`（**git 规格**；本项目不分发 npm，见 §2） |
 | **package.json 的 name / version 准确** | ✅ `dsh-context-pilot` / `0.1.50` | 根与 `plugin/` 两份清单同版本；与 git tag `v0.1.44` 一致 |
 | **Bundle 分发需 `dsh.bundle.patch`** | ✅ 根与 `plugin/` 两处都有，指向**同一份**生产 patch | 根 → `./plugin/cordis.patch.yml`；`plugin/package.json` → `./cordis.patch.yml` |
 | **许可证** | ✅ MIT（`LICENSE`） | 原仓库无 license 字段；如需换协议只改 `LICENSE` + 两处 `package.json` 的 `license` |
@@ -21,7 +21,7 @@
 **复核命令（匿名、只读，一条就够）**：
 
 ```powershell
-$j = (Invoke-WebRequest https://api.github.com/repos/Shuffle-1992/dsh-context-pilot -UseBasicParsing).Content | ConvertFrom-Json
+$j = (Invoke-WebRequest https://api.github.com/repos/y123546/dsh-context-pilot -UseBasicParsing).Content | ConvertFrom-Json
 $j | Select-Object full_name, private, visibility, license, homepage, topics
 ```
 

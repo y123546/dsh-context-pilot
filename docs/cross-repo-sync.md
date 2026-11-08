@@ -1,6 +1,6 @@
 # 两仓同构点与同步清单（D2）
 
-> **背景**：`dsh-context-pilot` 与 [`dsh-browser-kit`](https://github.com/Shuffle-1992/dsh-browser-kit)
+> **背景**：`dsh-context-pilot` 与 [`dsh-browser-kit`](https://github.com/y123546/dsh-browser-kit)
 > 都是 DSH 宿主侧插件，共享同一套「入口薄壳 + mtime 热换 + remote face 轮询」机制。
 > 因**各自独立部署**（profile Junction + 独立 client.js）且**无共享构建**，样板代码只能复制。
 >
