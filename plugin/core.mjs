@@ -1,0 +1,1073 @@
+/**
+ * dsh-context-pilot —— **core**（R14 解耦第六刀）：配置 / 状态 / 报告管线 / 工具函数。
+ *
+ * ## 为什么它必须由 entry 预加载后传进来（而不是像其它域那样在 apply 里动态 import）
+ * `state` / `log` / `svc` / `schedule` / `addListener` 都在 `apply()` 期**同步**使用；
+ * 而本项目的铁律是「相对模块必须用 `?ts=` 动态加载」（P16：静态相对导入会命中无参 URL 的进程缓存，
+ * 改代码不生效）。两者只能靠**调用方先加载**来同时满足 ⇒ entry.mjs 用同一个 `?ts=` 先加载本模块，
+ * 再作为第 4 个参数传给 `apply`。
+ *
+ * ## ⚠️ 部署约束（比其它刀都硬）
+ * entry.mjs 属「改它必须重启 DSH」的薄壳（cordis loader 经 ESM 缓存加载入口，toggle 不换新）。
+ * ⇒ **未重启前**，正在运行的旧 entry 不会传 core；宿主侧已做**降级不崩**（见 host.impl.mjs 顶部）。
+ *
+ * ## 它持有什么（按 R7 审计的「core 不可搬」清单）
+ * 纯函数（msg/pick/kfmt/nfmt/errCodeOf/remember/compactMeasure/summarizeBreakdown/messageText/
+ * extractEventText）、候选链加载器、`M3_DEFAULTS`、`state`、`mergeConfig`/`M3`/`effEnabled`、
+ * 报告管线（loadReportBase / writeReport / refresh / schedule）、`addListener`、createUserMessage 解析。
+ *
+ * ## 报告管线的「快照来源」是**后置注入**的
+ * `refresh` 需要产快照，而快照实现已抽进 plugin/m1.snapshot.mjs ⇒ 由宿主在 M1 接线完成后调
+ * `attachSnapshot({buildSnapshot, slimSnapshot, isSlimReason})`。未注入时用**最小快照 + FULL 档位**
+ * 兜底（宁可多写字段，也不要报告断档——R13 真事故就是这个形态）。
+ */
+import { mkdirSync, readFileSync, statSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+// B4（审查批次3）：wire 改为动态 import（见 M5 face 注册块）——静态相对导入解析回无参规范 URL
+// 命中进程缓存（P16），face 逻辑被冻结在重启版本；动态加载后 wire 随 impl 同批热换。
+
+const TAG = '[dsh-context-pilot]';
+const HISTORY_CAP = 120; // 报告 history 上限（防长期运行膨胀）
+const HEARTBEAT_MS = 120_000; // 心跳周期：跟踪会话出现与用量增长（回调内注册，见 apply 尾部注释）
+const SESSION_CAP = 50; // 单次快照最多测量的 Session 数
+/* 压缩调用超时（pre-step 兜底信号 / idle compactNow 共用）。
+ * ⚠️ 2026-10-08 R14 审计发现：它的**定义曾在 R11（M5 HUD 域搬迁）中被静默丢掉**（切块范围比预期宽），
+ * 而 m3.compact.mjs 从 R10 起就在用它 ⇒ **从 R11 激活起 M3 域加载失败**：
+ * 工具调用仍回 ok/scheduled，但 pre-step 里 m3Ctl 为 null ⇒ preStepCompaction 是 no-op
+ * ⇒ 意图永不消费、压缩永不发生；同一原因让 measureRatio 失败 ⇒ M2 用量行/决策卡也一起消失。
+ * 现在它住 core，由 host 解构后注入 M3；新增 boot 的「无模块加载失败」断言兜住这一类。 */
+const COMPACT_TIMEOUT_MS = 180_000;
+const SOURCE_KIND = 'context-pilot'; // 注入消息的 source.kind（投影/归属标记）
+const DSH_LLM_REL = ['dsh', 'node_modules', '@deepseek-ai', 'dsh-llm', 'lib', 'index.js'];
+/** R2：dsh-tools 的 defineTool（工具定义器）——与 dsh-llm 同款候选链加载。 */
+const DSH_TOOLS_REL = ['dsh', 'node_modules', '@deepseek-ai', 'dsh-tools', 'lib', 'index.js'];
+
+/**
+ * M3.5/M3.6 三通道默认参数（M4 起可被 bundle config 覆盖，apply 内合并）。设计原则（2026-10-06 用户澄清）：
+ * 决策发生在任务摄入时，决策主体是「模型语义判断」——插件只提供
+ * 读数（注入）、选项（政策卡）、执行（轮内先压/兜底）。场景映射：
+ *  - 场景1 任务与远端关联小 / 场景2 重任务需腾退 → 政策卡教模型写标记 → idle 后自动压缩（用户零输入）
+ *  - 场景3+ 中途/空闲越线 → criticalRatio 无条件兜底（pre-step pressure 路径 + idle compactNow）
+ *
+ * ⚠️ 默认值取舍 = 计费口径的函数（2026-10-06 官方文档 + 本机实测校准，模型详见 README §6「成本模型」）：
+ *  - DeepSeek API：命中 $0.003/M vs 未命中 $0.15/M（1:50）。285K 上下文里「重读上下文」只占单请求成本 **45%**
+ *    ⇒ 上下文规模化便宜，默认偏保守（少压、保信息，避免压缩导致返工）——markerMinRatio 0.30 偏高：
+ *      3 倍价格差才能换回一次多余压缩的代价。
+ *  - GLM Coding Plan：Cached 1.7 vs Input 6.9（1:4.1，**命中仍计费**）。同样 285K 下上下文占 **91%**
+ *    ⇒ 上下文是持续失血，压早直接换额度——建议 markerMinRatio 0.15–0.20。
+ *  - 阈值→成本弹性（实测增速 6.8K/段、压后回落 25K）：0.15→0.30 平均上下文 88K→163K，
+ *    单请求成本 DS 仅 +18% 而 GLM +69%。**同一组阈值在 GLM 上的钱效约为 DeepSeek 的 3.8 倍**。
+ *  ⚠️ 2026-10-07：决策卡门槛已并入 markerMinRatio（用户决定，消除「卡未教/标记不可达」死区），
+ *    故下面注释只提单一门槛。面板备注（client.js FIELDS[].hint）与 schema description 须同步。
+ */
+const M3_DEFAULTS = {
+  enabled: true,
+  /* 智能思考总门（2026-10-07 引入，R2 换工具方案，R3 移入 effort.mjs）。
+   * 开 = 向 Agent 注入思考强度信息 + 注册 set_reasoning_effort 工具允许其自主换档；
+   * 关 = 提示词不注入、工具不注册（用户定义：一个开关管两件事，不做只读/只写拆分）。
+   * 默认 false：新功能默认不介入，避免未确认行为改变既有会话（用户可随时在弹窗开启）。 */
+  effortEnabled: false,
+  /* 换档冷却（2026-10-08 起可配，R3-S7）：两次换档的最小间隔。
+   * 换档会使前缀缓存失效（dsh-llm call-config.js 标注 effort 属缓存敏感参数）⇒
+   * 这是**会实际影响计费**的参数，故开放配置；默认 30s 是实测「够用且不误挡」的折中。 */
+  effortCooldownMs: 30_000,
+  /* R94：模型在正文里声明换档但没调用工具时，插件按声明自动应用（面板可关，缺省开）。 */
+  effortAutoApply: true,
+  criticalRatio: 0.85, // 强制压缩线：pre-step/idle 无条件压（官方 pressure 路径）；GLM 等 1:4 档可降 0.80
+  markerMinRatio: 0.2, // 智能压缩线：**决策卡注入门槛**（2026-10-07 起与「模型可自行决定压缩」统一）
+  // policyCardMinRatio / highRatio / lightTaskChars 已于 2026-10-07 退役（用户决定）：
+  //   - 决策卡门槛 = markerMinRatio（消除「卡未教/标记不可达」死区）
+  //   - highRatio/lightTaskChars 是「高风险+轻任务建议压缩」的旧审计参数，决策主体移交模型后已无触发作用
+  /* R7（2026-10-08）**marker 通道整体退役**：`marker`（回复尾行文本标记）与 `armedTtlMs`（标记有效期）
+   * 随「工具触发压缩」（R4）一并删除——R4 起压缩由模型调用 `compact_context` 触发，
+   * 标记既无教学（三处教学已改工具版）也无执行路径，留着只是永不命中的死通道 + 无界 Map。
+   * ⚠️ `markerMinRatio` **必须保留**：它同时是决策卡注入门槛，与标记无关。 */
+  sweepMinIntervalMs: 600_000, // 强制压缩冷却：两次兜底压缩的最小间隔
+  /* ═══ R55（2026-10-19 用户要求：「决策卡/提示词/用量行暴露到面板，方便设置」）═══
+   * ① 三档保留比例开放配置（原先写死在 compact-range.TIERS）——它决定三档的名字与
+   *    「保留窗口 × N%」，是用户最想调的参数。**只改比例，不改「三档只是保留预算不同」的语义**；
+   *    非法值（非数/≤0/≥1/不满足 light<standard<heavy）**整组回退默认**，不做部分接受
+   *    （避免「深压 8% / 标准 16% / 浅压 5%」这种名不副实的半套生效）。 */
+  retainRatioLight: 0.08,
+  retainRatioStandard: 0.16,
+  retainRatioHeavy: 0.24,
+  /* ② 生效强制线 = min(criticalRatio, 引擎阈值 − 本余量)。默认 5 个百分点。 */
+  engineCapMargin: 0.05,
+  /* ③ 文案模板（空串 = 用内置文案）。占位符见 README §7；**缺必需占位符 `{tool}` ⇒ 回退内置并留痕**
+   *    （绝不注入半截模板：模板里若没有工具名，模型就不知道该调什么，比不注入更糟）。 */
+  tplBrief: '',
+  tplCard: '',
+  /* R60（2026-10-19 用户要求「还缺一个思考强度教学的输入框」）：思考强度教学的模板。
+   * 原文由 effort.mjs 产出，模板由 compact-tool 的 renderTemplated 施加（同样必须含 {tool}）。 */
+  tplEffBrief: '',
+};
+// 注：关键词「先压缩」通道已按用户决定裁撤（2026-10-06）——"要写先压缩不如直接手动执行压缩指令"。
+
+const msg = (e) => (e && e.message ? e.message : String(e));
+const pick = (...vals) => {
+  for (const v of vals) if (v !== undefined && v !== null) return v;
+  return undefined;
+};
+const kfmt = (n) =>
+  typeof n === 'number' && Number.isFinite(n)
+    ? Math.abs(n) >= 10000
+      ? `${(n / 1000).toFixed(1)}k`
+      : String(Math.round(n))
+    : '–';
+const nfmt = (n) => (typeof n === 'number' && Number.isFinite(n) ? Math.round(n).toLocaleString('en-US') : '?');
+
+/** 错误码归一（D7 审查）：pre-step 与 idle 两条压缩路径原先各自分类，同一个失败会在
+ *  `preStepErrors` / `actErrors` 里落成不同的键 ⇒ 收敛为一个口径（`code` → `name` → 'error'）。 */
+const errCodeOf = (e) => e?.code ?? e?.name ?? 'error';
+
+/** 有界 Set（C 类审查：`briefedBySid` / `effBriefedBySid` / `measuredFailedOnce` 原先无上限，
+ *  键是 session id ⇒ 随会话数无界增长）。超限丢最旧的键；被淘汰的会话最多多讲一次说明，无害。 */
+const SET_CAP = 200;
+const remember = (set, key) => {
+  try {
+    set.add(key);
+    if (set.size > SET_CAP) set.delete(set.values().next().value);
+  } catch { /* 吞：有界化不影响主流程 */ }
+};
+
+/** measure() 快照 → 紧凑读数（官方承诺 detached / deeply immutable，可安全序列化）。 */
+function compactMeasure(m) {
+  if (!m || typeof m !== 'object') return null;
+  return {
+    totalTokens: m.totalTokens ?? null,
+    surfaceTokens: m.surfaceTokens ?? null,
+    contextPressure: m.contextPressure ?? null,
+    projectedTokens: m.projectedTokens ?? null,
+    contextBreakdown: m.contextBreakdown ?? null,
+    nodeCount: Array.isArray(m.nodes) ? m.nodes.length : undefined,
+    keys: Object.keys(m),
+  };
+}
+
+/**
+ * contextBreakdown 投影 → { system, rest } 聚合。
+ * 实测形状（2026-10-06 报告取证）：`{ nodes: [...], breakdown: { systemTokens, messageTokens, toolsTokens } }`；
+ * 兼容数组 / {entries} / {nodes} 等容器，留 sample 供形状取证。
+ */
+/* R39.1：**导出为模块级纯函数**——测试要能用"真函数"验证折算因子（只桩在服务边界）。
+ * 工厂出口仍照旧返回它（宿主解构使用），两处是同一个函数。 */
+export function summarizeBreakdown(bd) {
+  if (!bd || typeof bd !== 'object') return null;
+  const nodes = Array.isArray(bd.nodes) ? bd.nodes : null;
+  const b = bd.breakdown;
+  /* R25：把 `toolsTokens` / `messageTokens` **分开**留出来（原先只有合并的 `rest`）——
+   * 面板上「系统/工具/对话」三行就是这三个数，报告要与面板逐项对得上。 */
+  const split = (o) => ({
+    tools: typeof o.toolsTokens === 'number' ? o.toolsTokens : null,
+    messages: typeof o.messageTokens === 'number' ? o.messageTokens : null,
+  });
+  if (b && typeof b === 'object' && typeof b.systemTokens === 'number') {
+    return {
+      system: b.systemTokens,
+      ...split(b),
+      rest: (b.messageTokens ?? 0) + (b.toolsTokens ?? 0),
+      count: nodes ? nodes.length : null,
+      sample: nodes ? nodes[0] ?? null : null,
+    };
+  }
+  const entries = Array.isArray(bd) ? bd : Array.isArray(bd.entries) ? bd.entries : nodes;
+  if (entries) {
+    let system = 0;
+    let all = 0;
+    for (const e of entries) {
+      const t = typeof e?.heuristicTokens === 'number' ? e.heuristicTokens : 0;
+      all += t;
+      if (e?.system) system += t;
+    }
+    return { system, tools: null, messages: null, rest: all - system, count: entries.length, sample: entries[0] ?? null };
+  }
+  if (typeof bd.systemTokens === 'number') {
+    return {
+      system: bd.systemTokens,
+      ...split(bd),
+      rest: (bd.messageTokens ?? 0) + (bd.toolsTokens ?? 0),
+      count: null,
+      sample: null,
+    };
+  }
+  return { unknown: true, keys: Object.keys(bd).slice(0, 20), sample: null };
+}
+
+/* ═══════════ R24/R25：占用口径（**单一真相**） ═══════════
+ * DSH 表盘（`ContextMeter.js#contextOccupancy`）用的是 `contextPressure` 的 **wire.view**：
+ *   `projectedTokens = Math.max(0, pressureTokens + surfaceTokens − sampledSurfaceTokens)`
+ * 语义 =「provider 实报的 prompt 大小 + 从那以后 surface 的增量」= 下一请求的预计大小。
+ * ⚠️ 两种情况下必须**自算**：① `projectedTokens` 只在 wire.view 里，投影 **state** 没有它；
+ *   ② 直接退回 `pressureTokens` 会拿到**上一次上报的过期值**（真机：压缩后仍是 748,806/74.9%，
+ *      而表盘已是 51%→40%）。
+ * 这里放**唯一一份**实现：`createCore` 出口把 `projectedFromPressure` / `contextLedgerOf` 交给宿主，
+ * m3（触发判定 + 显示）与 m1（报告取证）都用同一份，禁止在模块内重写公式（参见 R22/R23 的重复实现教训）。
+ * `usage.composer` 的 `pressureFrom` 定义：prompt 侧压力 = input + cacheRead + cacheWrite（不含 output）。 */
+
+/**
+ * R91：从 surface 尾部收集"最近若干条 assistant 文本"（含内容兜底），供"声明-执行复检"使用。
+ * 为什么不是"只读最后一条"：真机上决策行写在**轮首**，之后还有几十个工具节点 + 一条收尾消息，
+ * 最后一条 assistant 里根本没有声明 ⇒ R89/R90 一次都没触发（已用报告里的 0 次计数坐实）。
+ * 纯函数（extract(event) 由调用方注入）⇒ 可单测；createCore 内部直接复用同一实现，避免两份漂移。
+ * 容忍事件形状差异：type 含 assistant / data.message.role==='assistant' / 内容含「档位决策|压缩决策」。
+ */
+export function scanAssistantText(session, extract, opts = {}) {
+  const maxNodes = Number(opts.maxNodes ?? 200);
+  const maxMsg = Number(opts.maxMsg ?? 4);
+  const maxLen = Number(opts.maxLen ?? 1600);
+  try {
+    const nodes = Array.isArray(session?.surface) ? session.surface : session?.surface?.nodes;
+    if (!Array.isArray(nodes) || typeof session?.eventAt !== 'function' || typeof extract !== 'function') return '';
+    const isAsst = (ev) => {
+      const ty = String(ev?.type ?? '');
+      if (/assistant/i.test(ty)) return true;
+      const m = ev?.data?.message ?? ev?.data ?? null;
+      return (m?.role ?? m?.message?.role) === 'assistant';
+    };
+    const parts = [];
+    let declPart = null;   // R93：**最新一条含声明的** assistant 文本（必须优先保留）
+    /* R93（真机 2026-10-30）：**扫描不能按预算提前停**——原实现在 `budget` 用尽时退出循环，
+     * 而真机是"先吃到两条很长的收尾消息 → 预算耗尽 → 声明所在的那条根本没被扫到"
+     * （诊断字段实测 asstLen 恰好 1600 且 hasTierDecl=false）。现改为**扫满窗口**，
+     * 只对输出做截断；每段单独限长，避免一条超长消息吃掉全部预算。 */
+    const perPartCap = Math.max(200, Math.floor(maxLen / maxMsg));
+    for (let i = nodes.length - 1, k = 0; i >= 0 && k < maxNodes; i -= 1, k += 1) {
+      const ev = session.eventAt(nodes[i]);
+      if (!ev) continue;
+      const t = extract(ev);
+      if (!t) continue;
+      const dec = /档位决策|压缩决策/.test(t);
+      if (!isAsst(ev) && !dec) continue;
+      if (dec && declPart === null) declPart = String(t);   // 从尾部往前扫 ⇒ 第一次命中就是最新的声明
+      if (parts.length < maxMsg) parts.unshift(String(t).slice(0, perPartCap));
+    }
+    const base = parts.join(String.fromCharCode(10));
+    /* R93（真机 2026-10-30：asstLen 恰好卡在 1600 且 hasTierDecl=false）：
+     * 原实现 `slice(-maxLen)` 保留**尾部**——而声明写在**轮首**，后面更长的收尾消息把声明挤出窗口 ⇒
+     * 永远检测不到。现改为**声明优先**：命中声明的消息放最前，保证不被截断掉。 */
+    if (declPart !== null) return (declPart + String.fromCharCode(10) + base).slice(0, maxLen);
+    return base.slice(-maxLen);
+  } catch { return ''; }
+}
+
+/** → `{ used, projected, reported, surface, sampled, basis }`；`used=null` 表示**没有任何** provider 数据。 */
+export function projectedFromPressure(rec) {
+  const reported = rec?.pressureTokens ?? null;
+  const surface = rec?.surfaceTokens ?? null;
+  const sampled = rec?.sampledSurfaceTokens ?? null;
+  const out = { projected: null, reported, surface, sampled, stale: false, used: null, basis: '无 provider 数据' };
+  /* R88（2026-10-28 真机：压缩后 provider 仍报 689,631、我方投影 291,964=27.8%，面板行却**没标**
+   * 「provider 待刷新」⇒ 用户以为 27.8% 是压后真实值，和两秒后刷新的 8.4% 对不上）。
+   * 原判据只在 surface/sampled 都齐全时才成立（真机某些时刻 sampledSurfaceTokens 缺失 ⇒ 永远 false）。
+   * 现补一条**更稳的**判据：provider 上报值仍显著高于我们的投影（reported > projected×1.5）⇒
+   * 说明「本次上报是压缩前那次请求的」，投影必然偏高 ⇒ 同样属于待刷新。
+   * ⚠️ 只作显示标注，**不参与判定**（方向偏高 = 保守，与 R29 一致）。 */
+  const staleOf = (p) => {
+    const bySurface = reported != null && sampled != null && surface != null && sampled > 0 && surface < sampled * 0.5;
+    const byGap = reported != null && Number.isFinite(p) && p > 0 && reported > p * 1.5;
+    return bySurface || byGap;
+  };
+  if (rec?.projectedTokens != null) {
+    return { ...out, projected: rec.projectedTokens, stale: staleOf(rec.projectedTokens), used: rec.projectedTokens, basis: '下一请求预估' };
+  }
+  if (reported != null && surface != null && sampled != null) {
+    const p = Math.max(0, reported + surface - sampled);
+    return { ...out, projected: p, stale: staleOf(p), used: p, basis: '下一请求预估(自算)' };
+  }
+  if (reported != null) return { ...out, used: reported, basis: 'provider 实报(无增量参照)' };
+  return out;
+}
+
+/* ═══════════ 会话投影读取：rc.x / 0.2.2+ 双轨兼容（2026-10-31）═══════════
+ *
+ * ## 为什么需要这一层
+ * dsh 0.2.2 把 `ctx.sessionProjections` 改成「异步注册 + 句柄」模型：
+ *   - `register()` 现在返回 `Promise<ProjectionHandle>`（注册可能做异步工作，
+ *     调用方必须 await 后再发布消费者）；
+ *   - `dispose()` 返回 Promise（释放登记是异步的）；
+ *   - 消费者侧旧通道 `stateOf(session, key)` 被标 @deprecated。
+ *
+ * ## 但不能无脑切到 `snapshot()` —— 实测证据（asar 源码）
+ * `snapshot()` 返回 **wire view**（过 `viewSchema`），`stateOf()` 返回**原始 state**，
+ * 两者**不等价**，且差异是**丢字段**：
+ *   - `dsh-token-meter` 的 `tokenUsage`：`wire: { view: state => state.totals }`
+ *     —— 原始 state 还有 `last` 等字段，view 直接换成了另一个对象；
+ *   - `contextPressure`：view **只挑 4 个字段**
+ *     （contextWindow / pressureTokens / surfaceTokens / sampledSurfaceTokens），
+ *     `claim`、`projectedTokens` 等被丢弃；
+ *   - `snapshot()` 还会**跳过** `wire === undefined` 的 host-only 单元。
+ * 本插件 `m3.compact` 的 `projectedFromPressure()` 要用 `projectedTokens`，
+ * `m1` 的占用账本要看完整 pressure 形状 ⇒ 换 view 会**静默算错**（不是报错）。
+ *
+ * ## 读取顺序（能力探测，不依赖版本号）
+ *   1. `stateOf(session, key)` —— **首选**：rc.x 非弃用、0.2.2 弃用但保留，
+ *      语义与旧版**逐字节一致**（raw state）；
+ *   2. `snapshot(session,[key]).values[key]` —— 仅当 ① 不可用/抛错/缺键时的降级：
+ *      拿到的是 wire view，**可能缺字段** ⇒ 计入 `degraded`；
+ *   3. `cachedSnapshot(...)` —— 最后兜底（只读已物化 cell，可能滞后，仅 hint 性质）。
+ *
+ * **永不抛异常**：调用方在 pre-step 注入与 HUD 热路径上，投影读失败不得中断本轮。
+ */
+
+/** 双轨读取的运行时诊断（m1 报告可用；不参与任何判定）。 */
+export const projReadStats = {
+  /** 'stateOf' | 'snapshot' | 'cachedSnapshot' | 'none' —— 最近一次生效的通道 */
+  channel: null,
+  /** 最近一次读取的投影 key */
+  lastKey: null,
+  /** 走 wire-view 降级通道的次数（>0 说明 stateOf 已不可用） */
+  degraded: 0,
+  /** 每 (通道,key) 只记一条的读取异常（最多留 8 条） */
+  errors: [],
+};
+
+/** 记一条读取通道命中（纯诊断，无副作用）。 */
+function noteProjRead(channel, key) {
+  projReadStats.channel = channel;
+  projReadStats.lastKey = key;
+  if (channel === 'snapshot' || channel === 'cachedSnapshot') projReadStats.degraded += 1;
+}
+
+/** 记一条读取异常（同 (通道,key) 去重；不写日志，避免热路径刷屏）。 */
+function noteProjReadError(channel, key, e) {
+  const tag = channel + ':' + key;
+  for (const it of projReadStats.errors) if (it.tag === tag) return;
+  projReadStats.errors.push({ tag, message: String((e && e.message) || e) });
+  if (projReadStats.errors.length > 8) projReadStats.errors.shift();
+}
+
+/**
+ * 读一个会话投影值（双轨兼容，永不抛）。
+ * @param {unknown} projections `ctx.sessionProjections` 服务（可能是 undefined）
+ * @param {unknown} session     Session 对象（投影按它的已提交事件折叠）
+ * @param {string}  key         投影 key（'modelSelection' / 'contextBreakdown' / 'contextPressure' …）
+ * @returns {unknown} 投影当前值；拿不到返回 undefined
+ */
+export function readProjectionFrom(projections, session, key) {
+  if (projections === undefined || projections === null) return undefined;
+  if (session === undefined || session === null) return undefined;
+  if (typeof key !== 'string' || key === '') return undefined;
+
+  /* ① raw state —— 与旧版语义完全一致；0.2.2 上虽弃用但保留。 */
+  if (typeof projections.stateOf === 'function') {
+    try {
+      const v = projections.stateOf(session, key);
+      if (v !== undefined) { noteProjRead('stateOf', key); return v; }
+    } catch (e) { noteProjReadError('stateOf', key, e); }
+  }
+
+  /* ② wire view —— 非弃用的一致切面，但**有损** ⇒ 只在 ① 不可用时降级。 */
+  if (typeof projections.snapshot === 'function') {
+    try {
+      const snap = projections.snapshot(session, [key]);
+      const v = snap && snap.values ? snap.values[key] : undefined;
+      if (v !== undefined) { noteProjRead('snapshot', key); return v; }
+    } catch (e) { noteProjReadError('snapshot', key, e); }
+  }
+
+  /* ③ 已物化 cell —— 可能滞后，最后兜底。 */
+  if (typeof projections.cachedSnapshot === 'function') {
+    try {
+      const snap = projections.cachedSnapshot(session, [key]);
+      const v = snap && snap.values ? snap.values[key] : undefined;
+      if (v !== undefined) { noteProjRead('cachedSnapshot', key); return v; }
+    } catch (e) { noteProjReadError('cachedSnapshot', key, e); }
+  }
+
+  noteProjRead('none', key);
+  return undefined;
+}
+
+/**
+ * 一个会话的**占用账本**（报告取证用，四件套 + 差额）：表盘口径 vs 三行启发式组成。
+ * ⚠️ `gapVsBreakdown` **只作读数**，不参与任何判定：它是「provider 计入而启发式不计」的部分
+ * （route-pricing 的图片/文件真实表示、文件句柄投影、固定估算 vs 真实分词的差）。
+ * 真机样例（session-54597a24 压缩后）：`748806 + 247859 − 487049 = 509616`，组成 `2161 + 258256`。
+ */
+export function contextLedgerOf(pressure, measure, breakdown) {
+  const proj = projectedFromPressure(pressure);
+  const b = summarizeBreakdown(breakdown);
+  const bdSum = b && typeof b.system === 'number' ? b.system + (b.rest ?? 0) : null;
+  return {
+    at: new Date().toISOString(),
+    window: pressure?.contextWindow ?? null,
+    /* ① 表盘口径（provider 锚定） */
+    providerReported: proj.reported,
+    sampledSurface: proj.sampled,
+    projected: proj.projected,
+    providerSurface: proj.surface,
+    displayUsed: proj.used,
+    basis: proj.basis,
+    /* R88：过渡读数标记（provider 还没刷新到压缩后的值）——报告/面板据此加「待刷新」。 */
+    stale: proj.stale === true,
+    /* ② 启发式口径（面板三行 / 日志总量） */
+    heuristicTotal: measure?.totalTokens ?? null,
+    heuristicSurface: measure?.surfaceTokens ?? null,
+    breakdown: b ? { system: b.system, tools: b.tools ?? null, messages: b.messages ?? null, rest: b.rest ?? null } : null,
+    breakdownSum: bdSum,
+    /* ③ 两个口径之差（取证读数，不参与判定） */
+    gapVsBreakdown: proj.used != null && bdSum != null ? proj.used - bdSum : null,
+  };
+}
+
+/* ─────────── 官方包解析（候选链：bare → env → resourcesPath → 硬编码） ───────────
+ * R76（审查 S3）：`createUserMessage` 与 `defineTool` 两条候选链原先**结构逐字同构**（各 ~50 行），
+ * 改一处漏一处的漂移面。现合并为一个参数化加载器；**行为逐字不变**：
+ *   尝试顺序（bare → env → resourcesPath/app.asar → .unpacked → abs D: → abs unpacked）
+ *   每个候选先 import 后 require；probe 的形状与 via 命名（`<source>|import|require`、`bare|import`）不变。
+ * 失败语义也不变：全失败 ⇒ 返回 `{ <exportName>: null, via: null, probe }`，调用方据此降级（绝不抛）。 */
+function candidatesOf({ envKey, rel }) {
+  const out = [];
+  const env = process.env[envKey];
+  if (typeof env === 'string' && env) out.push({ source: 'env', path: env });
+  const res = typeof process.resourcesPath === 'string' ? process.resourcesPath : '';
+  if (res) {
+    out.push({ source: 'resourcesPath/app.asar', path: join(res, 'app.asar', ...rel) });
+    out.push({ source: 'resourcesPath/app.asar.unpacked', path: join(res, 'app.asar.unpacked', ...rel) });
+  }
+  out.push({ source: 'abs:D:/DeepSeek/resources/app.asar', path: join('D:/DeepSeek/resources/app.asar', ...rel) });
+  out.push({ source: 'abs:D:/DeepSeek/resources/app.asar.unpacked', path: join('D:/DeepSeek/resources/app.asar.unpacked', ...rel) });
+  return out;
+}
+
+async function loadFromOfficial({ pkgImport, exportName, envKey, rel }) {
+  const probe = [];
+  const accept = (mod) => (mod && typeof mod[exportName] === 'function' ? mod[exportName] : null);
+  try {
+    const fn = accept(await pkgImport()); // R76：**字面量** import 由调用方提供 ⇒ R48 的依赖白名单扫描仍能看见
+    if (fn) return { [exportName]: fn, via: 'bare|import', probe };
+    probe.push({ source: 'bare', ok: false, error: `no ${exportName} export` });
+  } catch (e) {
+    probe.push({ source: 'bare', ok: false, error: msg(e) });
+  }
+  const require = createRequire(import.meta.url);
+  for (const cand of candidatesOf({ envKey, rel })) {
+    for (const via of ['import', 'require']) {
+      try {
+        const mod = via === 'import' ? await import(pathToFileURL(cand.path).href) : require(cand.path);
+        const fn = accept(mod);
+        if (fn) return { [exportName]: fn, via: `${cand.source}|${via}`, probe };
+        probe.push({ source: cand.source, ok: false, path: cand.path, error: `no ${exportName} export` });
+      } catch (e) {
+        probe.push({ source: cand.source, ok: false, path: cand.path, error: msg(e) });
+      }
+    }
+  }
+  return { [exportName]: null, via: null, probe };
+}
+
+const loadCreateUserMessage = () => loadFromOfficial({
+  /* ⚠️ 必须写成**字面量** import：R48 的「官方运行时依赖 ⊆ 白名单」扫描按字面量匹配。 */
+  pkgImport: async () => await import('@deepseek-ai/dsh-llm'), exportName: 'createUserMessage',
+  envKey: 'DSH_CONTEXT_PILOT_DSH_LLM', rel: DSH_LLM_REL,
+});
+
+/* R2：官方 defineTool 解析走同一条链（依据 @deepseek-ai/dsh-tool-ask-user 的范式）。
+ * descriptor 由插件提供（name/description/parameters/output/execute）；全失败 ⇒ 不注册工具
+ * （换档退化为不可用，但主流程绝不受影响）。 */
+const loadDefineTool = () => loadFromOfficial({
+  pkgImport: async () => await import('@deepseek-ai/dsh-tools'), exportName: 'defineTool',
+  envKey: 'DSH_CONTEXT_PILOT_DSH_TOOLS', rel: DSH_TOOLS_REL,
+});
+
+export function createCore({ ctx, config, pluginDir, reportPath }) {
+  const log = (level, text) => {
+    try {
+      const logger = ctx && ctx.logger;
+      if (logger && typeof logger[level] === 'function') logger[level](`${TAG} ${text}`);
+      else console[level === 'info' ? 'log' : level === 'warn' ? 'warn' : 'error'](`${TAG} ${text}`);
+    } catch { /* 静默 */ }
+  };
+
+  /** 服务访问：ctx.get('name') 为主（本机验证惯用法），ctx[name] 属性访问兜底。 */
+  const svc = (key) => {
+    try {
+      if (ctx && typeof ctx.get === 'function') {
+        const v = ctx.get(key);
+        if (v) return v;
+      }
+    } catch { /* fallthrough */ }
+    try {
+      const v = ctx ? ctx[key] : undefined;
+      if (v) return v;
+    } catch { /* absent */ }
+    return undefined;
+  };
+
+  /** 吞异常调用：返回 { value } 或 { error }，永不抛。 */
+  const tryOf = (fn) => {
+    try { return { value: fn() }; } catch (e) { return { error: msg(e) }; }
+  };
+
+  /** 会话投影读取（双轨兼容）：把「服务查找 + 通道选择」收敛到一处。
+   *  实现与实测证据见模块级 `readProjectionFrom`；本包装只负责 svc 查找，
+   *  便于各功能域直接经 deps 注入使用（不各自重复写 stateOf/snapshot 探测）。 */
+  const readProjection = (session, key) => readProjectionFrom(svc('sessionProjections'), session, key);
+
+  const pending = new Map(); // reason -> timer（防抖合并）
+  /** R54（独立审计 F2，2026-10-17）：防抖表归 core 自己清。
+   * 宿主原先是直接 `for (const t of pending.values())` —— 而 `pending` **既没被解构、core 也没导出**
+   * ⇒ 卸载/热换时清理块**第一行就 ReferenceError** ⇒ 后面所有 disposer 都不执行（监听器/定时器泄漏），
+   * 而 apply 期看不到任何异常（正是「最坏情况静默」的形态）。 */
+  const clearSchedules = () => {
+    try {
+      for (const t of pending.values()) { try { clearTimeout(t); } catch { /* 吞 */ } }
+      pending.clear();
+    } catch { /* 吞 */ }
+  };
+  /** M3.6 取证：session/event 全量形状探针（类型计数 + 前 N 条样本），落报告定位解析断点。 */
+  
+  /* ---- M4：生效参数 = bundle config 覆盖默认值（字段级类型守卫，异常全落默认）。
+   *  ⚠️ volatile 字段经 settings 写入后以 {get()} 活引用到达（zcode unwrapLive 同款），
+   *  不剥引用会被类型守卫跳过 → 面板改了值 host 永远用默认。
+   *  ⚠️ 面板保存不会自动重跑 apply（2026-10-06 实测：保存 0.1 后 eff 仍 0.3）——
+   *  所以 mergeConfig 在每个决策点现调（effEnabled 入口统一调），活引用现读即最新值。 ---- */
+  const M3 = { ...M3_DEFAULTS };
+  let cfgErrLogged = false; // C1①：config 读取异常只报一次（防刷屏）
+  /* R76（审查 C12 保守变体）：非法配置值原先被**静默忽略**（保持上一次有效值）。
+   * 这不让用户看见「你存的值没生效」（schema 无范围约束、面板有硬限、host 有守卫 ⇒ 三端口径不一）。
+   * 这里只加**留痕**，不改任何校验/写入行为（加 .min/.max 会改变 set() 语义，需单独拍板）：
+   *   state.cfgRejected = {at, field, value, why} + state.cfgRejects 计数；每个 field|why 只 warn 一次。 */
+  const cfgRejectSeen = new Set();
+  const mergeConfig = () => {
+    try {
+      const live = (v) => (v !== null && typeof v === 'object' && typeof v.get === 'function' ? v.get() : v);
+      if (!config || typeof config !== 'object') return;
+      const raw = {};
+      /* R7：`marker` / `armedTtlMs` 已随 marker 通道退役移出读取集——
+       * 读取集必须与 M3_DEFAULTS 保持同一集合，否则「面板改了不生效」会重演。 */
+      for (const k of ['enabled', 'effortEnabled', 'effortAutoApply', 'criticalRatio', 'markerMinRatio', 'sweepMinIntervalMs', 'effortCooldownMs', 'retainRatioLight', 'retainRatioStandard', 'retainRatioHeavy', 'engineCapMargin', 'tplBrief', 'tplCard', 'tplEffBrief']) {
+        raw[k] = live(config[k]);
+      }
+      /* R76（C12）：被拒配置的统一留痕入口（每次 mergeConfig 现建，闭包捕获 raw）。 */
+      const reject = (field, why) => {
+        try {
+          state.cfgRejected = { at: new Date().toISOString(), field, why, value: typeof raw[field] === 'object' ? '[object]' : raw[field] };
+          state.cfgRejects = (state.cfgRejects ?? 0) + 1;
+          const seenKey = field + '|' + why;
+          if (!cfgRejectSeen.has(seenKey)) {
+            cfgRejectSeen.add(seenKey);
+            log('warn', `配置值被拒（保持上一次有效值）：${field}=${JSON.stringify(raw[field])} —— ${why}`);
+          }
+        } catch { /* 吞 */ }
+      };
+      if (typeof raw.enabled === 'boolean') M3.enabled = raw.enabled;
+      if (typeof raw.effortEnabled === 'boolean') M3.effortEnabled = raw.effortEnabled;
+      if (typeof raw.effortAutoApply === 'boolean') M3.effortAutoApply = raw.effortAutoApply;
+      /* F10（审查）：比率必须 **> 0**（原先是 `>= 0`）。填 0 不是「关闭」而是**瘫痪**：
+       * `criticalRatio: 0` ⇒ 每个 pre-step 都判「越强制线」；`markerMinRatio: 0` ⇒ 决策卡恒注入。
+       * schema 无 `.min()`、面板只拦空串 ⇒ 这里必须挡住（非法值保持上一次的有效值）。 */
+      for (const k of ['criticalRatio', 'markerMinRatio']) {
+        if (typeof raw[k] === 'number' && Number.isFinite(raw[k]) && raw[k] > 0 && raw[k] <= 1) M3[k] = raw[k];
+        else if (raw[k] !== undefined && raw[k] !== null) reject(k, '必须是 (0, 1] 的数');
+      }
+      for (const k of ['sweepMinIntervalMs', 'effortCooldownMs']) {
+        if (typeof raw[k] === 'number' && Number.isFinite(raw[k]) && raw[k] >= 0) M3[k] = raw[k];
+        else if (raw[k] !== undefined && raw[k] !== null) reject(k, '必须是 ≥0 的数（毫秒）');
+      }
+      /* R55①：三档比例 —— 全组校验，**任一项非法就整组不动**（保持上一次的有效值）。
+       * 顺序约束 light < standard < heavy 必须成立，否则「深压/标准/浅压」的语义就反了。 */
+      const trio = ['retainRatioLight', 'retainRatioStandard', 'retainRatioHeavy'];
+      if (trio.every((k) => typeof raw[k] === 'number' && Number.isFinite(raw[k]) && raw[k] > 0 && raw[k] < 1)
+        && raw.retainRatioLight < raw.retainRatioStandard && raw.retainRatioStandard < raw.retainRatioHeavy) {
+        for (const k of trio) M3[k] = raw[k];
+      } else if (trio.some((k) => raw[k] !== undefined && raw[k] !== null)) {
+        reject('retainRatios', '三档必须都在 (0,1) 且 light < standard < heavy（整组生效）');
+      }
+      /* R55②：引擎阈值余量 —— 0 ≤ v < 0.5（≥0.5 会把生效线压到一半以下，等于取消强制压缩）。 */
+      if (typeof raw.engineCapMargin === 'number' && Number.isFinite(raw.engineCapMargin)
+        && raw.engineCapMargin >= 0 && raw.engineCapMargin < 0.5) {
+        M3.engineCapMargin = raw.engineCapMargin;
+      } else if (raw.engineCapMargin !== undefined && raw.engineCapMargin !== null) {
+        reject('engineCapMargin', '必须是 [0, 0.5) 的数（≥0.5 = 取消强制压缩）');
+      }
+      /* R55③ / R60：文案模板 —— 只收字符串，**上限 8000 字符**（模板每轮注入，无界会把上下文吃光；
+       * 超限视为非法 ⇒ 保持现值）。占位符校验在消费端（compact-tool）：缺 `{tool}` ⇒ 回退内置。 */
+      for (const k of ['tplBrief', 'tplCard', 'tplEffBrief']) {
+        if (typeof raw[k] === 'string' && raw[k].length <= 8000) M3[k] = raw[k];
+        else if (raw[k] !== undefined && raw[k] !== null) reject(k, '必须是字符串且 ≤8000 字符');
+      }
+    } catch (e) {
+      /* C1①（审查）：config 读取异常保持现值——留一句痕（仅一次），防「面板改值不生效」无从排查 */
+      if (!cfgErrLogged) {
+        cfgErrLogged = true;
+        log('warn', `config 读取异常（保持现值，仅报一次）：${msg(e)}`);
+      }
+    }
+  };
+  mergeConfig();
+
+  /** 总开关活读：入口统一先 mergeConfig()（面板保存不改跑 apply，决策点现读即最新值）。
+   *  关闭语义 = 完全恢复原生 DSH：不注入、不决策、不压缩。 */
+  const effEnabled = () => {
+    try {
+      mergeConfig();
+      const v = config?.enabled;
+      const x = v !== null && typeof v === 'object' && typeof v.get === 'function' ? v.get() : v;
+      return x !== false;
+    } catch {
+      return true;
+    }
+  };
+
+  /* ---- M5：HUD 状态发布（内存通道 + client 5s 轮询 getHud）----
+   *  2026-10-06 实证：host→configEditor.edit 恒被「HMR transactions cannot be nested」拒绝
+   *  （面板保存能成是因为 client→remote 不经插件 apply scope）⇒ 旧推送通道结构性不可用。
+   *  现改为：压缩/武装事件写 state.m5.hud，client 半经 wire.host.mjs 的 getHud() 每 5s 拉取；
+   *  跨重启显示由启动回填（读报告最近一次 m3-act）补齐。 */
+  /* C-lineage 会话血统链 —— ❌ 2026-10-08 已整体移除（连同 noteSessionId / state.m5.lineage /
+   * state.m5.lastSid / hud-acts.json 的 lineage 键 / m5.hudPoll.lineageSize）。
+   *
+   * 移除依据（两条独立证据，均来自一手会话存盘）：
+   * ① **前提被证伪**：血统链的前提是「DSH 压缩会轮转 session id」。但本会话
+   *    12:51、18:25、18:45 三次压缩**全部**记录在**同一个 sid** 下
+   *    ⇒ 压缩并不换 id，「按当前 id 过滤永远匹配不上」是误判。
+   * ② **它自己制造 bug**：链的建立规则是「sid 一变就连一条边」，而多对话下 UI 的
+   *    `NS.sid` 会漂移到别的会话 ⇒ 生成跨会话假边，实测已成环：
+   *      { f4154f01→16616c07, cb8d115e→f4154f01, 16616c07→f4154f01（回边）, 899bfaca→16616c07 }
+   *    从 16616c07 回溯得 { 16616c07, f4154f01 } ⇒ 命中 4/5 条，把 `keysion-dac-vue`
+   *    workspace 里**另一个对话**的压缩记录显示进了本会话弹窗（用户实测反馈）。
+   *
+   * 教训：用「启发式推断的关联」去补「以为丢了的记录」，会把别的对象的数据当成自己的。
+   * 现在 getHud 严格按 sid 精确匹配；匹配不到就如实显示「本会话暂无压缩记录」。 */
+
+  /* ---- M5.5「任务挂起-自动恢复」**已整体退役**（R4 删投递链，R7 删剩余残留）----
+   *  旧闭环：任务进来 → 模型判断需先压缩 → 本轮不执行、回复写「待执行：<任务>」+ 标记 →
+   *  idle 自动压缩 → host 用 `sessionController.prompt()` 直发一条**用户消息**拉起会话 →
+   *  agent 以压缩后上下文继续执行原任务。
+   *  ⚠️ 用户否决了其中「伪造一条我的信息重新拉起会话」这一步（R4）；
+   *  而**投递链一断，整个闭环就没有存在意义**——压缩不再需要「拉起」，因为工具调用
+   *  （`compact_context`）本身就保证有下一步、本轮自然继续。
+   *  ⇒ R7 把最后三块残留一并删除：`lastUserTextBySid`（挂起任务的兜底文本来源）、
+   *     `pendingBySid`（挂起任务表，R4 后**读点为零**）、`m55Attempt` / `state.m55`（只为旧
+   *     恢复相位留痕）。保留 `clearBriefed` 与 `briefedBySid`（与压缩重讲逻辑有关，与 M5.5 无关）。 */
+  /* `resumeCountBySid` / `M5_RESUME_MAX` / `resumeTimers` 已随伪造恢复投递链一并删除（R4）；
+   * `m55Attempt` / `state.m55` 已随 M5.5 收官残留删除（R7，见上方说明）。 */
+  /* R7：`probeService`（服务可达性 + 原型方法名探针）已删除——**全仓库零调用点**。
+   * 它的职责先是服务在位枚举，后被 `snap.services[k] = svc(k) ? typeof svc(k) : 'absent'` 取代，
+   * 之后一直没人调用（连带 `state.m3.probe` 恒为 null，一并删除）。 */
+  /* ❌❌ M5.5「压制后伪造恢复」投递链 —— **2026-10-08 R4 整体删除** ❌❌
+   *
+   * 删除位置：`maybeResumeAfterMarker`（2s 定时调度 + 上限计数 + 待执行徽章）
+   *          `resumeViaAnyChannel`（通道 A `sessionController.prompt` → B `ctx.remote.session.prompt`
+   *           → C `createUserMessage` + `agent.followup("next-turn")`）。
+   *
+   * 删除依据（用户明确要求）：「自动压缩时，**不用伪造一条我的信息**重新拉起会话」。
+   * 三个通道的最终落点都是 `createUserMessage({ content, source: { kind: 'user', … } })`
+   * ⇒ 无论走哪条，都是**替用户发言**：UI 上表现为一条用户消息，语义上等于用户重新下了任务。
+   *
+   * 替代方案：模型主动调工具 `compact_context` ⇒ 下一步 pre-step 轮内压缩 ⇒ 本轮无缝继续，
+   * **零消息**（不注入、不投递、不恢复）。源码依据与「为什么不能只改投递方式」见
+   * plugin/compact-tool.mjs 文件头（inbox 只有 next-turn/next-step 两个队列且载荷类型是
+   * UserMessage；system/developer 消息只写对话不唤醒 agent；steer 仍是用户消息且 idle 后不可用）。
+   *
+   * R7：**marker 通道已一并退役** ⇒ `state.m55` / `m55Attempt` / `markerArmed` / `pendingBySid` /
+   *     `lastUserTextBySid` 全部删除（投递链一断，整个「挂起-恢复」闭环就没有存在意义）。
+   *     `resumeTimers` 的卸载清理（空集合无害）保留。 */
+
+  /* ---- M4.5 诊断：宿主内 Config schema 解析状态（与 entry 静态导出同一模块，独立重解析）。 ---- */
+  try {
+    const schemaUrl = pathToFileURL(join(pluginDir, 'plugin-config.schema.mjs')).href;
+    import(`${schemaUrl}?probe=${Date.now()}`)
+      .then((m) => {
+        state.m4Probe = {
+          at: new Date().toISOString(),
+          schemaSource: m.DSH_CONTEXT_PILOT_SCHEMA_SOURCE ?? null,
+          configType: m.DSH_CONTEXT_PILOT_CONFIG_SCHEMA ? typeof m.DSH_CONTEXT_PILOT_CONFIG_SCHEMA : 'undefined',
+        };
+        log('info', `M4 探针：schema=${state.m4Probe.schemaSource} config=${state.m4Probe.configType}`);
+        schedule('m4-probe', 300);
+      })
+      .catch((e) => {
+        state.m4Probe = { at: new Date().toISOString(), error: msg(e) };
+        log('warn', `M4 探针失败：${msg(e)}`);
+        schedule('m4-probe', 300);
+      });
+  } catch { /* 探针不致命 */ }
+
+  const state = {
+    seq: 0,
+    implLoadedAt: new Date().toISOString(),
+    listeners: {},
+    m2: { registered: false, injections: 0, briefings: 0, lastText: null, lastAt: null, via: null, skips: {},
+      // 智能思考注入取证（教学次数 / 压缩后重讲次数 / 每轮后缀次数）
+      effortBriefings: 0, briefReissues: 0, effortSuffixes: 0 },
+    m3: {
+      acts: 0,
+      actOk: 0,
+      lastAct: null,
+      actErrors: {},
+      /* ⚠️ 2026-10-08：压缩失败的错误**正文**（此前只记错误码，报告无法定位——
+       * 实测 actErrors={summary:2} / preStepErrors={INVALID_REQUEST:17} 而两条路径成功均为 0） */
+      lastActError: null,
+      lastPreStepError: null,
+      sweeps: {},
+      // M3.5 三通道
+      preStepActs: 0,
+      preStepOk: 0,
+      lastPreStep: null,
+      preStepErrors: {},
+      /* R71（F-14）：range 模块未就绪 + 未越强制线 ⇒ 本轮跳过压缩的次数。
+       * 有此计数才可能回答「这条兜底路径到底发生过没有」（此前只有 warn 文本、无法取证）。 */
+      rangePendingSkips: 0,
+      policyCards: 0,
+      engineCapProbe: null, // C-own：引擎阈值探测留痕（via/ratio/fallback），取证「钳制用的是哪个值」
+      /* 智能思考（effort）取证 —— R3 收敛（原先 12 个散字段 + 两处 `?? 0` 隐式初始化）。
+       * `effortMarkerHits`（文本标记时代，永不自增）与 `lastEffortMarker`（实为工具路径写入）
+       * 已删除：前者是死字段，后者名字误导。 */
+      /* R77（E4 评估结论：**不改**）：effort 域的取证字段历史上挂在这里（R3 收敛时未迁移）。
+       * 迁移到 `state.effort` 会改**报告字段形状**——本项目把报告当「重启取证入口」，可能被外部脚本读；
+       * 而收益只是命名清晰 ⇒ 成本/收益不划算。此处留注释声明属域，字段名以 `effort*` 前缀区分即可。 */
+      effortSwitches: 0, // 真换档次数（只在档位实际变化时自增，见 effort.mjs 结论④）
+      effortReasserts: 0, // 每轮重复覆盖次数（防被官方内层打回，不计入换档）
+      effortSkips: {}, // 跳过原因计数：foreign|noRoute|invalid|sameValue|cooldown
+      effortToolCalls: 0,
+      lastEffortApply: null, // 最近一次应用决策（含 from/provider/model/options/失败原因）
+      lastEffortTool: null, // 最近一次工具接受（want + sid）
+      effortTool: null, // 工具注册结果
+      effortToolLoader: null, // defineTool 加载链探测
+      effortHooks: 0, // 已安装的 agent/request 钩子数
+      /** 懒安装诊断（R3-S10：原先 effortEnsure + effortHookError 两个对象，现合一）。
+       *  ⚠️ 曾因该函数**全静默**导致「工具接受成功却永不变档」无从定位（effortToolCalls=1、
+       *  effortSwitches=0、effortHooks 从未赋值）⇒ 必须留痕。 */
+      effortDiag: { calls: 0, at: null, enabled: false, agents: null, installed: 0, failed: 0, error: null, hookError: null },
+      /* 智能压缩「工具触发」（R4）取证 —— 替代旧 marker + 伪造恢复链路。
+       * 意图登记（工具侧）与消费（pre-step 侧）都必须留痕：这条链路一旦静默，
+       * 就会重演「工具接受成功却永不生效」那类无从定位的故障。 */
+      compactTool: null, // 工具注册结果
+      compactToolDiag: { calls: 0, at: null, enabled: false, installed: false, intents: 0, error: null },
+      compactToolCalls: 0,
+      lastCompactTool: null, // 最近一次工具登记（sid/reason/repeated）
+      compactIntents: 0, // pre-step 消费意图次数
+      compactIntentExpired: 0, // 意图过期作废次数（登记后未被消费）
+      /* R7/F5 诊断：本 sid 查不到意图、但表里还有**别的 sid** 的未过期意图时落痕
+       * （session id 轮转 ⇒ 意图登记在旧键 ⇒ 工具回了 scheduled 但压缩永不发生）。 */
+      compactIntentMiss: null,
+      lastCompactIntent: null, // 最近一次消费详情（trigger/ratio/acted/shadowedTokens/ms + R5 rangeSource）
+      /* R5：最近一次**自选范围**读数（预算/起点/终点/保留·影子 token/失败原因）。
+       * 范围算错时这是唯一现场：报告里没有它就只剩「压了个奇怪的东西」这一句现象。 */
+      rangeProbe: null,
+    },
+    // M5 HUD 发布取证（entry 查找/edit 结果全程留痕——弹窗侧空态无法区分静默失败）
+    // hud.gen = 实例指纹：客户端取到的 gen 应与本实例一致；不一致 = RPC 打到了旧激活的僵尸面
+    // acts = 最近压缩记录（按会话可过滤，新→旧，cap 8）：主行显示最新，悬停展开列表
+    // R7：`hudArmed` / `hudPending` 已随 marker 通道退役——它们是「武装灯/待执行徽章」的数据源，
+    //     两个徽章删掉后这两条链**写而无人读**（host 6 处写 → client 0 处读）。
+    m5: { lastPublish: null, hud: { hudLastAct: '', gen: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}` }, hudFace: 'absent', acts: [] },
+  };
+  /* R8 解耦第一刀：`engineThreshold` / `criticalCapOf` / `resolveCompactionFor` 及其常量
+   * （`DEFAULT_ENGINE_THRESHOLD` / `ENGINE_CAP_MARGIN`）**已整体搬进 plugin/threshold.mjs**。
+   * 搬迁理由与「为何先抽这一个」见该文件头；`criticalCapOf` 被 M1/M2/M3/M5 四处复用的局面
+   * 由此收敛为一个叶子模块。宿主只保留**懒加载 + 三个同名转发**（见下方 IMPL_TS 之后）。 */
+
+  /* ═══════════ 智能思考（reasoning effort）：模块接线（R3 解耦，2026-10-08）═══════════
+   * 实现全部搬进 plugin/effort.mjs（配置/状态/读取/钩子/工具/注入文本/HUD 载荷）；
+   * 此处只留四件事：① 依赖注入；② 幂等懒安装入口；③ 注入文本出口；④ HUD 载荷出口。
+   * 审查与解耦方案：docs/r3-effort-review.md；十条「来之不易」的实证结论见 effort.mjs 文件头。
+   *
+   * ⚠️ 动态 import 必须带 ?ts=（沿用 impl 自身的 ts）：静态相对于 ESM 会按**无参 URL**
+   *    永久缓存（P16 实测踩过），改 effort.mjs 后将无法随插件 toggle 热换。
+   *    impl 的 ts 由 entry.mjs 按「mtime + 激活序号」构造 ⇒ 每次 toggle 必变 ⇒ effort 同批换新。 */
+
+  const messageText = (message) => {
+    const content = message?.content;
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    let out = '';
+    for (const b of content) {
+      if (typeof b === 'string') out += b;
+      else if (b?.type === 'text' && typeof b.text === 'string') out += b.text;
+    }
+    return out;
+  };
+  /** assistant/message 事件文本提取——镜像官方 deriveEventMessage（dsh-session lib/index.js:214）：
+   * user/message 的 data 即消息本体；assistant/message、tool/result 在 data.message。 */
+  const extractEventText = (event) => {
+    if (!event) return '';
+    const m = event.type === 'user/message' ? event.data : event.data?.message;
+    return messageText(m);
+  };
+
+  /** R89（2026-10-28 真机多次：模型写了「档位决策：降 低(low)」却没调用工具）：
+   * 最近一条**模型自己的**消息文本——用于检测「声明了升降档但没执行」。
+   * 与 lastUserText 同构（surface 尾部 + eventAt 取事件），只筛 `assistant/message`。
+   * 读不到返回空串（调用方据此不提示，绝不影响注入主流程）。 */
+  /* R91：委托顶层 scanAssistantText（单一实现；这里只绑定 extractEventText）。 */
+  const lastAssistantText = (session, maxNodes = 200, maxMsg = 4, maxLen = 1600) =>
+    scanAssistantText(session, extractEventText, { maxNodes, maxMsg, maxLen });
+
+  /** R16.12：最近一条**真人用户**消息的文本（换档提醒的外部触发输入）。
+   * 只读 surface 尾部若干节点；跳过插件自己注入的 user/message（kind=context-pilot）
+   * 与 UI 产生的 model-selection，否则会读到自己的用量行。
+   * 读不到就返回空串 —— 调用方据此不提示，绝不影响注入主流程。 */
+  const lastUserText = (session, maxNodes = 8, maxLen = 400) => {
+    try {
+      /* R72（真 GLM-5.3 审查 H1）：DSH 的 `Session.surface` 是 **SurfaceManager**，节点列表在
+       * `surface.nodes`（getter）——原来把对象当数组判 `Array.isArray` 恒 false ⇒ **恒返回空串** ⇒
+       * effort 的「用户要求深入/快速」两个换档触发**从未工作过**。这里**两种形状都吃**（数组当旧版/测试桩），
+       * 避免下一次结构变化又静默失效。 */
+      const nodes = Array.isArray(session?.surface) ? session.surface : session?.surface?.nodes;
+      if (!Array.isArray(nodes) || typeof session?.eventAt !== 'function') return '';
+      for (let i = nodes.length - 1, k = 0; i >= 0 && k < maxNodes; i -= 1, k += 1) {
+        const ev = session.eventAt(nodes[i]);
+        if (!ev || ev.type !== 'user/message') continue;
+        const kind = ev.data?.source?.kind;
+        if (kind !== undefined && kind !== null && kind !== 'user') continue;
+        const t = extractEventText(ev);
+        if (t) return String(t).slice(0, maxLen);
+      }
+    } catch { /* 吞：读不到即不提示 */ }
+    return '';
+  };
+
+  /* R7：`decideCompaction` 已删除。
+   * 它原本服务三个调用点（inbox 审计 / idle 兜底 / pre-step），但审计监听器与决策主体都已退役，
+   * 只剩下 idleSweep 读它的 `ok`/`ratio`——其余产物（`compact`/`reason`/`used`/`window`）全部无消费者，
+   * 且文档还停在「决策主体是模型标记」的旧语义。现在 idleSweep 直接调 `measureRatio`，
+   * **少一层间接、少一套会漂移的语义**。 */
+
+  /* ---- 报告落盘（追加式 history，重启取证入口） ----
+   * C3（审查）：基线 apply 期读一次缓存、后续内存追加——原实现每次写入全量 readFileSync（实测 1.2MB×每次，
+   * 触发点含 400-500ms 防抖高频 reason）。C1③：读失败/形状异常不再静默「首写覆盖」，留一句痕。
+   * ⚠️ 2026-10-06 14:4x 实测补丁：缓存基线在**多写入者共存**时会互相覆盖（A1 泄漏的僵尸实例每 15s 用
+   * 自己的旧基线整段写回 ⇒ 抹掉新实例条目）。现每次写入先「按本实例已写入的条数做尾部对账」：
+   * 磁盘 history 尾部若与本实例最后一次写入不一致（=有他人追加），则以磁盘为准重新接续——正确性优先，
+   * 仍避免全量解析（只在检测到他人写入时重读）。 */
+
+  let reportBase = null; // 缓存的报告数据（history 随写随追加，卸载即弃）
+  let reportBaseLoaded = false;
+  let lastWrittenAt = null; // 本实例最后一次写入条目的 at（尾部对账锚点）
+  /* R71（两份独立审查一致结论，P1）：原先**每次**写入都对报告文件做 readFileSync + JSON.parse
+   * 只为取磁盘尾条时间戳——注释自称「只在检测到他人写入时重读」，实现却每次都全量解析。
+   * 报告实测已达 MB 级（HISTORY_CAP=120 且 FULL 条目优先保留），而写入触发源很密
+   * （agent/status 1.5s 防抖 / m5-publish 400ms / m2-inject 500ms / 心跳 120s）⇒ 活跃期每秒级
+   * MB 解析 + MB 序列化，是全插件最重的热路径。
+   * 现改为**指纹门控**：本实例写完记下 {size,mtimeMs}，下次写先 stat 比对——一致即说明
+   * 「自上次写后没人动过磁盘」，直接跳过全量解析用缓存基线；不一致才走原对账逻辑。
+   * 语义不变：他人写入必然改变 size 或 mtime ⇒ 仍能被发现（极端同尺寸同毫秒写入的漏检
+   * 由下一写以 lastWrittenAt 锚点纠正，且报告是追加式取证、不是事务日志）。 */
+  let writtenFingerprint = null; // R71：本实例上次写成功后的磁盘指纹（size:mtimeMs）
+  const statFingerprint = () => {
+    try { const st = statSync(reportPath); return st.size + ':' + st.mtimeMs; } catch { return null; }
+  };
+
+  const loadReportBase = () => {
+    try {
+      const prev = JSON.parse(readFileSync(reportPath, 'utf8'));
+      if (prev && Array.isArray(prev.history)) return { ...prev };
+      log('warn', '报告基线形状异常（无 history 数组）→ 将按首写覆盖（C1③ 留痕）');
+    } catch (e) {
+      if (e?.code !== 'ENOENT') {
+        /* R73（审查 E5）：损坏的报告原先直接「按首写覆盖」⇒ 历史**整份丢失**（writeJsonAtomic 防了
+         * 半截写，防不了外部损坏/磁盘错误）。改成先改名备份，再走首写重建。ENOENT=首写属正常。 */
+        try {
+          const bak = `${reportPath}.corrupt-${Date.now()}`;
+          renameSync(reportPath, bak);
+          log('warn', `报告基线损坏（${msg(e)}）⇒ 已备份到 ${bak}，随后按首写重建`);
+        } catch (e2) {
+          log('warn', `报告基线读取失败（按首写覆盖，原内容不保留）：${msg(e)}；备份亦失败：${msg(e2)}`);
+        }
+      }
+    }
+    return null;
+  };
+  const writeReport = (entry) => {
+    try {
+      let data;
+      if (!reportBaseLoaded) {
+        reportBaseLoaded = true;
+        data = loadReportBase();
+      } else {
+        /* 尾部对账：磁盘最后一条不是本实例刚写的那条 ⇒ 有他人写入 ⇒ 以磁盘为准重新接续（防互相覆盖） */
+        /* R71：指纹一致 ⇒ 自上次写后磁盘未被他人改动 ⇒ 无需全量解析（热路径省掉 MB 级 parse）。 */
+        if (writtenFingerprint != null && statFingerprint() === writtenFingerprint) {
+          data = reportBase;
+        } else {
+          let diskTailAt = null;
+          try {
+            const onDisk = JSON.parse(readFileSync(reportPath, 'utf8'));
+            const dHist = Array.isArray(onDisk?.history) ? onDisk.history : [];
+            diskTailAt = dHist.length ? dHist[dHist.length - 1]?.at ?? null : null;
+            if (diskTailAt !== lastWrittenAt) {
+              data = onDisk;
+              log('info', `报告尾部对账：检测到他方写入（磁盘尾 ${diskTailAt} ≠ 本实例 ${lastWrittenAt}）→ 重读接续`);
+            }
+          } catch { /* 读失败则沿用缓存基线 */ }
+          if (!data) data = reportBase;
+        }
+      }
+      data = data ?? {
+        plugin: 'dsh-context-pilot',
+        purpose: 'M1 用量读取验证 + M2 注入报告',
+        updated: entry.at,
+        history: [],
+      };
+      reportBase = data;
+      data.updated = entry.at;
+      /* R8 修（审查发现的**取证静默丢失**）：满环时优先淘汰**最旧的 slim 条目**，而不是无差别砍最旧的。
+       * 现场：报告 120 条**全是 slim、full 0 条** —— heartbeat(120s) / agent/status / m5-publish(400ms 防抖) /
+       * m2-inject 这些高频 slim 事件把 FULL 条目（activation / m3-act / m4-probe / boot+10s）
+       * **挤出环形缓冲**，而 FULL 档位恰是「压缩到底成没成」的唯一留档位置。
+       * 而 report.mjs 的 `mustFull` 断言只检查那些 reason**不在 SLIM 名单里**，
+       * 从不检查它们**真的还在历史里** ⇒ 断言全绿、证据已丢。两处一起修。 */
+      const next = [...(data.history || []), entry];
+      while (next.length > HISTORY_CAP) {
+        const slimIdx = next.findIndex((e) => e?.profile === 'slim');
+        next.splice(slimIdx === -1 ? 0 : slimIdx, 1); // 没有 slim 可淘汰时退化为「砍最旧」
+      }
+      data.history = next;
+      mkdirSync(dirname(reportPath), { recursive: true });
+      writeJsonAtomic(reportPath, data);
+      lastWrittenAt = entry.at;
+      writtenFingerprint = statFingerprint(); // R71：记下本次写入后的指纹（供下次跳过全量对账）
+    } catch (e) {
+      log('warn', `报告写入失败：${msg(e)}`);
+    }
+  };
+
+  /* R53（自审发现 #2，2026-10-17）：**原子落盘**（同目录 tmp + rename）。
+   * 直写目标文件会在写入中途留下**半截 JSON**；任何并发读者（面板 / 报告工具 / 插件下次启动的
+   * `loadReportBase`）都会读到 `Unterminated string in JSON` ⇒ 记录/报告**整份丢失**
+   * （test/report.mjs 曾真实报过这个错 = 现场证据；R13 的"报告断档"是同一形态）。
+   * 语义：读者只会看到**旧的完整内容**或**新的完整内容**，永不看半截。
+   * ⚠️ 该 helper 在多个域各留一份（m5 / session-facts / compact-tool / effort）：
+   *    本项目禁止域间 import（依赖必须由宿主注入）⇒ 复制 8 行比引入耦合安全。 */
+  const writeJsonAtomic = (p, obj) => {
+    const body = JSON.stringify(obj, null, 2);
+    const tmp = `${p}.${process.pid}.${Date.now().toString(36)}.tmp`;
+    try {
+      writeFileSync(tmp, body);
+      renameSync(tmp, p);   // 同目录 rename：要么旧文件、要么新文件，永无半截
+      return true;
+    } catch (e) {
+      try { unlinkSync(tmp); } catch { /* 吞 */ }
+      writeFileSync(p, body);   // Windows 目标被占用时 rename 会 EBUSY ⇒ 退化为直写（宁可非原子，也别丢这次）
+      /* R74（审查 C7）：**非原子**路径必须留痕——半截 JSON 的风险在这里回来了，且发生了也无从取证。 */
+      try { log('warn', `原子写降级为直写（rename 失败：${String(e?.message ?? e)}）：${p}`); } catch { /* 吞 */ }
+      return true;
+    }
+  };
+
+  /* ---- C3② 报告稳态瘦身（2026-10-07）----
+   * 动因（本机实测）：报告文件 **3.77MB**（pretty 后），history 满 120 条、单条均值 **16KB**，
+   * 其中 heartbeat 52 条就占 888KB、agent/status 20 条占 330KB。体积主体是 buildSnapshot 的
+   * **全量 sessions/agents 枚举**（每会话 keys[40] + measure + pressureProjection + breakdownSummary）。
+   *
+   * 消费侧调研（决定瘦身安全性）：history 的全量内容**只被一处读取**——启动回填 bfOnce
+   * （筛 `reason==='m3-act'` 取 `m3.lastAct`）。其余字段纯为取证，不进任何逻辑分支。
+   *
+   * 策略：按 reason 分级——
+   *  - **SLIM**（高频、信息量低）：只留「读数 + 状态」，丢明细（keys/headerKeys/breakdown/probe 样本/LLM 拓扑）
+   *  - **FULL**（其余，含 m3-act/m4-probe/activation 等关键事件）：完整快照，取证不受影响
+   * 用 `profile` 字段显式标记，dump 时可直接区分。 */
+
+  const refresh = (reason) => {
+    let snap;
+    try {
+      snap = buildSnapshot(reason);
+    } catch (e) {
+      log('warn', `快照构建异常（${reason}）：${msg(e)}`);
+      return;
+    }
+    const s = snap.sessions ?? [];
+    const top = s
+      .filter((x) => typeof x.measure?.totalTokens === 'number')
+      .sort((x, y) => y.measure.totalTokens - x.measure.totalTokens)[0];
+    log(
+      'info',
+      `[${reason}] sessions=${snap.totals.sessions} agents=${snap.totals.agents}` +
+        (top ? ` ｜ 最热会话 id=${String(top.id).slice(0, 8)}… total=${kfmt(top.measure.totalTokens)}` : '') +
+        ` ｜ m2 注入=${snap.m2?.injections ?? 0}`,
+    );
+    // C3②：高频 reason 落精简档（体积降一个量级），关键事件保留全量
+    /* R13：`SLIM_REASONS` 随 M1 域搬走了 ⇒ 判断口径也必须走模块（否则这里是 ReferenceError，
+     * refresh 的 try/catch 会把它吞成「报告永不落盘」——**boot 冒烟当场抓到了这一条**）。
+     * 模块未就绪时按 **FULL** 处理：宁可多写几个字段，也不要报告断档。 */
+    writeReport(isSlimReason(reason) ? slimSnapshot(snap) : { ...snap, profile: 'full' });
+  };
+
+  /** 防抖刷新：同 reason 的多次触发合并为最后一次。 */
+  const schedule = (reason, delay = 1000) => {
+    try {
+      const prev = pending.get(reason);
+      if (prev) clearTimeout(prev);
+      const t = setTimeout(() => {
+        pending.delete(reason);
+        try { refresh(reason); } catch { /* 吞 */ }
+      }, delay);
+      t.unref?.();
+      pending.set(reason, t);
+    } catch { /* 吞 */ }
+  };
+
+
+  /* ---- 快照来源：后置注入（见文件头）。未注入时用最小快照 + FULL 档位兜底。 ---- */
+  let buildSnapshot = (reason) => ({ at: new Date().toISOString(), reason, profile: 'full', services: {}, sessions: [], agents: [], totals: {} });
+  let slimSnapshot = (snap) => ({ ...snap, profile: 'slim' });
+  let isSlimReason = () => false;
+  const attachSnapshot = (api) => {
+    if (!api) return;
+    buildSnapshot = api.buildSnapshot;
+    slimSnapshot = api.slimSnapshot;
+    isSlimReason = api.isSlimReason;
+  };
+  const factoryPromise = loadCreateUserMessage();
+  let createUserMessage = null;
+  factoryPromise
+    .then(({ createUserMessage: fn, via, probe }) => {
+      createUserMessage = fn;
+      state.m2.via = via;
+      if (fn) {
+        state.m2.registered = true;
+        log('info', `M2 createUserMessage 已解析（${via}）；每轮 step1 注入用量三元组`);
+      } else {
+        log('warn', `M2 createUserMessage 全候选失败，注入禁用（非致命）：${JSON.stringify(probe).slice(0, 400)}`);
+      }
+      schedule('m2-factory', 0);
+    })
+    .catch((e) => log('warn', `M2 工厂解析异常（禁用注入）：${msg(e)}`));
+
+  const addListener = (name, handler, opts) => {
+    try {
+      if (typeof ctx?.on !== 'function') return 'ctx.on 不可用';
+      ctx.on(name, handler, opts);
+      return 'ok';
+    } catch (e) {
+      return `err: ${msg(e)}`;
+    }
+  };
+
+  /* ═══════════ M3.5 通道1：pre-step 轮内先压（在 next() 之前执行 → 影响本步请求） ═══════════
+   * 官方源码实证（docs/reference @deepseek-ai/dsh-compaction-basic lib/index.js）：
+   *  - compactIfNeeded(agent,"pressure",signal) 即官方 pre-step 自动压缩的原话调用（阈值走引擎自身 config，默认 80%——
+   *    因此本函数的 critical 兜底在 ≥85% 时必然越过引擎阈值而生效；引擎自身监听若已压过则返回 null，幂等安全）；
+   *  - "context-overflow" 触发**绕过引擎阈值**：源码原文「bypasses the normal threshold and
+   *    retained-tail policy so it can force one useful balanced reduction」，内部走
+   *    selectCompactableRange(session, measurement, **0**) ⇒ 保留近端≈0（只留最后一个节点 + tool-pairing 回退）。
+   *    ⚠️ 代价明确：这是唯一能低于阈值强制压缩的通道，但保留策略比引擎默认（retainRatio 0.16）激进得多。
+   *  - compactNow 必须 idle（runMaintenance），轮内不可用——那是 idle 安全网专用。
+   *  - ⚠️ R5（2026-10-08）：上面这条「overflow 保留近端≈0」不再是本函数的默认行为——现在**先自选范围**
+   *    （保留预算 = 窗口 × M3.retainRatio），失败才沿用官方 overflow 兜底。见 compactWithOwnRange。 */
+
+  /* ═══ R5：自选保留范围 + 官方兜底 ═══
+   * 返回值：`{ result, source, skipWhy, retainBudget, walkBacks }`
+   *   source ∈ 'own'（自选范围成功）| 'official'（沿用官方 overflow）| 'none'（判定无需压缩）
+   * 异常语义：**非校验类错误一律上抛**（由 preStepCompaction 的 catch 统一记录）——
+   *   摘要 LLM 失败、`busy`、abort 等重试/兜底都无意义（官方路径会同样失败）。 */
+
+  /** core 出口：宿主只解构使用，不直接改。 */
+  return {
+    state, log, msg, svc, tryOf, readProjection, pick, kfmt, nfmt, errCodeOf, remember, SET_CAP,
+    /* R2026-10-31：双轨投影读取的诊断（m1 报告可读；判定一律不用它）。 */
+    projReadStats,
+    M3, mergeConfig, effEnabled, schedule, addListener, SOURCE_KIND, TAG, clearSchedules,
+    COMPACT_TIMEOUT_MS, HISTORY_CAP, HEARTBEAT_MS, SESSION_CAP,
+    compactMeasure, summarizeBreakdown, messageText, extractEventText, lastUserText, lastAssistantText,
+    /* R25：占用口径单源（m3 触发/显示、m1 报告账本都用这两支）。 */
+    projectedFromPressure, contextLedgerOf,
+    loadCreateUserMessage, loadDefineTool, getCreateUserMessage: () => createUserMessage,
+    attachSnapshot, loadReportBase, refresh, writeReport,
+  };
+}

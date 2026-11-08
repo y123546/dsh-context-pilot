@@ -1,0 +1,54 @@
+{
+  "name": "dsh-context-pilot",
+  "version": "0.1.96",
+  "icon": "./icon.svg",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "description": "DSH 上下文智能压缩 + 智能思考：读取上下文用量、每轮注入、按任务复杂度决策压缩（自算保留范围）；达强制压缩线时插件在 pre-step 无条件发起压缩（同样先自算范围，官方 overflow 兜底）。可选让模型自主调整思考强度档位",
+  "exports": {
+    ".": "./entry.mjs",
+    "./client": "./client.js",
+    "./typert": "./wire.host.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-client-ui-primitives",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "meta": {
+    "title": "上下文智能压缩",
+    "description": "每轮读取上下文用量（上限/已用/占比）注入 prompt，占用达智能压缩线时模型可自行决定压缩并自动续跑；占用达强制压缩线时插件在 pre-step 无条件发起压缩（执行路径相同：先自算保留范围，官方 overflow 兜底/收口）。智能思考（可选）：开启后向 Agent 暴露当前模型的思考强度档位与可选档，并允许其自主换档——下一步生效、任务不中断。"
+  },
+  "license": "MIT",
+  "author": "Shuffle-1992",
+  "homepage": "https://github.com/Shuffle-1992/dsh-context-pilot#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shuffle-1992/dsh-context-pilot.git"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis-plugin",
+    "context-compression",
+    "context-management",
+    "reasoning-effort"
+  ]
+}

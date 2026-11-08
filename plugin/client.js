@@ -1,0 +1,1739 @@
+window.__ModuleLoader__.load({
+	id: "dsh-context-pilot",
+	factory: (require) => {
+		var module = { exports: {} };
+		var exports = module.exports;
+		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+		/**
+		 * dsh-context-pilot client 半（M4.5 插件详情页配置卡片）。
+		 *
+		 * 结构完全照 dsh-connect-zcode lib/client.js 的信封与卡注册（不发明 API）：
+		 * - ModuleLoader 信封（自足 bundle，无构建步骤；唯一外部 require 是宿主提供的 react）；
+		 * - 卡注册 plugins.bundle.config，key = bundle 包名（slot 契约）；
+		 * - 设置读写走 configForms 软探测 + 命名空间重绑定（zcode/trae 同款），
+		 *   写后必须回读校验（set() resolve ≠ 真存进去了）；
+		 * - apply() 整体 try/catch，失败只 console.error，绝不抛（宿主详情页不被打崩）。
+		 */
+		const react = require("react"); // B6（审查）：无重赋值，const
+		const el = react.createElement;
+		/* B6（审查）：散挂 window 的 6 个全局名收敛为单命名空间（防与其他插件撞名、便于整体清理）。
+		 * 控制台取证路径变更：__DSH_CONTEXT_PILOT__.sid / .hudDebug / .gen 一次可读全貌。 */
+		const NS = (window.__DSH_CONTEXT_PILOT__ = window.__DSH_CONTEXT_PILOT__ || {});
+
+		/* R16.11 / R16.19：**唯一的「当前会话 id」解析口**（所有按会话过滤的查询都必须走它）。
+		 * 优先级（R16.19 修正——真机截图取证：新会话窗口里 `sid=session-16616…`，即拿到了**别的会话**）：
+		 *   ① **`NS.sidActive`**：由 chip 从**槽位标准 props 的 `sessionId`** 写入（Slots 检视面确认
+		 *      `conversation.input.right` 的 standardProps 含 `sessionId: SessionId`，scope=session）
+		 *      —— 这是**权威值**：它就是当前这个对话的会话 id，与 URL/请求都无关；
+		 *   ② 窗口 URL 里的 session id（**仅作 chip 未挂载前的兜底**；同一窗口内切换会话时 URL 不会变
+		 *      ⇒ 单独依赖它会拿到过期值，这正是本次串会话的直因）；
+		 *   ③ `NS.sid`（fetch first-wins 捕获；同样只是兜底）。
+		 * 起因：原实现只认「最后一个带 sessionId 的请求」（会被别的会话抢走）；R16.11 改成 URL 优先后，
+		 * 又栽在「同窗口切换会话 URL 不更新」上 ⇒ 现在以槽位 props 为权威，其余两者降级为兜底。 */
+		const resolveSid = () => {
+			if (NS.sidActive) return String(NS.sidActive);
+			try {
+				const m = /(session-[A-Za-z0-9-]{8,})/.exec(String(location.href || ""));
+				if (m) return m[1];
+			} catch { /* 忽略 */ }
+			return NS.sid || "";
+		};
+		/** 取证：本次 sid 来自哪一路（slot=权威 / url / fetch=兜底）——排障时一眼可见。 */
+		const sidSource = () => {
+			if (NS.sidActive) return "slot";
+			try { if (/(session-[A-Za-z0-9-]{8,})/.test(String(location.href || ""))) return "url"; } catch { /* 忽略 */ }
+			return NS.sid ? "fetch" : "none";
+		};
+		/** R75（审查 S4）：remote 信封解包**只有一份**（原先面板内联一份、弹窗里又一份，失败形态不一致）。
+		 *  规则：带 `value` 键 = 信封（`ok ? value : {ok:false,error}`）；否则视作直连值原样返回。 */
+		const unwrapEnv = (raw) => {
+			if (raw && typeof raw === "object" && "value" in raw) {
+				return raw.ok ? raw.value : { ok: false, error: (raw.error && raw.error.message) || String(raw.error ?? "remote error") };
+			}
+			return raw;
+		};
+
+		/** 卡片 key = bundle 包名（plugins.bundle.config slot 契约）。
+		 *  ⚠️ R56f：宿主派发用的是 **profile 的 bundle 名**（可能仍是旧别名 `@local/dsh-context-pilot`），
+		 *  所以两个 key 都要注册 —— 见 apply() 里的 R56f 注释与 PANEL-HOWTO §3.1。 */
+		const BUNDLE_KEY = "dsh-context-pilot";
+		/** profile 里的旧别名形式（2026-10-10 统一包名前挂载遗留；迁移完成后此键空置无害）。 */
+		const CARD_KEY_ALIAS = `@local/${BUNDLE_KEY}`;
+		/** 设置命名空间匹配（host 的 settingsNs = Loader entry id，本插件）。 */
+		/** ⚠️ R56e（2026-10-19，照 `dsh-connect-zcode/PANEL-HOWTO.md` §1④）：面板"可写"的硬前提是
+		 *  `configForms` 里那个命名空间**精确**等于 `cordis.patch.yml` 的 `- id:`。原实现只有模糊匹配
+		 *  （/context-pilot/i）——文档明确警告：模糊可能绑到**别的**命名空间 ⇒ 控件全灰/永远只读，
+		 *  甚至绑错后写入失败。⇒ 先精确、再模糊兜底（保留兜底是为了改名/多实例时仍能工作）。 */
+		const NS_EXACT = "dsh-context-pilot";
+		const NS_PATTERN = /context-pilot/i;
+		const LOG = "[dsh-context-pilot/client]";
+		/** HUD 轮询面（client→host remote；host 侧 wire.host.mjs ctx.provide 注册）。 */
+		const HUD_FACE = "dshContextPilot";
+		/** remote 贡献声明（与 wire.host.mjs FACE_METHOD_TABLE 逐字对账——漂移=调用静默失败）。 */
+		const REMOTE_CONTRIBUTION = {
+			package: "dsh-context-pilot",
+			descriptors: [
+				{
+					id: `dsh-context-pilot#${HUD_FACE}/getHud`,
+					service: HUD_FACE,
+					namespace: HUD_FACE,
+					method: "getHud",
+					invocation: { kind: "direct" },
+					parameters: [
+						{
+							name: "sid",
+							wire: "sid",
+							source: "json",
+							acceptsUndefined: true,
+							codec: { mode: "strict", typeSymbol: `dsh-context-pilot#${HUD_FACE}/getHud:sid`, create: () => ({ parse: (value) => value }) },
+						},
+					],
+					result: {
+						mode: "strict",
+						typeSymbol: `dsh-context-pilot#${HUD_FACE}/getHud:result`,
+						create: () => ({ parse: (value) => value }),
+					},
+				},
+			],
+		};
+
+		/** 字段描述符（与 host.impl.mjs M3_DEFAULTS / plugin-config.schema.mjs 一一对应）。
+		 *  存储口径：比率类字段为 0-1 小数；时长类字段**存储仍为毫秒**（兼容 host/schema/已有配置），
+		 *  scale:1000 仅在 UI 层做「秒 ↔ 毫秒」换算（parseInput/canon/显示/草稿比较统一按秒）。
+		 *  备注精简原则（2026-10-07 用户要求）：一行说清用途，不写推荐值枚举（推荐值在计算器里实时算）。 */
+		const FIELDS = [
+			{ key: "enabled", label: "总开关", type: "bool", def: true, hint: "关闭后完全恢复原生 DSH" },
+			/* 智能思考总门（2026-10-07 引入，R2 换工具方案，R3 移入 host 侧 effort.mjs）：
+			 * 开 = 注入思考强度信息 + 注册 set_reasoning_effort 工具；关 = 都不做
+			 * （用户明确定义：一个开关管两件事，不做"只读/只写"拆分）。 */
+			{ key: "effortEnabled", label: "智能思考", type: "bool", def: false, hint: "开启后向 Agent 暴露思考档位并允许其自主换档；关闭则完全不介入" },
+			/* 换档冷却（R3-S7 起可配）：换档会使前缀缓存失效 ⇒ 属计费敏感参数，故开放配置。 */
+			{ key: "effortCooldownMs", label: "换档冷却(秒)", type: "int", def: 30000, scale: 1000, hint: "两次换档的最小间隔（防反复打断前缀缓存）" },
+			/* R94（用户 2026-11-02）：模型"说了要换档却忘调工具"是高频现象 ⇒ 缺省自动补执行。 */
+			{ key: "effortAutoApply", label: "声明即执行", type: "bool", def: true, hint: "模型在正文里声明换档但没调用工具时，自动按声明应用（关闭=只在提醒里指出）" },
+			{ key: "markerMinRatio", label: "智能压缩线", type: "num", def: 0.2, hint: "占用达此值时注入决策卡，模型可自行决定压缩" },
+			{ key: "criticalRatio", label: "强制压缩线", type: "num", def: 0.85, hint: "占用达此值插件无条件发起压缩（先自算保留范围，官方 overflow 兜底；先于 DSH 引擎自动压缩触发）" },
+			/* ═══ R55（2026-10-19 用户要求：把参数暴露到面板「方便设置」）═══
+			 * 新增三项：阈值余量 + 三档保留比例 + 两个文案模板。
+			 * ⚠️ 每条 hint 必须与 plugin-config.schema.mjs 的 description 对账（P29：两端漂移
+			 * = 用户看到的说明与实际不符），contract 有专门断言。 */
+			{ key: "engineCapMargin", label: "阈值余量", type: "num", def: 0.05, hint: "生效强制线 = min(强制压缩线, 引擎阈值 − 本余量)。默认 0.05（即 5 个百分点）" },
+			{ key: "retainRatioLight", label: "深压比例", type: "num", def: 0.08, hint: "「深压」档保留窗口的比例；三项须满足 深压 < 标准 < 浅压，否则整组不生效" },
+			{ key: "retainRatioStandard", label: "标准比例", type: "num", def: 0.16, hint: "「标准」档保留比例（默认档；未选档或非法档位都落这里）" },
+			{ key: "retainRatioHeavy", label: "浅压比例", type: "num", def: 0.24, hint: "「浅压」档保留比例（接下来仍要频繁引用近端一大段时用）" },
+			{ key: "tplBrief", label: "一次性说明模板", type: "tpl", def: "", hint: "留空 = 用内置文案。占位符 {tool} {builtin} {critical} {tiers} {keepFromHint} {retainRatio} {retainTokens}；**必须含 {tool}**，缺则回退内置并在面板留痕" },
+			{ key: "tplCard", label: "决策卡模板", type: "tpl", def: "", hint: "留空 = 用内置文案。占位符 {tool} {builtin} {critical} {minRatio} {ratio} {retainRatio} {retainTokens} {used} {window} {tiers}；**必须含 {tool}**" },
+			/* R60（2026-10-19 用户要求「还缺一个思考强度教学的输入框」）：这段原文由 **effort 域**
+			 * 产出（m2 调 effortApi.renderBrief），模板经 compact-tool.renderTemplated 施加；
+			 * 规则与另两个模板一致：必须含 {tool}（此语境 = set_reasoning_effort），缺则回退内置并留痕。 */
+			{ key: "tplEffBrief", label: "思考强度教学模板", type: "tpl", def: "", hint: "留空 = 用内置文案。占位符 {tool}（= set_reasoning_effort）{builtin} {current} {tiers}；**必须含 {tool}**，缺则回退内置并在面板留痕" },
+			/* R7：`marker`（压缩标记）与 `armedTtlMs`（标记有效期）两个面板字段随 marker 通道退役删除——
+			 * 压缩已改由工具 `compact_context` 触发，回复尾行文本标记既无教学也无执行路径。
+			 * ⚠️「智能压缩线」(`markerMinRatio`) 保留：它是决策卡注入门槛，与标记无关。 */
+			{ key: "sweepMinIntervalMs", label: "强制压缩冷却(秒)", type: "int", def: 600000, scale: 1000, hint: "两次强制压缩的最小间隔" },
+		];
+
+		//#region helpers
+		/** 剥 volatile 活引用（zcode unwrapLiveDeep 同款）。 */
+		function unwrapLiveDeep(value) {
+			if (value === null || typeof value !== "object") return value;
+			if (typeof value.get === "function") return unwrapLiveDeep(value.get());
+			if (Array.isArray(value)) return value.map((entry) => unwrapLiveDeep(entry));
+			const source = value;
+			const out = {};
+			for (const key of Object.keys(source)) out[key] = unwrapLiveDeep(source[key]);
+			return out;
+		}
+		/** 字段值规范化（写前/回读比对同一口径）。
+		 *  scale>1 的字段（如时长字段存 ms、UI 用秒）：本函数与 parseInput 都工作在**存储口径**（ms）。 */
+		function canon(field, value) {
+			if (field.type === "bool") return value === true;
+			if (field.type === "num") { const n = Number(value); return Number.isFinite(n) ? n : null; }
+			if (field.type === "int") { const n = Math.round(Number(value)); return Number.isFinite(n) ? n : null; }
+			return typeof value === "string" ? value : void 0;
+		}
+		/** 解析输入框字符串 → 字段类型值（**存储口径**：scale 字段在此把「秒」换回「毫秒」）；非法返回 null。 */
+		function parseInput(field, raw) {
+			if (field.type === "bool") return raw === true;
+			/* R57b（2026-10-19 用户实测）：tpl（文案模板）与 text 一样是**字符串字段**。
+			 * 原先 tpl 落到数值分支 ⇒ 清空后 raw.trim()==="" 判 null ⇒ 保存被拒「输入不合法」
+			 * ⇒ 「留空 = 用内置文案」这条路根本走不通（用户无法把模板清回留空）。 */
+			if (field.type === "text" || field.type === "tpl") return typeof raw === "string" ? raw : null;
+			/* C5（审查）：清空输入拦为 null——原 `Number('')=0` 会把比率类字段存成 0（0 即该通道失效）。
+			 * null 走表单既有的「输入不合法」错误提示路径。 */
+			if (typeof raw === "string" && raw.trim() === "") return null;
+			const n = Number(raw);
+			if (!Number.isFinite(n)) return null;
+			const scaled = field.scale ? n * field.scale : n; // UI 秒 → 存储毫秒
+			if (field.type === "int") return Math.round(scaled);
+			return scaled;
+		}
+		/** 存储值 → UI 显示值（scale 字段：毫秒转秒）。 */
+		function toUi(field, storedValue) {
+			const base = storedValue === void 0 || storedValue === null ? field.def : storedValue;
+			if (field.type === "bool") return base === true; // 布尔直通：Number(true)=1 会让 checked===true 判定假阴（实测回归）
+			/* ⚠️ R57b（2026-10-19 用户实测「模板框里默认写个 0，应该为空白才对」）：
+			 * 文本类字段（text/tpl）必须**原样返回**——原先一律走 `Number(base)`，而 `Number("") === 0`
+			 * ⇒ 空模板被显示成 `0`。文本字段不是数字，绝不做数值归一。 */
+			if (field.type === "text" || field.type === "tpl") {
+				return base === void 0 || base === null ? "" : String(base);
+			}
+			const n = Number(base);
+			if (!Number.isFinite(n)) return base;
+			return field.scale ? n / field.scale : n;
+		}
+		/**
+		 * 写一个设置字段并回读校验（zcode writeField 同款纪律）：
+		 * set() resolve false = Host 拒绝；resolve true 也不代表落盘，必须读回比对。
+		 */
+		async function writeField(scope, field, value) {
+			if (!scope || typeof scope.set !== "function") throw new Error("设置服务不可用，面板处于只读状态。");
+			if ((await scope.set(field.key, value)) === false) {
+				throw new Error(`Host 拒绝写入 ${field.label}（${field.key}）。常见原因：设置命名空间未就绪，可稍后重试。`);
+			}
+			const readBack = canon(field, unwrapLiveDeep(scope.getSnapshot().value)?.[field.key]);
+			if (JSON.stringify(readBack) !== JSON.stringify(canon(field, value))) {
+				throw new Error(`写入未被持久化（${field.label} 读回值与写入值不一致），界面即将回弹。`);
+			}
+		}
+		//#endregion
+		//#region 样式（一次性注入；token 名来自 zcode 实测清单，回退值主题无关）
+		const PANEL_CSS = [
+			".dcp-panel{display:flex;flex-direction:column;gap:10px;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-primary,currentColor)}",
+			".dcp-summary{color:var(--dsw-alias-label-secondary,currentColor);opacity:.85}",
+			".dcp-grid{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:8px;background:var(--dsw-alias-bg-layer-1,transparent)}",
+			".dcp-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}",
+			".dcp-mini{font-size:10px;padding:1px 6px;cursor:pointer}",
+			/* 开关滑块（bool 字段）：**复刻 DSH 原生 Switch**（dsh-client-ui-primitives Switch.module.css，
+			 * 已存 docs/reference 溯源；36×20 轨道 padding2 + 16px 旋钮 translateX16）。
+			 * 全部用主题 token ⇒ 深浅主题自动适配（暗色下 ON=白轨道黑旋钮，与原生插件开关一致）。 */
+			".dcp-switch{position:relative;display:inline-block;width:36px;height:20px;flex:none;padding:2px;border:0;border-radius:999px;corner-shape:round;background:var(--dsw-alias-border-l3,rgba(128,128,128,.4));cursor:pointer;box-sizing:border-box;transition:background 120ms ease}",
+			".dcp-switch input{position:absolute;opacity:0;width:0;height:0;margin:0}",
+			".dcp-switch:has(input:checked){background:var(--dsw-alias-brand-primary,rgba(76,125,255,.9))}",
+			".dcp-switch:has(input:disabled){opacity:.5;cursor:default}",
+			".dcp-switch .dcp-slider{display:block;width:16px;height:16px;border-radius:50%;corner-shape:round;background:var(--dsw-alias-switch-thumb,rgba(128,128,128,.85));transition:transform 120ms ease;pointer-events:none}",
+			".dcp-switch input:checked + .dcp-slider{transform:translateX(16px);background:var(--dsw-alias-label-primary-foreground,#fff)}",
+			".dcp-switch input:focus-visible + .dcp-slider{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4c7dff));outline-offset:2px}",
+			/* R1（2026-10-07）：弹窗开关**小号**变体——用户要求「高度与『启用』字体一致」，且实测后要求再小。
+			 * 第二版（用户反馈「高度还是有点高」）：轨道 28×16 → **24×14**、滑块 12→10、位移 10px。
+			 * 比例与官方 36×20/16/16 一致（padding 2、滑块 = 轨道高 - 4）。 */
+			".dcp-switch-sm{width:24px;height:14px;padding:2px}",
+			".dcp-switch-sm .dcp-slider{width:10px;height:10px}",
+			".dcp-switch-sm input:checked + .dcp-slider{transform:translateX(10px)}",
+			".dcp-label{width:170px;color:var(--dsw-alias-label-secondary,currentColor);flex:none}",
+			".dcp-input{border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.45));border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,currentColor);padding:3px 8px;font-size:12px;min-width:110px}",
+			".dcp-hint{color:var(--dsw-alias-label-secondary,currentColor);opacity:.75;font-size:11px}",
+			/* ═══ R57（2026-10-19 用户要求）：模板输入框放大 + 内置文案改成旁边的按钮 ═══
+			 * 原先模板框与只读 <pre> 共用 .dcp-inj-p（rows:3）⇒ 用户实测「输入框尺寸太小」。
+			 * 现独立 .dcp-tpl（min-height 150px、等宽字体、可纵向拉伸），旁边一枚「查看内置文案」按钮。 */
+			".dcp-tplcol{display:flex;flex-direction:column;gap:6px;flex:1 1 auto;min-width:0}",
+			".dcp-tplwrap{display:flex;gap:8px;align-items:flex-start;width:100%}",
+			".dcp-tplbtns{display:flex;flex-direction:column;gap:6px;flex:none}",
+			".dcp-tpl{flex:1 1 auto;width:100%;min-height:150px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.45));border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,currentColor);padding:6px 8px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.55;resize:vertical;box-sizing:border-box}",
+			".dcp-tpl:disabled{opacity:.6}",
+			/* R87：模板字段的折叠行（默认折叠；样式全部走主题 token） */
+			".dcp-row-tpl{flex-direction:column;align-items:stretch;gap:6px}",
+			".dcp-tplhead{display:flex;align-items:center;gap:8px;width:100%;padding:6px 10px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:6px;background:var(--dsw-alias-bg-layer-1,transparent);color:inherit;font:inherit;cursor:pointer;text-align:left}",
+			".dcp-tplhead:hover{background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12))}",
+			".dcp-tplhead:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4c7dff));outline-offset:1px}",
+			".dcp-caret{width:12px;flex:none;opacity:.85}",
+			".dcp-tplname{font-weight:600}",
+			".dcp-tplstate{margin-left:auto;opacity:.7;font-size:11px}",
+			".dcp-tplbody{display:block}",
+			".dcp-tplbody.is-collapsed{display:none}",
+			".dcp-builtin{margin:0;padding:8px 10px;border:1px dashed var(--dsw-alias-border-l2,rgba(128,128,128,.45));border-radius:6px;background:var(--dsw-alias-bg-layer-1,transparent);white-space:pre-wrap;word-break:break-word;font-size:11.5px;line-height:1.5;max-height:340px;overflow:auto}",
+			".dcp-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}",
+			".dcp-btn{padding:4px 14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.45));border-radius:6px;background:var(--dsw-alias-bg-layer-1,transparent);color:var(--dsw-alias-label-primary,currentColor);cursor:pointer;font-size:12px}",
+			".dcp-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12))}",
+			".dcp-btn:disabled{opacity:.5;cursor:not-allowed}",
+			".dcp-btn-primary{border-color:var(--dsw-alias-brand-primary,currentColor);color:var(--dsw-alias-brand-primary,currentColor);font-weight:600}",
+			".dcp-msg-ok{color:var(--dsw-alias-state-success-primary,currentColor);font-weight:600;font-size:12px}",
+			".dcp-msg-error{color:var(--dsw-alias-state-error-primary,currentColor);font-weight:600;font-size:12px;word-break:break-all}",
+			/* 成本计算器 */
+			".dcp-calc{margin-top:2px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.35));border-radius:8px;background:var(--dsw-alias-bg-layer-1,transparent);display:flex;flex-direction:column;gap:8px}",
+			".dcp-calc-title{font-weight:600;font-size:12px}",
+			".dcp-presets{display:flex;gap:6px;flex-wrap:wrap}",
+			".dcp-preset{padding:2px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.45));border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary,currentColor);cursor:pointer;font-size:11px;line-height:16px}",
+			".dcp-preset:hover{background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.12))}",
+			".dcp-preset[data-active='1']{border-color:var(--dsw-alias-brand-primary,currentColor);color:var(--dsw-alias-brand-primary,currentColor);font-weight:600}",
+			".dcp-calc-num{width:96px;min-width:96px}",
+			".dcp-diag{display:flex;gap:14px;flex-wrap:wrap;color:var(--dsw-alias-label-secondary,currentColor);font-size:11px}",
+			".dcp-rec{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;align-items:center}",
+			".dcp-rec b{color:var(--dsw-alias-brand-primary,currentColor)}"
+		].join("\n");
+		if (typeof document !== "undefined") {
+			const cssId = "dsh-context-pilot/client.css";
+			if (!document.querySelector(`style[data-plugin-css="${cssId}"]`)) {
+				const styleTag = document.createElement("style");
+				styleTag.dataset.plugin = "dsh-context-pilot";
+				styleTag.dataset.pluginCss = cssId;
+				styleTag.textContent = PANEL_CSS;
+				document.head.appendChild(styleTag);
+			}
+		}
+		//#endregion
+		//#region 成本计算器（把 README §7 成本模型做成可交互面板）
+		/**
+		 * 依据三档单价推算合理阈值。模型与 README §7 完全一致（同一套公式，改一处须同步另一处）：
+		 *  - 单请求成本 = 命中价 × (上下文 - 新增) + 未命中价 × 新增 + 输出价 × 输出（此处只比较上下文相关项）
+		 *  - 压缩摊销成本 ≈ 新增 × 未命中价（摘要调用读满上下文 ∝ 阈值，但压缩间隔也 ∝ 阈值，两者相消）
+		 *  - 命中:未命中 比值越小（命中越便宜）⇒ 大上下文越无所谓 ⇒ 阈值可高（少压、保信息）
+		 *  - 比值越大（命中仍贵）⇒ 上下文持续失血 ⇒ 阈值应低（压早、省额度）
+		 * 实测常量（本机 2026-10-06）：新增/段 ≈ 6.8K token；压后回落 ≈ 25K。
+		 */
+		const CALC_CONST = { growth: 6800, floor: 25000 };
+		/** 预设（全部为 **人民币 ¥/1M** 口径，2026-10-06 官方页取证；unit/div 决定「估算单请求」的显示与除数。
+		 *  推荐值只依赖命中:未命中比值，与币种无关）。
+		 *  ⚠️ GLM 两档为 Coding Plan 积分口径（订阅制，官方无 ¥/M 换算，无法诚实折算成人民币）；其余为官方实价。
+		 *  ⚠️ Kimi K3 为参考价（官方定价页 JS 渲染无法直读）；千问 Max 的 ¥ 为统一价 $×7.1 折算（官方无 ¥ 价）。 */
+		const PRICE_PRESETS = [
+			{ id: "ds-flash", label: "DeepSeek flash(空闲)", hit: 0.02, miss: 1, out: 4, unit: "¥", div: 1e6, note: "官方 ¥/1M（空闲时段）；高峰时段 ×2（工作日 9-12/14-18 点）" },
+			{ id: "ds-pro", label: "DeepSeek v4-pro(空闲)", hit: 0.15, miss: 4.5, out: 13.5, unit: "¥", div: 1e6, note: "官方 ¥/1M（空闲时段）；高峰时段 ×2" },
+			{ id: "glm", label: "GLM-5.3", hit: 1.7, miss: 6.9, out: 24, unit: "积分", div: 1e4, note: "Coding Plan 积分系数/10000（订阅制，无官方 ¥/M 换算）；非高峰 ×50%" },
+			{ id: "glm-flash", label: "GLM-5.3-Flash", hit: 0.56, miss: 2.3, out: 8, unit: "积分", div: 1e4, note: "Coding Plan 积分系数/10000（订阅制）；非高峰 ×50%" },
+			{ id: "kimi-k3", label: "Kimi K3", hit: 1, miss: 4, out: 16, unit: "¥", div: 1e6, note: "参考价 ¥/1M（沿用 K2 系 1/4/16）；K3 另收缓存写入费（TTL 5min/1h）——以官方定价页为准" },
+			{ id: "qwen-max", label: "千问 3.8-Max", hit: 1.78, miss: 14.2, out: 42.6, unit: "¥", div: 1e6, note: "QwenCloud 统一价 $×7.1 折算（官方无 ¥ 价）；北京区原生 $1.98/$5.94（缓存未列）" },
+			{ id: "qwen-flash", label: "千问 3.8-Flash", hit: 0.1, miss: 0.8, out: 2.7, unit: "¥", div: 1e6, note: "官方北京区 ¥/1M（原生人民币价，无需换算）" },
+			{ id: "step-5", label: "阶跃 step-5", hit: 0.35, miss: 7, out: 20, unit: "¥", div: 1e6, note: "官方 API ¥/1M；命中:未命中 1:20，折扣强度仅次于 DeepSeek" },
+		];
+		/**
+		 * 由单价算推荐阈值。核心判据 = 上下文项占单请求成本的比例 ctxShare：
+		 *   ctxShare 低（命中便宜，如 DS）⇒ 阈值高：多压一次的信息损失 > 省下的钱。
+		 *   ctxShare 高（命中仍贵，如 GLM）⇒ 阈值低：压早直接换额度。
+		 * 锚点（据 README §7.3 结构占比 + §7.4 弹性表校准；取实测 ctxShare 而非理想值，使计算器复现 §7.5 表）：
+		 *   DS flash 在参考占用下 ctxShare≈50% → 推荐 markerMinRatio 0.30
+		 *   GLM-5.3 在同占用下 ctxShare≈93% → 推荐 markerMinRatio 0.15
+		 */
+		function recommendFromPrice(hit, miss) {
+			if (!(hit > 0) || !(miss > 0)) return null;
+			const ratio = miss / hit; // 命中:未命中 的倒数（越小 = 命中越便宜）
+			// 参考上下文取「中段占用」= 0.35 窗口，用于判定结构占比
+			const REF = 0.35 * 1_000_000;
+			const g = CALC_CONST.growth;
+			const ctxShare = ((REF - g) * hit) / ((REF - g) * hit + g * miss);
+			// 线性映射：ctxShare 0.50 → marker 0.30；ctxShare 0.93 → marker 0.15（两端夹逼到 [0.12, 0.40]）
+			const lerp = (x, x0, x1, y0, y1) => y0 + ((x - x0) * (y1 - y0)) / (x1 - x0);
+			const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+			const marker = clamp(lerp(ctxShare, 0.5, 0.93, 0.3, 0.15), 0.12, 0.4);
+			const crit = clamp(lerp(ctxShare, 0.5, 0.93, 0.85, 0.8), 0.75, 0.9);
+			// 2026-10-07：决策卡门槛 = 标记最低占用（用户决定）——不再有独立 card 值。
+			const r2 = (v) => Math.round(v * 100) / 100;
+			return {
+				ratio, ctxShare,
+				markerMinRatio: r2(marker),
+				criticalRatio: r2(crit),
+				verdict: ctxShare >= 0.8 ? "命中仍贵 ⇒ 上下文持续失血：建议压早（低阈值）"
+					: ctxShare >= 0.6 ? "中间地带：建议中等阈值"
+						: "命中很便宜 ⇒ 大上下文无所谓：建议压晚（高阈值），少压保信息",
+			};
+		}
+		//#endregion
+		//#region 卡片组件
+		/** props.view：'summary'（详情页顶部一行）| 'page'（完整表单）。settingsScope 走闭包。 */
+		function PilotPanelCard({ view }) {
+			const snapshot = settingsScope.getSnapshot();
+			const writable = snapshot.writable === true;
+			const stored = unwrapLiveDeep(snapshot.value) ?? {};
+			/* ⚠️ 就绪门（2026-10-08，用户实测反馈修复）：快照未解析前**不得渲染字段值**。
+			 * 原实现直接就 `stored[field.key]`，而未就绪时 `stored = {}` ⇒ 每一行都退回
+			 * `field.def` —— 它与已存值并不相同（实测：criticalRatio 默认 0.85 vs 已存 0.8；
+			 * markerMinRatio 默认 0.2 vs 已存 0.3）⇒ 面板「先显示一个值、随后跳到真实值」。
+			 * 新增字段插进来时这一帧最扎眼（用户看到「刚出现显示 600s，然后才变成 30s」；
+			 * 600s 实为紧邻的「强制压缩冷却(秒)」的默认值，根因就是这帧默认值渲染）。
+			 * 现未就绪只渲染占位：值一出现即终值，不存在「先错后对」。 */
+			const ready = snapshot.value !== void 0 && snapshot.value !== null;
+			const [rev, setRev] = react.useState(0);
+			/** 草稿：{key: 原始输入串/布尔}；null = 未编辑。 */
+			const [draft, setDraft] = react.useState(null);
+			const [saving, setSaving] = react.useState(false);
+			const [message, setMessage] = react.useState(void 0);
+			react.useEffect(() => {
+				if (settingsScope.subscribe === void 0) return void 0;
+				return settingsScope.subscribe(() => setRev((v) => v + 1));
+			}, [settingsScope]);
+			/**
+			 * 生效强制线上限（= 引擎阈值 − 5pp）。
+			 * ⚠️ 真 bug（2026-10-08 用户实测）：上限原先**只由悬浮弹窗的 pullHud 写入 `NS.engineCap`**，
+			 *    而面板是**独立表面**——用户没开过弹窗时 `NS.engineCap` 恒为 null ⇒
+			 *    ① 备注一直显示「待探测」② 保存时**不钳制**，设 0.8 就真存成 0.8（用户截图所见）。
+			 *    另外 `NS.engineCap` 是普通对象属性，改了不会触发重渲染 ⇒ 必须用 React state。
+			 *    面板于是**自己拉一次**（无参查询即返回 criticalCap）。
+			 */
+			const [engineCap, setEngineCap] = react.useState(
+				() => (typeof NS.engineCap === "number" && Number.isFinite(NS.engineCap) ? NS.engineCap : null),
+			);
+			/* R55：面板「本轮注入」区要显示 host 侧**本轮实际注入的原文**与**生效配置**。
+			 * 走同一路 getHud（只读，不参与保存流程）：挂载拉一次 + 用户点「刷新」再拉。
+			 * ⚠️ 刻意**不加定时器**——弹窗 chip 已有 5s 轮询，这里再加一个会把 RPC 量翻倍；
+			 * 注入原文本身是低频变化（每轮一次），手动刷新足够。 */
+			const [inj, setInj] = react.useState(null);
+			const [cfg, setCfg] = react.useState(null);
+			/* R57：哪一行模板正在展开「内置文案」（null = 全部收起）。必须与其他 hook 同层无条件调用。 */
+			const [tplOpen, setTplOpen] = react.useState(null);
+			/* R87（2026-10-27 用户要求）：三个模板框默认**折叠**——它们占掉整个面板的高度；
+			 * 用一个可点标题（左 ▸/▾ + 名字 + 右侧状态）替代原先常驻的 label + 大文本框。 */
+			const [tplExpand, setTplExpand] = react.useState({});
+			/* R71（审查 #6 + F-10）：原先 pullInj 与 pullCap **两个 effect 各发一次 getHud("")** —— 同一载荷拉两遍
+			 * （上方注释自己写着「不加定时器以免 RPC 翻倍」，挂载路径却翻了倍）；且 cap 走**无 sid** 调用 ⇒
+			 * host 侧 modelPolicies 永不命中，面板钳制上限与该模型真实引擎阈值可能不符（弹窗那条带 sid）。
+			 * 现合并为**一次**调用，并优先带 sid（与弹窗 getHud(resolveSid()) 同源）。 */
+			const pullInj = react.useCallback(async () => {
+				try {
+					if (!hudRemoteSvc || typeof hudRemoteSvc.getHud !== "function") return void 0;
+					const raw = await hudRemoteSvc.getHud(resolveSid());
+					const env = unwrapEnv(raw); // R75（S4）：复用模块级解包（失败时是 {ok:false}，下面各字段自然取不到）
+					const got = env && env.injected ? env.injected : null;
+					setInj(got);
+					setCfg(env && env.config ? env.config : null);
+					const c = env && typeof env.criticalCap === "number" && Number.isFinite(env.criticalCap) ? env.criticalCap : null;
+					if (c !== null) { NS.engineCap = c; setEngineCap(c); } // 保存路径与弹窗同源
+					return got; // R62：返回本轮注入，供可见反馈
+				} catch { return void 0; /* 吞：拿不到就显示「尚未取到」/按下限逻辑运行，绝不影响面板本身 */ }
+			}, [hudRemoteSvc]);
+			react.useEffect(() => { pullInj(); }, [pullInj]);
+			/**
+			 * 已存值**本身超过生效上限** ⇒ 自动钳回并保存（用户要求 2026-10-08：
+			 * 「如果原保存值超过钳回值，应该也直接钳回保存」）。
+			 * 场景：用户早先存过 0.8，之后余量规则把上限收到 0.75 ⇒ 进面板时 `stored` 仍是 0.8，
+			 * 而「保存」按钮的 disabled 含 `!dirty` —— 输入框显示的就是已存值 ⇒ `dirty=false`
+			 * ⇒ **按钮是灰的**，用户没有可行的收敛路径（用户实测就卡在这里）。
+			 * 只执行一次（ref 守卫）；仅在可写 + 上限已知 + 确实超限时动手；失败则复位以便重试。 */
+			const autoClamped = react.useRef(false);
+			react.useEffect(() => {
+				if (autoClamped.current) return;
+				/* R54（独立审计 F3）：**本 effect 自己的**存活标志——原实现在这里引用了上一个 effect
+				 * 里的 `alive`（作用域外 ⇒ ReferenceError）：await 之后的首个检查就抛、被 catch 吞掉后
+				 * 又在 catch 里**再抛一次** ⇒ 未捕获 rejection，且用户永远看不到成功/失败提示（静默）。 */
+				let alive = true;
+				if (!ready || !writable || engineCap === null) return;
+				const cur = Number(stored.criticalRatio);
+				if (!Number.isFinite(cur) || cur <= engineCap) return;
+				const field = FIELDS.find((f) => f.key === "criticalRatio");
+				if (!field) return;
+				autoClamped.current = true;
+				(async () => {
+					try {
+						/* R72（审查 C3）：落盘前归一，否则 host 下发的浮点尾差会写进配置并产生「幽灵 dirty」。 */
+						await writeField(settingsScope, field, roundRatio(engineCap));
+						/* E6（审查）：异步分支必须检查 `alive`——组件卸载后 setState 虽不报错，
+						 * 但这里还会**继续写配置**（越权副作用）；同文件其他异步路径都有这道守卫。 */
+						if (!alive) return;
+						const back = Number(unwrapLiveDeep(settingsScope.getSnapshot().value)?.criticalRatio);
+						if (back !== engineCap) throw new Error(`回读不一致（读到 ${back}）`);
+						setRev((v) => v + 1);
+						setMessage({
+							kind: "ok",
+							text: `已把「强制压缩线」由 ${cur} 自动钳到生效上限 ${engineCap} 并保存（上限 = 引擎阈值 − 余量 ${Math.round(marginSaved * 1000) / 10} 个百分点）。`,
+						});
+					} catch (error) {
+						autoClamped.current = false; // 失败允许下次重试
+						if (!alive) return;
+						setMessage({ kind: "error", text: `自动钳制失败：${String(error?.message ?? error)}` });
+					}
+				})();
+				return () => { alive = false; };
+			}, [ready, writable, engineCap, stored.criticalRatio]);
+			/** 取字段的 **UI 口径**值：草稿已是 UI 串（秒），存储值经 toUi 转成 UI 口径（毫秒→秒）。 */
+			const valueOf = (field) => {
+				if (draft !== null && Object.prototype.hasOwnProperty.call(draft, field.key)) return draft[field.key];
+				return toUi(field, stored[field.key]);
+			};
+			/* ═══ R67（2026-10-19 用户要求）：**上限随「阈值余量」实时重算** ═══
+			 * 用户：「设置应该是 DSH 内置的强制压缩线 − 余量 = 生效强制压缩线；现在设置余量，强制压缩线没有
+			 * 动态变化。比如现在是 0.05，设置 0.8 会被钳回 0.75；如果我设置 0.1，应该自动钳回 0.7」。
+			 * 旧实现 `engineCap` 只在挂载时由 HUD 拉一次（= 引擎阈值 − 当时的余量）⇒ 改余量不重算上限，
+			 * 强制压缩线自然不动。现在按活值重算：
+			 *   引擎阈值   = 拉到的 engineCap + 拉取时的余量（host: criticalCapOf = engineThreshold − margin）
+			 *   上限 capNow = 引擎阈值 − **当前草稿里的余量**  ⇒ 余量一改，上限立刻变
+			 * 再配合「草稿联动钳制 / 输入即时钳制 / 保存钳制」三处同时改用 capNow。 */
+			const marginSaved = (() => {
+				const m = Number(cfg?.engineCapMargin);
+				return Number.isFinite(m) && m >= 0 && m < 0.5 ? m : 0.05;
+			})();
+			const fieldOf = (key) => FIELDS.find((x) => x.key === key);
+			const engineThresholdNow = engineCap === null ? null : engineCap + marginSaved;
+			const marginDraft = (() => {
+				const f = fieldOf("engineCapMargin");
+				const raw = f && draft !== null && Object.prototype.hasOwnProperty.call(draft, "engineCapMargin")
+					? draft.engineCapMargin : (f ? toUi(f, stored.engineCapMargin) : marginSaved);
+				/* R72（审查 C10）：输入框被清空时 `Number("") === 0` 会**通过**下面的范围校验 ⇒
+				 * 草稿期 capNow 瞬时等于「引擎阈值全额」，钳制短暂放行。空串按"未填"处理，回退已保存值。 */
+				if (typeof raw === "string" && raw.trim() === "") return marginSaved;
+				const m = Number(raw);
+				return Number.isFinite(m) && m >= 0 && m < 0.5 ? m : marginSaved;
+			})();
+			/* R68（2026-10-19 用户实测「小数位有问题」）：上限是**浮点减法**算出来的
+			 * （0.75 + 0.05 − 0.1 = 0.7000000000000001）⇒ 直接 String() 进输入框就是一长串。
+			 * 比例类参数 **4 位小数（0.0001 = 0.01%）**已远超实际需要 ⇒ 统一归一后再往下用。 */
+			const roundRatio = (x) => Math.round(Number(x) * 1e4) / 1e4;
+			const capNow = engineThresholdNow === null ? null : Math.max(0, roundRatio(engineThresholdNow - marginDraft));
+			/** 字段备注：criticalRatio 动态追加**生效上限**（C-own）。
+			 *  ⚠️ 上限必须用**面板自己拉的 state**（`engineCap`），不能用 `NS.engineCap`——
+			 *     后者只有开过悬浮弹窗才有值（真 bug：用户没开弹窗 ⇒ 备注「待探测」+ 保存不钳制）。
+			 *  用户要求（2026-10-08）：上限 = DSH 内置阈值 **− 5 个百分点**（内置 80% ⇒ 75%），
+			 *  确保插件线确定性地先于引擎自动压缩触发。 */
+			/** ═══ R56（2026-10-19，用户实测「这个界面没有看到」）：`pct1` 必须提到**组件作用域** ═══
+			 * 事故现场：`const pct1` 原先定义在 `hintFor` **函数体内部**，而 **summary 分支**
+			 * （插件详情页那一行 `智能压缩线 x% ｜ 强制压缩线 y%`）在 `hintFor` **外面**调用它
+			 * ⇒ `ReferenceError: pct1 is not defined` ⇒ 被 `CardBoundary` 捕获 ⇒ `return null`
+			 * ⇒ **整张配置卡静默消失**（页面上"什么都没有"，控制台只有一条 console.warn）。
+			 * ⚠️ 这是本项目**第三次**栽在「作用域外的自由标识符」上：R54 的 F1（`lastUserText`）、
+			 * F3（`alive`），以及 §6.17 记录的 `PriceCalculator` 事故——**同一形状，同一个后果**。
+			 * 纪律：渲染期异常一律被错误边界吞掉 ⇒ 表现为"什么都没显示" ⇒ 排查成本极高。
+			 * 改这个文件时，凡在 JSX/分支里用的标识符，都要确认它在**使用点的作用域内**。 */
+			const pct1 = (x) => `${Math.round(Number(x) * 1000) / 10}%`;
+			/* ═══ R66（2026-10-19 用户实测「强制压缩线 0.75 与 阈值余量 0.05 有点冲突，看下哪个生效」）═══
+			 * 两者不是同一层概念，但旧提示把余量**写死成「5 个百分点」**（用户改了余量也不更新），
+			 * 而且**不显示最终生效值** ⇒ 看不出谁赢。现按活值把三层关系算清楚：
+			 *   引擎阈值 = 上限 + 余量（host 的 criticalCapOf = engineThreshold − margin，可反推）
+			 *   上限     = 引擎阈值 − 余量 = engineCap（面板拉到的 criticalCap）
+			 *   生效强制线 = min(强制压缩线, 上限)   ← 与 host 的 effCrit 同一公式
+			 */
+			const marginNow = marginDraft; // R67：余量取**当前草稿**（改完立即重算上限，不用等保存）
+			const effectiveCrit = () => {
+				const f = fieldOf("criticalRatio");
+				if (!f) return null;
+				const v = Number(valueOf(f));
+				if (!Number.isFinite(v)) return null;
+				return capNow === null ? null : Math.min(v, capNow);
+			};
+			/* R67：余量一改 ⇒ 上限降了 ⇒ 把「强制压缩线」当场钳到新上限（草稿级；保存即落盘）。
+			 * 刻意**不自动写盘**：草稿里改了余量还没点保存就去写线上配置，会让用户"没保存却已改"。 */
+			react.useEffect(() => {
+				if (!ready || capNow === null) return;
+				const f = fieldOf("criticalRatio");
+				if (!f) return;
+				setDraft((d) => {
+					const has = d !== null && Object.prototype.hasOwnProperty.call(d, "criticalRatio");
+					const cur = Number(has ? d.criticalRatio : toUi(f, stored.criticalRatio));
+					if (!Number.isFinite(cur) || cur <= capNow) return d;
+					return { ...(d ?? {}), criticalRatio: String(capNow) };
+				});
+			}, [ready, capNow, stored.criticalRatio]);
+			const hintFor = (field) => {
+				const pp = Math.round(marginNow * 1000) / 10;
+				const eff = effectiveCrit();
+				const effTxt = eff === null ? "（待探测）" : pct1(eff);
+				const capTxt = capNow === null ? "?" : pct1(capNow);
+				if (field.key === "criticalRatio") {
+					return capNow === null
+						? `${field.hint}；上限 = 引擎阈值 − 余量 ${pp} 个百分点（待探测，见弹窗阈值行）`
+						: `${field.hint}；上限 = 引擎阈值 − 余量 ${pp} 个百分点（当前上限 ${capTxt}）；**生效强制线 = min(你的值, 上限) = ${effTxt}**，超出上限会自动钳到上限`;
+				}
+				if (field.key === "engineCapMargin") {
+					return `${field.hint}；当前引擎阈值 ${engineThresholdNow === null ? "（待探测）" : pct1(engineThresholdNow)} − 余量 ${pp}pp = 上限 ${capTxt}；**生效强制线 = ${effTxt}**（改余量后强制压缩线会自动跟着降）`;
+				}
+				return field.hint ?? "";
+			};
+			const dirty = draft !== null && FIELDS.some((f) => {
+				const cur = parseInput(f, valueOf(f));
+				const base = canon(f, stored[f.key] === void 0 ? f.def : stored[f.key]);
+				return cur === null || JSON.stringify(canon(f, cur)) !== JSON.stringify(base);
+			});
+			const setField = (field, raw) => {
+				/* 强制压缩线**输入即时钳制**（2026-10-08 用户二次反馈：「设置 0.8 没有钳回 0.75」）。
+				 * 为什么不能只靠保存时钳制：用户输入 0.8 而**已存值也是 0.8** 时 `dirty=false`
+				 * ⇒ **保存按钮直接是灰的**（用户截图），那条钳制路径根本走不到。
+				 * 即时钳制让输入框当场显示 0.75 ⇒ dirty 变真、保存可用。
+				 * 只钳「已构成完整数字且超过生效上限」的情形——输入过程（"" / "0."）不改写，
+				 * 否则会边打字边被改。上限未探测到（engineCap=null）时不钳，保存路径仍有同一道兜底。 */
+				let next = raw;
+				/* R67：钳制基准改为 **capNow**（引擎阈值 − 当前余量）⇒ 改完余量再输入也会按新上限钳。 */
+				if (field.key === "criticalRatio" && capNow !== null) {
+					const n = parseInput(field, raw);
+					if (n !== null && n > capNow) next = String(capNow);
+				}
+				setDraft((d) => ({ ...(d ?? {}), [field.key]: next }));
+				setMessage(void 0);
+			};
+			/**
+			 * 持久化一组字段值（{key: 值}），逐个写 + 回读校验；未变的跳过。
+			 * 抽成独立函数的原因：计算器的「一键填入并保存」要写的是**推荐值**而非当前 draft，
+			 * 若直接调 save() 只会存下旧 draft（闭包读的是 draft 快照）。
+			 * @returns {Promise<{written: number}>}
+			 */
+			const persist = async (values) => {
+				let written = 0;
+				/* C-own：强制压缩线的**生效上限 = 引擎阈值 − 5pp**（动态探测，不写死 0.8）。
+				 * 插件线必须先行（用户需求：插件开启时插件线生效，引擎只作关闭后的安全网）。
+				 * ⚠️ 上限取**面板自己的 state**（`engineCap`，挂载时自取），不用 `NS.engineCap`——
+				 *    后者只有开过悬浮弹窗才有值。真 bug：用户没开弹窗 ⇒ 保存**不钳制**，
+				 *    设 0.8 就真存成 0.8（2026-10-08 用户截图实测）。
+				 * 仍拿不到时不钳制——host 侧 pre-step/sweep 还有同一道 min() 兜底。 */
+				const cap = capNow !== null && capNow > 0 && capNow <= 1 ? capNow : null;
+				for (const field of FIELDS) {
+					if (!Object.prototype.hasOwnProperty.call(values, field.key)) continue;
+					let parsed = parseInput(field, values[field.key]);
+					if (parsed === null) throw new Error(`${field.label}：输入不是合法的${field.type === "text" ? "字符串" : "数值"}。`);
+					if (field.key === "criticalRatio" && cap !== null && parsed > cap) {
+						parsed = cap; // 超上限自动收到生效线（而非报错——用户意图是"至少这么晚"，收到上限仍满足）
+					}
+					const base = canon(field, stored[field.key] === void 0 ? field.def : stored[field.key]);
+					if (JSON.stringify(canon(field, parsed)) === JSON.stringify(base)) continue; // 未变不写
+					await writeField(settingsScope, field, parsed);
+					written += 1;
+				}
+				return { written };
+			};
+			const save = async () => {
+				if (saving || draft === null) return;
+				setSaving(true);
+				setMessage(void 0);
+				try {
+					const { written } = await persist(draft);
+					setDraft(null);
+					setMessage({ kind: "ok", text: `已保存并回读校验通过${written === 0 ? "（无变化）" : `（${written} 项）`}。` });
+				} catch (error) {
+					setMessage({ kind: "error", text: String(error?.message ?? error) });
+				} finally {
+					setSaving(false);
+				}
+			};
+			/** 计算器「一键填入并保存」：写推荐值 + 同步草稿（让上方表单立即反映新值）。
+			 *  @returns {Promise<{ok:boolean, text:string}>} 供计算器内联展示结果 */
+			const applyRecommendation = async (rec) => {
+				if (saving) return { ok: false, text: "正在保存中，请稍候。" };
+				setSaving(true);
+				setMessage(void 0);
+				try {
+					const values = {
+						markerMinRatio: rec.markerMinRatio,
+						criticalRatio: rec.criticalRatio,
+					};
+					const { written } = await persist(values);
+					setDraft(null); // 以写入值清理草稿，避免残留脏值
+					/* C-own：persist 可能已把 criticalRatio 钳到**生效上限**（引擎阈值 − 5pp）——回读真实生效值展示 */
+					const appliedCrit = Math.min(rec.criticalRatio, capNow !== null ? capNow : rec.criticalRatio);
+					const capNote = appliedCrit < rec.criticalRatio
+						? `（已按生效上限 ${Math.round(capNow * 1000) / 10}% 收敛）` : "";
+					const text = written === 0
+						? "推荐值与当前配置一致，无需写入。"
+						: `已应用并回读校验通过（${written} 项：智能压缩线 ${rec.markerMinRatio} / 强制压缩线 ${appliedCrit}${capNote}）`;
+					setMessage({ kind: "ok", text: `${text}。` });
+					return { ok: true, text };
+				} catch (error) {
+					const text = String(error?.message ?? error);
+					setMessage({ kind: "error", text });
+					return { ok: false, text };
+				} finally {
+					setSaving(false);
+				}
+			};
+			if (view === "summary") {
+				if (!ready) return el("span", { className: "dcp-summary" }, "配置读取中…");
+				/* R7：原先显示「强制压缩线 + 压缩标记」——标记已退役，改为显示**两条线**
+				 * （智能压缩线 / 强制压缩线），与弹窗阈值行同口径。 */
+				const crit = pct1(valueOf(FIELDS.find((f) => f.key === "criticalRatio")));
+				const smart = pct1(valueOf(FIELDS.find((f) => f.key === "markerMinRatio")));
+				return el("span", { className: "dcp-summary" },
+					`智能压缩线 ${smart} ｜ 强制压缩线 ${crit}`);
+			}
+			/* 未就绪（命名空间尚未绑定 / 快照未解析）：只显示占位，绝不渲染 field.def 冒充当前值。 */
+			if (!ready) {
+				return el("div", { className: "dcp-panel" },
+					el("div", { className: "dcp-summary" }, "配置读取中…"),
+					el("div", { className: "dcp-hint" },
+						writable
+							? "读到当前配置后自动显示；就绪前不渲染默认值（避免先显示一个值再跳变）。"
+							: "设置命名空间尚未就绪，当前只读；就绪后自动显示当前值。"),
+				);
+			}
+			/* R65（2026-10-19 用户要求）：面板不再展示「本轮注入」整段——太乱，且模板留空时与内置文案重复。
+			 * 内置文案改为**只在三个模板行**按需查看/复制：查看=展开、复制=写剪贴板（复制不需要先展开）。
+			 * 数据来源：本轮注入里的 builtin*（若已有注入）否则 HUD config.builtins（host 随时可读）。 */
+			const builtinTextOf = (field) => (field.key === "tplBrief" ? (inj?.builtinBrief ?? cfg?.builtins?.brief)
+				: field.key === "tplCard" ? (inj?.builtinCard ?? cfg?.builtins?.card)
+					: (inj?.builtinEffBrief ?? cfg?.builtins?.effBrief));
+			return el("div", { className: "dcp-panel" },
+				el("div", { className: "dcp-grid" },
+					FIELDS.map((field) => el("div", { className: "dcp-row" + (field.type === "tpl" ? " dcp-row-tpl" : ""), key: field.key },
+						field.type === "tpl"
+							? el("button", {
+								className: "dcp-tplhead", type: "button",
+								"aria-expanded": tplExpand[field.key] ? "true" : "false",
+								title: hintFor(field),
+								onClick: () => setTplExpand((v) => Object.assign({}, v, { [field.key]: !v[field.key] })),
+							},
+								el("span", { className: "dcp-caret" }, tplExpand[field.key] ? "▾" : "▸"),
+								el("span", { className: "dcp-tplname" }, field.label),
+								el("span", { className: "dcp-tplstate" }, String(valueOf(field)).trim() ? "已自定义 · 点击展开编辑" : "留空 = 内置文案 · 点击展开编辑"),
+							)
+							: el("label", { className: "dcp-label", title: hintFor(field) }, field.label),
+						field.type === "bool"
+							? el("label", { className: "dcp-switch", title: hintFor(field) },
+								el("input", {
+									type: "checkbox", disabled: !writable || saving,
+									checked: valueOf(field) === true,
+									onChange: (e) => setField(field, e.target.checked),
+								}),
+								el("span", { className: "dcp-slider" }),
+							)
+							: field.type === "tpl"
+								? el("div", { className: "dcp-tplbody" + (tplExpand[field.key] ? "" : " is-collapsed") },
+									el("div", { className: "dcp-tplcol" },
+									el("div", { className: "dcp-tplwrap" },
+										el("textarea", {
+											className: "dcp-tpl", rows: 8,
+											disabled: !writable || saving,
+											placeholder: "留空 = 用内置文案（必须含 {tool} 占位符）",
+											value: String(valueOf(field)),
+											onChange: (e) => setField(field, e.target.value),
+										}),
+										/* R65（2026-10-19 用户要求）：「本轮注入」整段撤掉后，内置文案成为唯一查看入口 ⇒
+										 * 三个模板行各给两个按钮：**查看内置文案** + **复制内置文案**（复制不需要先展开）。 */
+										el("div", { className: "dcp-tplbtns" },
+											el("button", {
+												className: "dcp-mini", type: "button",
+												title: "查看内置文案（模板留空时插件实际使用的原文）",
+												onClick: () => setTplOpen((v) => (v === field.key ? null : field.key)),
+											}, tplOpen === field.key ? "收起内置文案" : "查看内置文案"),
+											el("button", {
+												className: "dcp-mini", type: "button", title: "复制内置文案到剪贴板",
+												onClick: () => {
+													const t = builtinTextOf(field);
+													if (!t) { setMessage({ kind: "error", text: "暂无内置文案：先 toggle 插件（关→开）让 host 下发，再试" }); return; }
+													try {
+														navigator.clipboard?.writeText(String(t));
+														setMessage({ kind: "ok", text: `已复制「${field.label}」的内置文案` });
+													} catch { setMessage({ kind: "error", text: "复制失败：剪贴板不可用" }); }
+												},
+											}, "复制内置文案"),
+										),
+									),
+									tplOpen === field.key
+										? el("pre", { className: "dcp-builtin" },
+											builtinTextOf(field)
+												|| "（暂无内置文案：先 toggle 插件（关→开）加载新版 host，再重新打开本面板后重试；本面板不设刷新按钮）")
+										: null,
+								)
+								)
+								: el("input", {
+									className: "dcp-input", type: field.type === "text" ? "text" : "number",
+								step: field.type === "num" ? 0.05 : field.type === "int" ? 100 : void 0,
+								disabled: !writable || saving,
+								value: String(valueOf(field)),
+								onChange: (e) => setField(field, e.target.value),
+							}),
+						el("span", { className: "dcp-hint" }, hintFor(field)),
+					)),
+				),
+				el("div", { className: "dcp-actions" },
+					el("button", {
+						className: "dcp-btn", disabled: !writable || saving || draft === null,
+						onClick: () => { setDraft(null); setMessage(void 0); },
+					}, "放弃修改"),
+					el("button", {
+						className: "dcp-btn dcp-btn-primary", disabled: !writable || saving || !dirty,
+						onClick: save,
+					}, saving ? "保存中…" : "保存"),
+					writable ? null : el("span", { className: "dcp-hint" }, "设置命名空间不可写（尚未就绪），当前只读。"),
+					message !== void 0 ? el("span", { className: message.kind === "ok" ? "dcp-msg-ok" : "dcp-msg-error", role: "status" }, message.text) : null,
+				),
+				el("div", { className: "dcp-hint" },
+			"保存写入插件配置并**即时生效**（host 在每个决策点活读，无需重载）；压缩由模型调用 compact_context 触发、在**下一步开始前**执行，越过强制线时由插件在 pre-step 自动发起。"
+			+ "智能思考：开启后向 Agent 暴露当前思考档位（可选档由模型动态决定）并允许其调用 set_reasoning_effort 工具自主换档，本次任务内立即生效、不中断；关闭则提示词不注入、工具也不注册。"),
+				el(PriceCalculator, { writable, saving, onApply: applyRecommendation, engineCap: capNow }),
+			);
+		}
+		/**
+		 * 成本计算器（面板下方）：输入三档单价 → 推荐阈值 + 结构诊断。
+		 * 默认只计算（不写配置）；「一键填入并保存」按钮由用户显式点击才写入，
+		 * 走 onApply → applyRecommendation → persist → writeField（命名空间 set + 回读校验），
+		 * 与上方表单同一条持久化路径，故失败原因（未就绪/未持久化）提示完全一致。
+		 */
+		function PriceCalculator({ writable, saving, onApply, engineCap }) {
+			const [hit, setHit] = react.useState("0.02");
+			const [miss, setMiss] = react.useState("1");
+			const [out, setOut] = react.useState("4");
+			const [unit, setUnit] = react.useState("¥");
+			const [div, setDiv] = react.useState(1e6);
+			const [active, setActive] = react.useState("ds-flash");
+			const [applied, setApplied] = react.useState(void 0);
+			const pick = (p) => { setHit(String(p.hit)); setMiss(String(p.miss)); setOut(String(p.out)); setUnit(p.unit || "¥"); setDiv(p.div || 1e6); setActive(p.id); setApplied(void 0); };
+			const h = Number(hit), m = Number(miss), o = Number(out);
+			const rec = Number.isFinite(h) && Number.isFinite(m) ? recommendFromPrice(h, m) : null;
+			/** 单请求成本与结构占比（用于展示诊断，口径同 README §7.3） */
+			let diag = null;
+			if (rec) {
+				const REF = 0.35 * 1_000_000;
+				const g = CALC_CONST.growth;
+				const ctxCost = (REF - g) * h;
+				const newCost = g * m;
+				const outCost = Number.isFinite(o) ? g * 0.35 * o : 0; // 输出按新增的 35% 粗估
+				const total = ctxCost + newCost + outCost;
+				diag = {
+					ratio: rec.ratio, ctxShare: rec.ctxShare,
+					ctxPct: Math.round(ctxCost / total * 100),
+					newPct: Math.round(newCost / total * 100),
+					perReq: total / (div || 1e6),
+					unit,
+				};
+			}
+			const numField = (label, val, set, hint) => el("div", { className: "dcp-row" },
+				el("label", { className: "dcp-label", title: hint }, label),
+				el("input", {
+					className: "dcp-input dcp-calc-num", type: "number", step: "any", value: val,
+					onChange: (e) => { set(e.target.value); setActive(""); setApplied(void 0); },
+				}),
+				el("span", { className: "dcp-hint" }, hint ?? ""),
+			);
+			return el("div", { className: "dcp-calc" },
+				el("div", { className: "dcp-calc-title" }, "成本阈值计算器（参考值；点下方按钮可写入配置）"),
+				el("div", { className: "dcp-presets" },
+					PRICE_PRESETS.map((p) => el("button", {
+						/* R72（真 GLM-5.3 审查 C2）：React 组件不支持 `dataset` prop（那是原生 DOM 属性）⇒ 原先
+							 * CSS `.dcp-preset[data-active="1"]` **永不命中**，预设选中高亮从未生效。改写成 data-* 属性。 */
+							key: p.id, className: "dcp-preset", "data-active": active === p.id ? "1" : "0",
+						title: p.note, onClick: () => pick(p),
+					}, p.label)),
+				),
+				numField("缓存命中价格", hit, setHit, "每 1M token（或积分系数/10000）；命中越便宜，阈值可越高"),
+				numField("缓存未命中价格", miss, setMiss, "每 1M token：新增内容的单价，决定压缩摊销成本"),
+				numField("输出价格", out, setOut, "每 1M token：仅用于估算摘要/输出的占比"),
+				rec ? el("div", { className: "dcp-diag" },
+					el("span", null, `命中:未命中 = 1:${rec.ratio.toFixed(1)}`),
+					el("span", null, `上下文项占单请求 ${diag.ctxPct}%`),
+					el("span", null, `估算单请求 ≈ ${diag.perReq < 0.01 ? diag.perReq.toFixed(5) : diag.perReq.toFixed(2)} ${diag.unit}`),
+				) : el("div", { className: "dcp-hint" }, "请输入有效的正数价格。"),
+				rec ? el("div", { className: "dcp-rec" },
+					el("span", null, "推荐："),
+					el("span", null, "智能压缩线 ", el("b", null, rec.markerMinRatio)),
+					(() => {
+						/* C-own：推荐强制线同样不得越过**生效上限**（引擎阈值 − 5pp）——超出则按上限收敛并注明。
+						 * ⚠️ 上限来自 **props**（面板 state）：本组件是独立函数组件，直接引用面板 state名
+						 * 会 ReferenceError ⇒ 整个配置卡消失（2026-10-08 真事故）。
+						 * `node --check` 只查语法、抓不到未定义标识符 ⇒ 靠 contract 的作用域对账护栏。 */
+						const cap = engineCap !== null && engineCap > 0 && engineCap <= 1 ? engineCap : null;
+						const eff = cap !== null && rec.criticalRatio > cap ? cap : rec.criticalRatio;
+						return el("span", null,
+							"强制压缩线 ", el("b", null, eff),
+							eff < rec.criticalRatio ? el("span", { className: "dcp-hint" }, `（推荐值 ${rec.criticalRatio} 超生效上限，按 ${eff} 生效）`) : null,
+						);
+					})(),
+				) : null,
+				rec ? el("div", { className: "dcp-hint" }, rec.verdict) : null,
+				rec ? el("div", { className: "dcp-actions" },
+					el("button", {
+						className: "dcp-btn dcp-btn-primary",
+						disabled: !writable || saving === true,
+						title: writable ? "把上面三个推荐值写入配置并回读校验（可撤销：改回原值再保存）" : "设置命名空间未就绪，暂不可写入",
+						onClick: async () => {
+							setApplied(void 0);
+							const r = await onApply(rec);
+							setApplied(r);
+						},
+					}, saving === true ? "写入中…" : "一键填入并保存"),
+					writable ? null : el("span", { className: "dcp-hint" }, "设置命名空间未就绪，当前只读。"),
+					applied ? el("span", { className: applied.ok ? "dcp-msg-ok" : "dcp-msg-error", role: "status" }, applied.text) : null,
+				) : null,
+				el("div", { className: "dcp-hint" },
+					"模型说明：压缩摊销成本 ≈ 新增内容 × 未命中价，与阈值几乎无关（摘要调用 ∝ 阈值，但压缩间隔也 ∝ 阈值，两者相消）——全部收益来自上下文规模。详见 README §7。"),
+			);
+		}
+		/** 错误边界：**真正的 React 错误边界**（R7 审查 D5 修）。
+		 *  原先只是 `try { return el(PilotPanelCard, props) } catch { return null }` ——
+		 *  它**只能**挡住**渲染期同步**异常；组件的 effect / 事件回调 / 异步 setState 里抛的错
+		 *  照样冒泡到宿主，把整个插件详情页打崩。本项目已经出过一次「面板整卡消失」的真事故
+		 *  （`PriceCalculator` 引用未定义标识符，见 §6.17 的护栏）——那次是渲染期异常被这个
+		 *  try/catch 救了一部分，而**回调期**异常至今没有任何拦网。
+		 *  真正的边界必须是类组件：React 把子树的渲染期/提交期异常交给 `componentDidCatch`，
+		 *  并按 `getDerivedStateFromError` 的返回值把子树摘掉，而不是让异常逃出去。
+		 *  隔离粒度 = 单张卡：卡片坏了，插件详情页其余部分与宿主 UI 都不受影响。 */
+		class CardBoundary extends react.Component {
+			constructor(props) {
+				super(props);
+				this.state = { failed: false, message: "" };
+			}
+			static getDerivedStateFromError(error) {
+				return { failed: true, message: String((error && error.message) || error || "未知错误") };
+			}
+			componentDidCatch(error) {
+				console.warn(`${LOG} 卡片渲染失败（已隔离，面板其余部分不受影响）:`, error && error.message);
+			}
+			/* ═══ R56d（2026-10-19）：失败时**必须可见**，不许静默 return null ═══
+			 * 事故教训：用户连续三轮「插件详情页没有看到配置卡」，而卡片之所以"没有"，
+			 * 是渲染期异常被这里吞成 `return null` ⇒ 页面上**一片空白、零线索**（只有控制台
+			 * 一条 warn，而用户不会开 F12）⇒ 排查成本极高。
+			 * 现在失败时渲染一行**自解释**诊断（含错误消息），用户截图即可定位；
+			 * 隔离粒度不变：坏的只是这一张卡，插件详情页其余部分与宿主 UI 不受影响。 */
+			render() {
+				if (this.state.failed) {
+					return el("div", { className: "dcp-panel" },
+						el("div", { className: "dcp-summary" }, "⚠️ 配置卡渲染失败（已隔离，不影响 DSH 其余部分）"),
+						el("div", { className: "dcp-hint" }, `错误：${this.state.message}`),
+						el("div", { className: "dcp-hint" }, "请把这一行截图给开发者；浏览器控制台有完整堆栈。"),
+					);
+				}
+				return el(PilotPanelCard, this.props);
+			}
+		}
+		/**
+		 * R1：输入框「智能思考档位:<当前档>」chip（conversation.input.right slot）。
+		 * 显示条件 = 智能思考开关开启（effortEnabled 经 getHud 探测）。
+		 * 数据来源（2026-10-07 用户要求「不要 5S 轮询」后重写）：
+		 *   **响应式投影 `useProjection("modelSelection")`** —— 官方 UI 同款数据源
+		 *   （dsh-client-ui-conversation client.js L17240 等，`useProjection("plan")` 同形）。
+		 *   投影由会话事件驱动更新（model/selection、request/header 两类事件，
+		 *   见 api-session-controller applyModelSelectionProjection L2072-2088）
+		 *   ⇒ 换档一落库即重渲染，**无需任何轮询**。
+		 *   - lastUsed = 已生效档位（来自 request/header 事件）
+		 *   - pending  = 已选待生效（model/selection 事件）⇒ 优先显示，让用户提前看到
+		 * 开关状态 + **换档冷却**走 getHud，但**只在挂载时 + 投影变化时**各问一次
+		 * （事件驱动，非定时器）——投影一变就重问，拿到新的 cooldownUntil。
+		 * 样式：读邻居（模型选择器按钮）computedStyle 复制圆角/字号——router-laya 同款做法。
+		 * 全函数吞异常：任何失败都不渲染（绝不因 chip 打崩输入框）。
+		 */
+		/** chip 窄屏收起样式（注入一次）：≤560px（与 DSH 模型选择器同断点）时隐藏文字与点、
+		 * 显示压缩图标。容器查询在无容器祖先时按规范回退到视口宽 ⇒ 两态始终有定义。
+		 * 用 CSS 而非 JS 观察的原因（两次实测失败的教训）：
+		 *   ① v1 量 chip 自己——chip 是 flex:none 永不收缩 ⇒ 永远量到宽；
+		 *   ② v2 观察父容器——但 effect 依赖 [] 只在挂载跑一次，而 chip 首帧常因
+		 *      hostInfo 未就绪 return null ⇒ ref 为空、观察器根本没装上。
+		 *   CSS 容器查询不依赖任何挂载时序，与 DSH 模型选择器完全同机制。
+		 * R16.6（用户要求）简化：**恒为图标态**（任何尺寸都不再显示文字）——
+		 * 容器查询分支与 dot/label 元素一并移除，chip 恒显 24px 火花。 */
+		const ensureChipStyle = () => {
+			try {
+				if (typeof document === "undefined" || document.getElementById("dcp-effort-chip-style")) return;
+				const st = document.createElement("style");
+				st.id = "dcp-effort-chip-style";
+				st.textContent = [
+					".dcp-effort-chip{background:transparent!important;box-shadow:none!important;padding:0!important;margin-right:0!important}",
+					".dcp-effort-chip>[data-bg],.dcp-effort-chip>[data-progress]{display:none!important}",
+				].join("\n");
+				document.head.appendChild(st);
+			} catch { /* 注入失败 ⇒ 图标仍显示（盒样式走内联兜底） */ }
+		};
+
+		function EffortChip(props) {
+			const ref = react.useRef(null);
+			ensureChipStyle();
+			/* R16.19：**权威会话 id 来源**——本 chip 挂在 `conversation.input.right`（scope=session），
+			 * 该槽位的 standardProps 明确带 `sessionId: SessionId`（Slots 检视面确认）。
+			 * 真机教训：同一窗口内切换会话时 URL 不更新、fetch 捕获也会过期 ⇒ 只有这里能拿到**当前**会话。
+			 * 渲染期同步写入（幂等全局赋值）：保证本轮及后续所有按会话过滤的查询立刻用上正确 id。 */
+			try {
+				const sidProp = props && props.sessionId ? String(props.sessionId) : "";
+				if (sidProp && NS.sidActive !== sidProp) {
+					NS.sidActive = sidProp;
+					/* 会话变了 ⇒ 丢弃上一个会话的 HUD 缓存，避免「拿旧会话记录顶替」。 */
+					try { NS.pullHud?.(); } catch { /* 忽略 */ }
+				}
+			} catch { /* 忽略 */ }
+			/* ② 档位：响应式投影（事件驱动，零轮询）。useProjection 由 slot 标准 props 提供。 */
+			let sel = null;
+			try {
+				const up = props && props.useProjection;
+				if (typeof up === "function") sel = up("modelSelection") || null;
+			} catch { /* 投影不可用 ⇒ 不显示 */ }
+			/* pending 优先（已选待生效，用户可提前看到「下一步生效」的结果） */
+			/* R79：pending 存在但**没带档位**（只换模型/选「默认」）时，原先 effort 被判空 ⇒
+			 * **整个 chip 消失**，即使 lastUsed 有值。现按「带档位的 pending → lastUsed → 任意 pending」回退。 */
+			const pendingSel = sel && sel.pending && sel.pending.reasoningEffort ? sel.pending : null;
+			/* ═══ R84（N1，Kimi 复核）：路由行与档位行**解耦** ═══
+			 * 原实现 `shown = pendingSel || lastUsed`：当「只换模型、pending 不带档位」时，
+			 * `shown` 会落到**旧模型**的 lastUsed ⇒ tooltip 出现「旧 provider/model + 新档位」混行。
+			 * 现分开取：
+			 *   · routeSel —— 本轮**会用的**路由（pending 优先，否则 lastUsed）⇒ 模型行；
+			 *   · effort  —— 仅作档位兜底；真正的档位显示优先用 host 的 currentLabel
+			 *                （host 侧 read() 已是 pending 优先的真实生效值，见 R17 结论⑪）。 */
+			const routeSel = (sel && sel.pending) || (sel && sel.lastUsed) || null;
+			const effortObj = pendingSel || (sel && sel.lastUsed) || null;
+			const effort = effortObj && effortObj.reasoningEffort ? String(effortObj.reasoningEffort) : null;
+			const pendingNow = !!pendingSel;
+			/* ① host 侧信息（开关状态 + 换档冷却）：挂载时问一次；**投影变化时再问一次**
+			 * （换档必然改变投影 ⇒ 天然触发重问，拿到新的 cooldownUntil）。
+			 * 依赖数组用 effort/pendingNow：它们变化即代表投影变了。
+			 * R3-S9：host 现显式返回 effortEnabled 布尔 —— 开关状态与档位数据分离，
+			 * 不再用 `effort.ok` 同时承担两种语义（它既可能是「开关关闭」也可能是「读档失败」）。 */
+			const [hostInfo, setHostInfo] = react.useState(null);
+			/* R85（N2，Kimi 复核）：`lastSkip` 更新**不会**改变 modelSelection 投影，而 chip 只在投影变化/
+			 * 挂载+2.5s 补拉时取 HUD ⇒ 失败原因可能长期不可见。这里不加轮询、不加 wire 通道，
+			 * 改为**悬停即刷新**：用户真正要读 tooltip 的那一刻拉一次，天然对齐"读的时候是新的"。 */
+			const pullRef = react.useRef(null);
+			react.useEffect(() => {
+				let alive = true;
+				const pullOnce = async () => {
+					try {
+						if (!hudRemoteSvc || typeof hudRemoteSvc.getHud !== "function") return;
+						const raw = await hudRemoteSvc.getHud(resolveSid());
+						const env = raw && typeof raw === "object" && "value" in raw ? (raw.ok ? raw.value : null) : raw;
+						if (!alive) return;
+						const e = env && env.effort ? env.effort : null;
+						setHostInfo(env && env.ok
+							? {
+								on: env.effortEnabled === true,
+								cooldownUntil: e && typeof e.cooldownUntil === "number" ? e.cooldownUntil : 0,
+								cooldownTotalMs: e && typeof e.cooldownTotalMs === "number" ? e.cooldownTotalMs : 30000,
+								/* R16.6/R16.7：tooltip 的「最近切换 / 会话切换次数」。
+								 * ⚠️ 必须在这里透传——hudPayload 返回了这两个字段，但这里不取
+								 * 就永远到不了 tooltip（用户实测重启后显示 0 次的另一半根因）。 */
+								lastSwitch: e && e.lastSwitch ? e.lastSwitch : null,
+								switchCount: e && Number.isFinite(e.switchCount) ? e.switchCount : 0,
+								/* R23：host 侧统一给的「中文(id)」显示名（如 高(high)）——
+								 * 客户端**不自己维护档位名映射**（避免第二份真值）。 */
+								currentLabel: e && typeof e.currentLabel === "string" ? e.currentLabel : "",
+								/* R79：把"用户刚改档（本步骤即生效）"与"最近一次为什么没生效"透传上来——
+								 * host 早已在 hudPayload 里返回，client 不取就永远到不了 tooltip。 */
+								pendingChanged: e && e.pendingChanged === true,
+								pendingFrom: e && typeof e.pendingFrom === "string" ? e.pendingFrom : null,
+								lastSkip: e && e.lastSkip ? e.lastSkip : null,
+							}
+							: null);
+					} catch { /* 吞 */ }
+				};
+				pullRef.current = pullOnce; // R85：供 onMouseEnter 复用（同一份拉取逻辑，不复制）
+				pullOnce();
+				/* R15.1（用户实测反馈「切换到 Max 时 chip 没进入冷却」）：
+				 * 插件的状态**在投影变化之后**才落定——换档是「工具接受 → 下一次请求 apply → 才起算冷却」，
+				 * 而 chip 恰恰是被那次投影变化叫醒的。实测：轮询与 apply 落在同一秒，之后再无轮询
+				 * ⇒ chip 永远停在「就绪」。
+				 * ⇒ 投影变化后**再补拉一次**（一次性、低频；不是定时轮询）：把「稍后才落定」的状态捞回来。
+				 * 时长取 2.5s：换档 apply 就在下一次请求（同一步内，秒级），30s 冷却有充分余量。 */
+				const latePull = setTimeout(() => { if (alive) pullOnce(); }, 2500);
+				/* 开关被面板改动时立即重问一次（事件驱动，非定时器） */
+				let off;
+				try { off = settingsScope.subscribe?.(() => { pullOnce(); }); } catch { /* 忽略 */ }
+				return () => { alive = false; clearTimeout(latePull); try { off?.(); } catch { /* 忽略 */ } };
+			}, [effort, pendingNow]);
+			/* 冷却倒计时（本地，仅在确实处于冷却时启用 1s tick；冷却结束自动停） */
+			const [now, setNow] = react.useState(() => Date.now());
+			const until = hostInfo ? hostInfo.cooldownUntil : 0;
+			const cooling = until > now;
+			react.useEffect(() => {
+				if (!cooling) return undefined;
+				const t = setInterval(() => setNow(Date.now()), 1000);
+				return () => clearInterval(t);
+			}, [cooling]);
+			/* 邻居形状复制（一次性，挂在 ref 上）：圆角/字号跟随模型选择器 */
+			react.useEffect(() => {
+				try {
+					const node = ref.current;
+					if (!node) return;
+					const neighbour = document.querySelector('[class*="triggerEffort"]') || document.querySelector('[class*="modelTrigger"]');
+					const trigger = neighbour ? (neighbour.closest("button") || neighbour.parentElement) : null;
+					if (!trigger) return;
+					const cs = getComputedStyle(trigger);
+					if (cs.borderRadius && cs.borderRadius !== "0px") node.style.borderRadius = cs.borderRadius;
+					if (cs.fontSize) node.style.fontSize = cs.fontSize;
+				} catch { /* 忽略 */ }
+			}, [effort]);
+			/* R84（N1）：档位显示优先 host 的 currentLabel（真实生效口径）——
+			 * 这样「只换模型、pending 无档位」时 chip 仍能显示档位，而不是整块消失。 */
+			const tierLabel = (hostInfo && hostInfo.currentLabel) || effort;
+			if (!hostInfo || !hostInfo.on || !tierLabel) return null;
+			/* 显示形态（2026-10-08 用户要求重做）：
+			 * ① **删除内联的档位值与冷却秒数**（原「智能思考档位 low · 冷却 23s」）——
+			 *    这两项不再占位，全部移入 title 提示（信息不丢，只是不抢视觉）。
+			 * ② 文案两态：冷却中「智能思考冷却」、冷却完成「智能思考就绪」
+			 *    （2026-10-08 用户补充要求）——文字与样式**同源判据 `cooling`**，
+			 *    不会出现「文字说冷却、颜色说就绪」的不一致。
+			 * ③ 两个样式 + 进度条式过渡：
+			 *    底层铺满 warn 色 = 冷却态；上层 success 色按 progress 从左往右扫过
+			 *    ⇒ 冷却走完时正好扫满 = 就绪态。1s tick + CSS transition 补帧，肉眼即平滑。
+			 * 判据：progress 0 = 刚进冷却，1 = 冷却完成（`cooling=false` 时直接取 1，
+			 * 因此「冷却结束」与「扫满」是同一时刻，不会出现「样式已就绪但条还没满」）。 */
+			const totalMs = hostInfo.cooldownTotalMs > 0 ? hostInfo.cooldownTotalMs : 30000;
+			const remainMs = cooling ? Math.max(0, until - now) : 0;
+			const progress = cooling ? Math.min(1, Math.max(0, (totalMs - remainMs) / totalMs)) : 1;
+			const coolLeft = Math.ceil(remainMs / 1000);
+			const C_WARN = "var(--dsw-alias-state-warn-primary, #ff9f0a)";
+			/* 2026-10-08 用户要求：就绪态由**绿色**改为**发送按钮的蓝色**。
+			 * ⚠️ 第一次改错了 token，教训记在这里：
+			 *   我先按名字选了 `--dsw-alias-brand-primary`，结果 chip 渲染成**灰白色**。
+			 *   去 app.asar 查真值才发现：`--dsw-alias-brand-primary` = `--dsw-static-neutral-bluish-1000`
+			 *   （深色）/ `neutral-bluish-50`（浅色，= #f9fafb）——它是**随主题反转的中性高对比色**
+			 *   （`--dsw-alias-button-primary-fill` 就是它，即「白底黑字」那类主按钮），**根本不是蓝**。
+			 *   真正的发送按钮在 `.../dsh-client-ui-conversation/lib/client.js`：
+			 *     `.RlGAzG_primary{background:var(--dsw-alias-button-info-fill);border-radius:999px;width:34px;height:34px}`（"发送消息" 键 input.send）
+			 *   而 `--dsw-alias-button-info-fill: var(--dsw-static-deepseek-500)`。
+			 * ⇒ 直接复用**同一个 token**（而非近似色值），chip 与发送按钮在任何主题下都自动一致。
+			 *   回退值取该 token 的真值 #4176e6。 */
+			const C_OK = "var(--dsw-alias-button-info-fill, #4176e6)";
+			const accent = cooling ? C_WARN : C_OK;
+			/* R16.6（用户要求）：tooltip 增补「最近切换 / 会话切换次数」。
+			 * 数据来自 getHud 的 effort 字段（host 从按会话的 lastSwitch/switchCount 组装）。 */
+			const ls = hostInfo && hostInfo.lastSwitch ? hostInfo.lastSwitch : null;
+			/* R16.7 修复「悬浮弹窗 1 秒闪一次」：`title` 里的「还剩 Xs」每秒随 tick 变化 ⇒
+			 * React 更新 title attribute ⇒ 浏览器重置原生 tooltip（用户悬停时弹窗每秒闪）。
+			 * ✔ title 只放**稳定内容**；剩余秒数本就有火花显色动画承担（进度即信息），不再进 title。 */
+			const tip = [
+				`模型：${(routeSel && routeSel.provider) || "?"}/${(routeSel && routeSel.model) || "?"}`,
+				`当前档位：${tierLabel}`
+					+ (hostInfo && hostInfo.pendingChanged
+						? "（**用户刚改，本步骤即生效**——不是「保持」）"
+						: (pendingNow ? "（已选，下一步生效）" : "")),
+				(hostInfo && hostInfo.lastSkip)
+					? `最近一次未生效：${hostInfo.lastSkip.label}（${hostInfo.lastSkip.at}）`
+					: null,
+				cooling ? "换档冷却中（剩余时间见火花显色，从下往上）" : "换档冷却：已就绪",
+				ls ? `最近切换：${ls.from} → ${ls.to}（${ls.at}）` : "最近切换：本会话还没有",
+				`会话切换次数：${(hostInfo && hostInfo.switchCount) || 0} 次`,
+				"Agent 可调用 set_reasoning_effort 工具自主换档（本次任务内立即生效）",
+			].filter(Boolean).join("\n"); // R81：lastSkip 缺失时是 null ⇒ 不 join 出空行
+			/* 小尺寸态专用图标（R16.5f 定稿）：**思考火花（四角星 + 小星点），无外框**。
+			 * 语义（用户指出）：这是**智能思考**的 chip，图标必须是思考语义（火花/星芒），
+			 * 不能沿用插件图标的压缩层叠（那是压缩域的语义）。
+			 * 形随状态（用户要求的冷却动画）：
+			 *   - 冷却中：**灰色**（中性灰，深浅主题下都是「未点亮」感）
+			 *     ⇒ 彩色火花放在裁剪窗里，按冷却进度**从下往上显色**（进度条式）；
+			 *   - 冷却完成：整颗彩色点亮（ready=info 蓝，与发送按钮同源）。
+			 * 无外框（上一版实底方块被指「外层的框」多余）；24px（与 chip 等高），图标感更强。
+			 * 显色窗与灰底是**两张同形 SVG** 对齐叠放。 */
+			/* ✦ 四角星（凹边星芒，经典 sparkle 形）：M 顶点 → 用二次曲线内凹到各尖点。
+			 * 上一版用直线连点 ⇒ 形状像「+」。曲线内凹才是火花/闪耀的通用形态。 */
+			const SPARK = "M10 1.6 Q10.9 6.6 15.6 8 Q10.9 9.4 10 14.4 Q9.1 9.4 4.4 8 Q9.1 6.6 10 1.6 Z";
+			const sparkSvg = (fill) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="18" height="18">`
+				+ `<path d="${SPARK}" fill="${fill}"/>`
+				+ `<path d="M15.2 3.4 L15.85 5.15 L17.6 5.8 L15.85 6.45 L15.2 8.2 L14.55 6.45 L12.8 5.8 L14.55 5.15 Z" fill="${fill}" fill-opacity="0.8"/></svg>`;
+			const iconColor = cooling ? "#ff9f0a" : "#4176e6";
+			const grayUrl = `data:image/svg+xml;utf8,${encodeURIComponent(sparkSvg("#9aa3ad"))}`; // 未点亮：中性灰
+			const colorUrl = `data:image/svg+xml;utf8,${encodeURIComponent(sparkSvg(iconColor))}`; // 已显色
+			/* 显色窗：高度 = progress × 100%，底部对齐 ⇒ 从下往上涨；冷却完成(progress=1)全显。 */
+			const clipPct = Math.round(progress * 100);
+			/* R16.6（最终形态）：**恒为图标**——点与文字已按用户要求移除，任何尺寸都只显示火花。
+			 * 盒样式（背景/边框/扫色 overlay）由注入样式表整体关闭（不再有宽窄两态）。 */
+			return el("div", {
+				ref,
+				className: "dcp-effort-chip",
+				"data-state": cooling ? "cooling" : "ready",
+				title: tip,
+				/* R85（N2）：悬停刷新——让 tooltip 里的 lastSkip/pendingChanged/冷却在"读的那一刻"是新的。 */
+				onMouseEnter: () => { try { pullRef.current?.(); } catch { /* 忽略 */ } },
+				style: {
+					position: "relative", overflow: "visible", flex: "none",
+					display: "inline-flex", alignItems: "center",
+					height: "24px", lineHeight: 0,
+					userSelect: "none", cursor: "default",
+				},
+			},
+				/* 火花 = 双层叠放：底层灰色（未点亮），上层彩色装在**底部对齐的裁剪窗**里
+				 * （高度 = 冷却进度）⇒ 显色从下往上涨，进度条式；冷却完成整颗点亮。
+				 * ⚠️ img 不写内联 display（R16.5d 教训）。 */
+				el("span", {
+					className: "dcp-chip-icon",
+					"aria-hidden": "true",
+					/* 24px 与 chip 等高；alignSelf:center + lineHeight:0 防 inline 基线偏移。
+					 * 视觉微调（用户实测）：火花质量集中在下半部 ⇒ 下移 2px 校正视觉重心。 */
+					style: { position: "relative", width: "24px", height: "24px", flex: "none", alignSelf: "center", lineHeight: 0, top: "2px" },
+				},
+					el("img", { src: grayUrl, alt: "", draggable: false,
+						style: { position: "absolute", inset: 0, width: "24px", height: "24px" } }),
+					el("span", {
+						"aria-hidden": "true",
+						style: {
+							position: "absolute", left: 0, right: 0, bottom: 0,
+							height: `${clipPct}%`, overflow: "hidden",
+							transition: "height 1s linear",
+						},
+					},
+						el("img", { src: colorUrl, alt: cooling ? "智能思考冷却" : "智能思考就绪", draggable: false,
+							style: { position: "absolute", left: 0, bottom: 0, width: "24px", height: "24px" } }),
+					),
+				),
+			);
+		}
+		//#endregion
+		//#region apply
+		const name = "dsh-context-pilot-client";
+		/**
+		 * client 服务 inject：slots（卡注入）+ locale + remote + typert。
+		 * 机制（zcode 实证）：configForms 由 dsh-client-ui-settings 的 client 半提供，
+		 * 而它要求组合里先有 remote 服务才激活——缺 remote ⇒ configForms 恒 undefined ⇒ 面板永久只读。
+		 * settingsScope 闭包绑定（bundle.config 卡不依赖 inject 载荷，browser-kit 同款）。
+		 * typert（browser-kit client.js:504 同款）：$mount 的硬依赖——缺它 ⇒ $mount 抛
+		 * `cannot get property "typert" without inject`（2026-10-06 实证）⇒ HUD 轮询面挂不上。
+		 */
+		const inject = ["slots", "locale", "remote", "typert"];
+		/** ⚠️ R56b（2026-10-19，真复现抓到）：兜底 scope 必须是**独立常量**，不能写 `settingsScope`。
+		 *  事故现场：`scope.getSnapshot` 的兜底分支写的是 `settingsScope.getSnapshot()`，而
+		 *  下方 `settingsScope = scope` 把它指回自己 ⇒ 命名空间未就绪时 `getSnapshot` **自我递归**
+		 *  ⇒ `RangeError: Maximum call stack size exceeded`（渲染期）⇒ 被 CardBoundary 吞掉
+		 *  ⇒ **配置卡从来就没渲染过**（用户历次截图里那块空白）。 */
+		const UNAVAILABLE_SCOPE = { getSnapshot: () => ({ status: "unavailable", value: void 0, writable: false }), subscribe: void 0, set: () => Promise.resolve(false) };
+		let settingsScope = UNAVAILABLE_SCOPE;
+		let hudRemoteSvc = null; // getHud 轮询面句柄（ctx.inject 捕获）
+		function apply(ctx) {
+			try {
+				const forms = ctx.get ? ctx.get("configForms") : void 0;
+				/** 命名空间重绑定（zcode :479-519 同款）：镜像就绪前 writable=false，面板只读。 */
+				let current;
+				let currentOff;
+				const listeners = new Set();
+				const notify = () => { for (const listener of [...listeners]) listener(); };
+				const scope = {
+					getSnapshot: () => (current !== void 0 ? current.getSnapshot() : UNAVAILABLE_SCOPE.getSnapshot()),
+					subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+					set: (field, value) => (current !== void 0 ? current.set(field, value) : Promise.resolve(false)),
+				};
+				const rebind = () => {
+					let served;
+					try {
+						const all = forms?.describe().getSnapshot().view?.namespaces ?? [];
+						served = all.find((entry) => entry.ns === NS_EXACT) ?? all.find((entry) => NS_PATTERN.test(entry.ns));
+					} catch { /* 形状未就绪 */ }
+					const next = served === void 0 || forms === void 0 ? void 0 : forms.get(served.ns);
+					if (next !== current) {
+						currentOff?.();
+						current = next;
+						currentOff = current?.subscribe(notify);
+						notify();
+					}
+					if (next === void 0) {
+						try { (forms?.describe()).load?.(); } catch { /* 尽力加载 */ }
+					}
+				};
+				rebind();
+				forms?.describe().subscribe?.(rebind);
+				settingsScope = scope;
+				/* ═══ R56f（2026-10-19 真机定位）：卡片 key 必须覆盖 **profile 的 bundle 名** ═══
+				 * `plugins.bundle.config` 是 **keyed** 槽位；宿主插件页按
+				 *   renderSlot("plugins.bundle.config", { view: "page" }, { entryKey: pkg.name })
+				 * 派发，而 `pkg.name` 是 **profile 的 bundle 名**（`dsh.profile.bundles` 里那个字符串，
+				 * 可用 `plugin_manager list_bundles` 看到），**不是**本包 package.json 的 name。
+				 * 本插件在运行中的 profile 里以旧别名 `@local/dsh-context-pilot` 挂载
+				 * （2026-10-10 统一包名前的遗留）⇒ 只注册规范名时两边不相等 ⇒ 卡片区域
+				 * **静默空白**（无 error / 无 warn，槽位探针却显示 occupant active:true）。
+				 * 故两个 key 都注册：keyed 槽位允许不同 key 各占一格，无论 profile 用哪个名字都能命中。
+				 * 清单迁移到规范名后，别名那格自然空着、无害。 */
+				for (const cardKey of [CARD_KEY_ALIAS, BUNDLE_KEY]) {
+					ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register(
+						{ name: "plugins.bundle.config", key: cardKey, priority: 30, inject: () => ({}) },
+						CardBoundary,
+					));
+					console.info(`${LOG} 配置卡片已注册（plugins.bundle.config key=${cardKey}）`);
+				}
+				/* ═══ R1（2026-10-07）：输入框「智能思考档位」chip ═══
+				 * 位置（源码实证）：`conversation.input.right` 是 session 作用域 list slot，
+				 * 渲染点 dsh-client-ui-conversation/lib/client.js L17532 —— **紧邻**
+				 * renderSlot("conversation.input.model")，即模型选择器左侧（用户截图指定位置）。
+				 * 注册方式照 HapyRain/dsh-router-laya（.data/ref/router-laya-client.js L423）。
+				 * 显示条件：智能思考开关开启（host getHud 只在开启时返回 effort）。
+				 * 数据源：复用现有 getHud 5s 轮询（无需新通道）。 */
+				try {
+					if (ctx.slots && typeof ctx.slots.inject === "function") {
+						ctx.slots.inject("conversation.input.right", () => ctx.slots.register(
+							{ name: "conversation.input.right", id: "context-pilot-effort", order: 5 },
+							EffortChip,
+						));
+						console.info(`${LOG} 输入框档位 chip 已注册（conversation.input.right）`);
+					}
+				} catch (e) {
+					console.warn(`${LOG} 输入框 chip 注册失败（不影响其他功能）:`, e && e.message);
+				}
+				/* M5 HUD：client→host 轮询面挂载（configEditor 推送通道已判死，见 §6 M5）。 */
+				try {
+					const mount = ctx?.remote && ctx.remote.$mount;
+					if (typeof mount === "function") {
+						/* C6（审查）：$mount 失败退避重试（共 3 次尝试）——face/typert 时序性未就绪可自愈；
+						 * 结构性失败（如缺 typert inject）多两条 warn 而已。 */
+						let mountTries = 0;
+						const tryMount = () => {
+							mountTries += 1;
+							Promise.resolve(mount.call(ctx.remote, REMOTE_CONTRIBUTION))
+								.then(() => console.info(`${LOG} $mount 成功（第 ${mountTries} 次尝试）`))
+								.catch((e) => {
+									console.warn(`${LOG} $mount 失败（第 ${mountTries} 次尝试，HUD 无数据，不影响其他功能）:`, e && e.message);
+									if (mountTries <= 2) setTimeout(tryMount, mountTries === 1 ? 3000 : 10000);
+								});
+						};
+						tryMount();
+					}
+					if (typeof ctx?.inject === "function") {
+						/* 回调参数是 scope，服务在 scope.remote.<名>（browser-kit pitfalls 同款——2026-10-06 实证：
+						 * 直接把参数当服务存 ⇒ getHud 非函数 ⇒ 轮询静默空转，弹窗永远「暂无压缩记录」） */
+						ctx.inject([`remote.${HUD_FACE}`], (scope) => {
+							try {
+								const svc = scope && scope.remote && scope.remote[HUD_FACE];
+								if (svc && typeof svc.getHud === "function") {
+									hudRemoteSvc = svc;
+									console.info(`${LOG} remote.${HUD_FACE} 就绪（inject 子作用域）`);
+									/* C6（审查）：就绪即拉一次——首帧数据不再干等下一个 5s tick（弹窗开着才有效） */
+									if (typeof NS.pullHud === "function") NS.pullHud();
+								}
+							} catch { /* 就绪回调异常不影响条目 */ }
+						});
+					}
+				} catch (e) {
+					console.warn(`${LOG} HUD 轮询面挂载失败（吞）:`, e && e.message);
+				}
+				/* sessionId 捕获（按会话过滤 HUD）：**绝不能"谁带 sessionId 就认谁"**——
+				 * R16.11（2026-10-10 用户实测「新会话只压了一次，记录却显示很多条」）：
+				 * 原实现钩 fetch 并从**任意** URL 抓 `sessionId=`（last-wins），而 DSH 页面里
+				 * 别的会话/后台请求同样携带 sessionId ⇒ NS.sid 随时被**抢成另一个会话**，
+				 * 面板就列出了那个会话的记录（正是「串会话」）。
+				 * 现改为**多源择优 + 冲突留痕**：
+				 *   ① `location.href` 里出现 session id（本窗口自身的路由）——最高优先，每次轮询都重读；
+				 *   ② 首次 fetch 捕获（**first-wins**：本窗口的第一个会话请求必是自己的）；
+				 *   ③ 之后任何不同的 id 一律**不覆盖**，只累计到 NS.sidConflicts 供取证。 */
+				try {
+					if (!NS.sidHook) {
+						NS.sidHook = true;
+						const origFetch = window.fetch;
+						if (typeof origFetch === "function") {
+							window.fetch = function (...args) {
+								try {
+									const u = String((args[0] && args[0].url) || args[0] || "");
+									const m = /sessionId=(session-[A-Za-z0-9-]+)/.exec(u);
+									if (m) {
+										if (!NS.sid) NS.sid = m[1]; // first-wins
+										else if (NS.sid !== m[1]) {
+											NS.sidConflicts = (NS.sidConflicts || 0) + 1;
+											NS.sidConflictLast = m[1].slice(0, 24);
+										}
+									}
+								} catch { /* 忽略 */ }
+								return origFetch.apply(this, args);
+							};
+						}
+						try {
+							for (const e of performance.getEntriesByType("resource")) {
+								const m = /sessionId=(session-[A-Za-z0-9-]+)/.exec(e.name || "");
+								if (m && !NS.sid) NS.sid = m[1]; // 只补空，不覆盖
+							}
+						} catch { /* 忽略 */ }
+						/* 会话切换（同窗口内导航）⇒ 立即重问一次（事件驱动，非轮询）。
+						 * `NS.hudSid` 与「数据所属 sid」不一致时 renderHud/pullHud 也会自行清缓存。 */
+						try {
+							const onNav = () => { try { NS.pullHud?.(); } catch { /* 忽略 */ } };
+							window.addEventListener("popstate", onNav);
+							window.addEventListener("hashchange", onNav);
+						} catch { /* 忽略 */ }
+					}
+				} catch { /* 忽略 */ }
+				installPopupToggle();
+			} catch (error) {
+				console.error(`${LOG} client 面板加载失败（host 半不受影响）:`, error);
+			}
+		}
+		//#endregion
+		//#region 上下文弹窗开关（M4.6）
+		/**
+		 * 在原生「上下文已用 x%」悬浮弹窗里加一个插件总开关（DOM 注入 + 守卫重挂）。
+		 * 妥协声明（browser-kit toolbar 注入同款）：弹窗是宿主内部组件、无官方插槽，
+		 * DSH 升级可能失效——失效只是开关不见了，注入/压缩功能与配置卡片不受影响。
+		 * 写入走 settingsScope.set('enabled') + 回读校验；host 端 effEnabled() 活读，即时生效。
+		 */
+		function installPopupToggle() {
+			try {
+				if (typeof MutationObserver === "undefined" || !document?.body) return;
+				/* P37 多实例纪律：新 apply 先断旧观察器/旧轮询，绝不两个实例同时拉锯 */
+				if (NS.popupObserver) {
+					try { NS.popupObserver.disconnect(); } catch { /* 忽略 */ }
+				}
+				if (NS.popupTimer) {
+					try { clearInterval(NS.popupTimer); } catch { /* 忽略 */ }
+				}
+				/* C4（审查）：订阅登记——弹窗关闭后行随面板离开 DOM，登记表统一退订，
+				 * 防 settingsScope.listeners 里死回调随弹窗反复重开而累积空转。 */
+				const liveRows = [];
+				const sweepRows = () => {
+					for (let i = liveRows.length - 1; i >= 0; i--) {
+						const rec = liveRows[i];
+						if (rec.row.isConnected) continue;
+						if (typeof rec.off === "function") { try { rec.off(); } catch { /* 忽略 */ } }
+						liveRows.splice(i, 1);
+					}
+				};
+				let scheduled = false;
+				const buildRow = (panel) => {
+					const row = document.createElement("div");
+					row.dataset.dcpToggle = "1";
+					/* 结构复刻原生明细行（ContextMeter .row = [8px 色块 + 6px 间距] + 文字）：
+						行左缘即面板色块列起点（padding-left:0）→ 图标对齐色块列、文字对齐 dt 文字列。
+						右内边距为 0：开关右缘须与上方数值列（如 ~324K）右对齐（用户实测 12px 右内缩）。 */
+					row.style.cssText = "display:flex;align-items:center;gap:6px;padding:6px 0;border-top:1px solid rgba(128,128,128,.25);text-align:left;";
+					const icon = document.createElement("span");
+					icon.style.cssText = "display:inline-block;width:8px;height:8px;border-radius:2px;background:#4c7dff;flex:none;";
+					const label = document.createElement("span");
+					label.textContent = "智能压缩";
+					label.title = "注入 + 压缩总开关（关闭 = 恢复原生 DSH 行为）";
+					/* ⚠️ 去掉 flex:1（用户要求开关「移到智能压缩右侧挨着」）——flex:1 会把开关顶到行最右，
+					 * 与「挨着」矛盾。现为左紧凑排列：■ 智能压缩 [sw] 智能思考 [sw]（标签仍与其他行左对齐）。 */
+					label.style.cssText = "opacity:.85;white-space:nowrap;flex:none;";
+					/* ── R1（2026-10-07 用户要求）弹窗开关行改造 ─────────────────────────────
+					 * 变更点：① 删除「启用」文字标签；② 开关**缩小**（高度与「启用」字号一致）；
+					 * ③ 开关移到「智能压缩」右侧紧邻（固定 8px）；④ 右侧新增「智能思考」+ 开关。
+					 * 布局：label(flex:1 吃掉剩余) 之后是两个 [开关(±文字)] 组，天然右对齐。
+					 * 尺寸：原 36×20 → 28×16（knob 16→12、位移 16→12px），与 12px 字号行高协调。
+					 * ⚠️ 尺寸靠 CSS 类 .dcp-switch-sm 覆盖，不改 .dcp-switch 本体（配置面板仍在用大号）。 */
+					const mkSwitch = (ariaLabel) => {
+						const box = document.createElement("span");
+						box.className = "dcp-switch dcp-switch-sm";
+						const input = document.createElement("input");
+						input.type = "checkbox";
+						input.setAttribute("role", "switch");
+						input.setAttribute("aria-label", ariaLabel);
+						const knob = document.createElement("span");
+						knob.className = "dcp-slider";
+						box.appendChild(input);
+						box.appendChild(knob);
+						return { box, input, knob };
+					};
+					/* ① 智能压缩开关（原「启用」文字已删；开关直接跟在 label 右侧，间距由 row gap 给出） */
+					const wrap = document.createElement("label");
+					/* margin 2px + row gap 6px = 与「智能压缩」间距 8px（用户要求「一定的间距」） */
+					wrap.style.cssText = "display:inline-flex;align-items:center;cursor:pointer;flex:none;margin-left:2px;";
+					const sw1 = mkSwitch("智能压缩总开关");
+					wrap.appendChild(sw1.box);
+					const sync = () => {
+						try {
+							const s = settingsScope.getSnapshot();
+							const raw = s?.value?.enabled;
+							const value = raw !== null && typeof raw === "object" && typeof raw.get === "function" ? raw.get() : raw;
+							sw1.input.checked = value !== false;
+							sw1.input.disabled = s?.writable !== true;
+							wrap.style.opacity = s?.writable === true ? "1" : ".55";
+							label.style.opacity = s?.writable === true ? ".85" : ".45";
+							wrap.title = s?.writable === true ? "关闭 = 完全恢复原生 DSH 行为" : "设置命名空间未就绪，暂不可切换";
+						} catch { /* 快照失败保持现状 */ }
+					};
+					sw1.input.addEventListener("change", async () => {
+						const next = sw1.input.checked;
+						sw1.input.disabled = true;
+						try {
+							if ((await settingsScope.set("enabled", next)) === false) throw new Error("Host 拒绝写入");
+							const backRaw = unwrapLiveDeep(settingsScope.getSnapshot().value)?.enabled;
+							if (backRaw !== next) throw new Error("写入未持久化，已回弹");
+						} catch (error) {
+							console.warn(`${LOG} 弹窗开关写入失败:`, error && error.message);
+						} finally {
+							sync();
+						}
+					});
+					/* ② 智能思考开关（R1 新增）：独立配置字段 effortEnabled，与总开关解耦。
+					 * 语义（用户定义）：开 = 注入思考强度提示词 + 注册换档工具；关 = 两者都不做。 */
+					const wrapE = document.createElement("label");
+					/* 右对齐（用户要求「智能思考+开关右对齐」）：margin-left:auto 吃掉中间全部剩余空间，
+					 * 把本组推到行最右缘 —— 与上方数值列（如 ~282K）右对齐，也与弹窗右边界一致。
+					 * 左组（智能压缩 + 开关）保持紧邻，两组分居行两端。 */
+					wrapE.style.cssText = "display:inline-flex;align-items:center;gap:6px;cursor:pointer;flex:none;margin-left:auto;";
+					const labE = document.createElement("span");
+					labE.textContent = "智能思考";
+					labE.style.cssText = "opacity:.85;white-space:nowrap;font-size:12px;";
+					/* 2026-10-08 用户要求：智能思考前面**也加一个方块色块**，与「智能压缩」行同款
+					 * （8px / 圆角 2px / 同色 #4c7dff）——两行视觉成对，一眼看出都是本插件的开关。
+					 * 若想区分两个开关的色相，改这一处即可（当前与智能压缩同色，是刻意的「插件强调色」）。 */
+					const iconE = document.createElement("span");
+					iconE.style.cssText = "display:inline-block;width:8px;height:8px;border-radius:2px;background:#4c7dff;flex:none;";
+					const sw2 = mkSwitch("智能思考开关");
+					wrapE.appendChild(iconE);
+					wrapE.appendChild(labE);
+					wrapE.appendChild(sw2.box);
+					const syncE = () => {
+						try {
+							const s = settingsScope.getSnapshot();
+							const raw = s?.value?.effortEnabled;
+							const value = raw !== null && typeof raw === "object" && typeof raw.get === "function" ? raw.get() : raw;
+							sw2.input.checked = value === true;
+							sw2.input.disabled = s?.writable !== true;
+							wrapE.style.opacity = s?.writable === true ? "1" : ".55";
+							wrapE.title = s?.writable === true
+								? "开启后向 Agent 暴露当前思考档位并允许其自主换档；关闭则完全不介入"
+								: "设置命名空间未就绪，暂不可切换";
+						} catch { /* 快照失败保持现状 */ }
+					};
+					sw2.input.addEventListener("change", async () => {
+						const next = sw2.input.checked;
+						sw2.input.disabled = true;
+						try {
+							if ((await settingsScope.set("effortEnabled", next)) === false) throw new Error("Host 拒绝写入");
+							const backRaw = unwrapLiveDeep(settingsScope.getSnapshot().value)?.effortEnabled;
+							if (backRaw !== next) throw new Error("写入未持久化，已回弹");
+						} catch (error) {
+							console.warn(`${LOG} 智能思考开关写入失败:`, error && error.message);
+						} finally {
+							syncE();
+						}
+					});
+					if (typeof settingsScope.subscribe === "function") {
+						liveRows.push({ row, off: settingsScope.subscribe(sync) }); // C4：off 在册
+						liveRows.push({ row, off: settingsScope.subscribe(syncE) });
+					}
+					sync();
+					syncE();
+					row.appendChild(icon);
+					row.appendChild(label);
+					row.appendChild(wrap);
+					row.appendChild(wrapE);
+					return row;
+				};
+				/** M5 HUD 行：最近压缩摘要 + 武装/待执行徽章。数据源 = host 轮询 getHud（5s）覆盖 + 配置镜像兜底。 */
+				const buildHudRow = () => {
+					const row = document.createElement("div");
+					row.dataset.dcpHud = "1";
+					/* 行结构：line1 = 最近压缩（**按会话血统链过滤**）+徽章，line2 = 阈值速览（贴底）。
+					 * 记录易丢的真根因（2026-10-07 定案）：host getHud 曾因 agents 作用域错误抛
+					 * ReferenceError ⇒ client 永远拿不到数据（与 session id 无关，血统链为旁路加固）。 */
+					row.style.cssText = "display:flex;flex-direction:column;align-items:center;gap:0;padding:2px 12px 1px;text-align:center;overflow:hidden;max-width:100%;box-sizing:border-box;";
+					const line1 = document.createElement("div");
+					line1.style.cssText = "display:flex;align-items:center;justify-content:center;gap:8px;max-width:100%;overflow:hidden;";
+					const label = document.createElement("span");
+					/* 记录文字超长时在边界内省略（此前 nowrap 会溢出弹窗右缘） */
+					label.style.cssText = "opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;";
+					const thr = document.createElement("div");
+					/* 排版（2026-10-07）：用户两轮反馈的最终形态——
+					 * ①「上限 80% 没显示完整」→ 曾用 9px + 折行 + 半角分隔符解决截断；
+					 * ②「删除上限」「字体改大一些」→ 删掉上限（行变短）+ 字号 9px → **11px**。
+					 * 保留 word-break:normal（**不是** keep-all：keep-all 禁止汉字断行，反而更易溢出）
+					 * 与 overflow-wrap:anywhere 作为窄容器兜底；不再用 ellipsis（宁可折行不静默截断）。 */
+					thr.style.cssText = "font-size:11px;line-height:1.4;opacity:.68;letter-spacing:0;max-width:100%;white-space:normal;word-break:normal;overflow-wrap:anywhere;text-align:center;";
+					let hudRemote = null; // getHud 结果（覆盖配置镜像同名字段）
+					/* 完整本地日期时间（2026-10-08 用户要求）：YYYY-MM-DD HH:MM:SS。
+					 * 解析失败时回退原文前 19 字符，绝不显示 Invalid Date。 */
+					const fmtFullTime = (iso) => {
+						const d = new Date(String(iso ?? ""));
+						if (Number.isNaN(d.getTime())) return String(iso ?? "?").slice(0, 19) || "?";
+						const p = (n) => String(n).padStart(2, "0");
+						return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+							+ `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+					};
+					/* host 的 text 形如「02:45 · 智能压缩 · 省 217.8K」——完整日期时间已由 fmtFullTime 给出，
+					 * 故去掉前导 hh:mm 以免同一行出现两个时间。旧记录同样适用（模板自 B1 起未变）。 */
+					const stripHhmm = (text) => String(text ?? "").replace(/^\d{1,2}:\d{2}\s*·\s*/, "");
+					const renderHud = () => {
+						try {
+							const cfg = unwrapLiveDeep(settingsScope.getSnapshot()?.value) ?? {};
+							const v = { ...cfg, ...(hudRemote ?? {}) };
+							const act = typeof v.hudLastAct === "string" && v.hudLastAct ? v.hudLastAct : "";
+							/* 自诊断（2026-10-07）：无数据时把轮询状态显示出来——host 侧已证 getHud 从未被调用，
+							 * 而弹窗行是渲染成功的 ⇒ 断点在 client（$mount/inject 未就绪）。这段让截图即可定位。 */
+							let diag = "";
+							if (!act) {
+								const d = NS.hudDebug;
+								diag = d == null ? "（轮询未启动）"
+									: d.svc === false ? "（轮询面未就绪）"
+										: d.ok === false ? `（RPC 失败：${String(d.r || d.err || "?").slice(0, 40)}）`
+											: d.svc === true ? "（RPC 已通但无记录）" : "";
+							}
+							label.textContent = act ? `最近压缩 ${act}` : `本会话暂无压缩记录${diag}`;
+							/* 悬停 = **本会话**最近压缩列表（host 严格按 sid 过滤）+ 完整日期时间 + 取证指纹。
+							 * 2026-10-08 两处修正（用户实测反馈）：
+							 * ① **删除「全局兜底」显示路径**——它正是「弹窗里混进别的会话压缩记录」的来源。
+							 *    取证：hud-acts.json 里 3 个 sid，lineage 链 16616c07 → f4154f01（已成环）
+							 *    使 4/5 条被「本会话」命中，其中 f4154f01 属另一个 workspace 的会话。
+							 * ② 列表时间由 hh:mm 改为完整「YYYY-MM-DD HH:MM:SS」。 */
+							const detail = Array.isArray(v.actsDetail) ? v.actsDetail : null;
+							const actLines = detail && detail.length
+								? detail.map((x) => `${fmtFullTime(x && x.at)} · ${stripHhmm(x && x.text)}`)
+								: (act ? [act] : []);
+							row.title = `${actLines.length ? actLines.join("\n") : "（暂无压缩记录）"}\n—— dcp: gen=${v.gen || "?"} sid=${(resolveSid() || "?").slice(0, 13)} src=${sidSource()} n=${Array.isArray(v.actsDetail) ? v.actsDetail.length : 0}`;
+							/* R7：原「武装中」(`v.hudArmed === "armed"`) 与「待执行」(解析 `v.hudPending`)
+							 * 两个徽章随 marker 通道退役删除——压缩已改由工具在轮内触发，
+							 * **不存在**任何「压缩后自动恢复执行」的动作，徽章文案本身已失真。 */
+							/* 底部阈值速览：智能压缩线 / 强制压缩线（配置镜像实时跟随）。
+							 * 2026-10-07 用户要求：**删除「上限 NN%」**（引擎阈值是内部钳制细节，
+							 * 用户不需要在弹窗里看到；面板备注与计算器仍会说明该约束）。
+							 * 同时字号 9px → 11px（用户要求「字体改大一些」）——删掉上限后行更短，
+							 * 11px 仍能一行放下，无需再靠缩小字号换空间。 */
+							const pct = (x, d) => `${Math.round((Number.isFinite(Number(x)) ? Number(x) : d) * 100)}%`;
+							const num = (x, d) => (Number.isFinite(Number(x)) ? Number(x) : d);
+							/* 用户要求（2026-10-08）：强制线**永远比 DSH 内置阈值低 5 个百分点**
+							 * （内置 80% ⇒ 上限 75%）。弹窗显示**生效值**（= min(配置, 上限)），
+							 * 否则用户看到 80% 却在实际 75% 触发。
+							 * ⚠️ 用户随后明确要求**删掉「（已按上限 75% 收敛）」这层注释**——显示生效值本身
+							 * 已经说清事实，再加一句解释就是噪声（与 2026-10-07 删「上限 80%」同一取向）。
+							 * 且面板修好后保存即被钳到上限，该过渡态基本不再出现。 */
+							const critCap = num(v.criticalCap, null);
+							const critCfg = num(v.criticalRatio, 0.85);
+							const critEff = critCap != null ? Math.min(critCfg, critCap) : critCfg;
+							thr.textContent = `智能压缩线 ${pct(v.markerMinRatio, 0.2)} · 强制压缩线 ${pct(critEff, 0.85)}`;
+							/* 「距离触发还差多少」——弹窗已在顶部显示当前占用，这里补最有决策价值的一行：
+							 * 距智能压缩线还有多少（达线后模型可自行决定压缩），以及是否已越线。 */
+							const occ = num(v.occupancyRatio, null); // host 侧未提供时跳过（保持向后兼容）
+							/* R72（审查 C9）：host 允许 ratio 有值而 window 为 null（m5 的宽松透传）⇒
+							 * 直接乘会渲染「距智能压缩线 NaN」。窗口缺失时只报状态、不给距离。 */
+							const occWin = num(v.occupancyWindow, null);
+							if (occ != null && occWin != null) {
+								const smart = num(v.markerMinRatio, 0.2);
+								const crit = critEff; // ⚠️ 必须用生效值，否则会在「不会真正触发的线」上报已达线
+								const fmtK = (t) => (t >= 1000 ? `${(t / 1000).toFixed(0)}K` : String(Math.round(t)));
+								let hint;
+								if (occ >= crit) hint = "已达强制压缩线";
+								else if (occ >= smart) hint = `已过智能压缩线（距强制线 ${fmtK(occWin * (crit - occ))}）`;
+								else hint = `距智能压缩线 ${fmtK(occWin * (smart - occ))}`;
+								/* 用户反馈（2026-10-08 截图）：「已过智能压缩线（距强制线 305K）」被**从中间断开**
+								 * （显示成「…· 已过智」/「能压缩线（距强制线 305K）」）。
+								 * 根因：两条线 + 状态提示被拼进**同一个文本节点**，而弹窗宽仅 ~230px
+								 * —— 40+ 个汉字在 11px 下**不可能**一行放下，于是浏览器逐字折行。
+								 * 正解不是缩字号（用户已明确要求放大过），而是**把状态提示单独成行**：
+								 * 断点落在自然边界，既不会切断「智能压缩线」这个词，行数与现状（2 行）一致。
+								 * ⚠️ 别退回 `thr.textContent += ' · ' + hint` —— 那正是这次的回归形态。 */
+								const hintLine = document.createElement("div");
+								hintLine.textContent = hint;
+								hintLine.style.cssText = "margin-top:1px;";
+								thr.appendChild(hintLine);
+							}
+							/* R18：智能思考在**本模型**下会静默（无可切档 ⇒ 不注入文本、隐藏工具）。
+							 * 不给提示的话，用户看到「开关开着、却不提档位」会以为功能坏了——
+							 * 静默失效是本项目大忌，所以这里把判据摆到明面上（独立成行，见上方折行教训）。 */
+							if (v.effortEnabled === true && v.effortGate && v.effortGate.canSwitch === false) {
+								const gateLine = document.createElement("div");
+								gateLine.textContent = "智能思考：当前模型无可切换档位（已静默）";
+								gateLine.style.cssText = "margin-top:1px;opacity:.62;";
+								thr.appendChild(gateLine);
+							}
+						} catch { /* 快照失败保持现状 */ }
+					};
+					if (typeof settingsScope.subscribe === "function") liveRows.push({ row, off: settingsScope.subscribe(renderHud) }); // C4：off 在册
+					renderHud();
+					/* 5s 轮询 host（wire.host.mjs getHud → state.m5.hud）；立即拉一次 */
+					/* face 代理返回 {ok,value} 信封（browser-kit client.js:2098 同款实测坑）：必须拆包，
+					 * 否则 r.hudLastAct 恒 undefined ⇒ HUD 永远空态。无信封形态（直连）原样透传。 */
+					/* R75（S4）：原地的 unwrapEnv 已提到模块级（面板与弹窗共用一份）。 */
+					let everConnected = false; // C4：首次 pull 时 row 尚未 append（isConnected=false 属正常），只在「曾连过又断开」时自停
+					let myTimerId = null;
+					let myPullFn = null;
+					/** C4：停止本行轮询——只在计时器/桥仍属于本行时清，防旧行的回调误清新行（弹窗关→开瞬间竞态）。 */
+					const stopPolling = () => {
+						if (myTimerId != null && NS.hudTimer === myTimerId) {
+							try { clearInterval(myTimerId); } catch { /* 忽略 */ }
+							NS.hudTimer = null;
+						}
+						myTimerId = null;
+						if (myPullFn != null && NS.pullHud === myPullFn) NS.pullHud = null;
+						myPullFn = null;
+					};
+					const pullHud = async () => {
+						try {
+							/* C4（审查）：行已随弹窗关闭离开 DOM → 自停 5s 轮询（订阅退订由 sweepRows 就近接管） */
+							if (row.isConnected) everConnected = true;
+							else if (everConnected) {
+								stopPolling();
+								return;
+							}
+							if (!hudRemoteSvc || typeof hudRemoteSvc.getHud !== "function") {
+								NS.hudDebug = { svc: false, at: Date.now() };
+								return;
+							}
+							/* R16.11：sid 择优（URL 优先，其次 first-wins 捕获）。
+							 * ⚠️ **换代即弃缓存**：本次轮询用的 sid 与 `hudRemote` 所属的 sid
+							 * （NS.hudSid）不一致时，先把缓存清空再渲染——否则会拿**上一个会话**
+							 * 的记录顶替（用户实测「新会话只压一次却显示很多条」的另一条路径）。 */
+							const sidNow = resolveSid();
+							if ((NS.hudSid || "") !== sidNow) {
+								hudRemote = null;
+								NS.hudSid = sidNow;
+								try { renderHud(); } catch { /* 忽略 */ }
+							}
+							const r = unwrapEnv(await hudRemoteSvc.getHud(sidNow));
+							/* 2026-10-08：**删除「带参失败即退回无参全局查询」的回退**。
+							 * 原回退的初衷是「旧 face 未重载时带参被拒」，但它在协议不匹配时会把
+							 * **全部会话**的压缩记录灌进弹窗——正是用户实测反馈的问题形态。
+							 * 现在失败即如实显示 RPC 错误（renderHud 的 diag），不拿别会话数据顶替。 */
+							if (r && r.ok) {
+								hudRemote = {
+									hudLastAct: r.hudLastAct || "",
+									gen: r.gen || "",
+									/* 本会话压缩记录明细（host 严格按 sid 过滤）：{at, text}[] */
+									actsDetail: Array.isArray(r.actsDetail) ? r.actsDetail : null,
+									/* 生效强制线上限（= 引擎阈值 − 5pp）：既给保存路径钳制用（NS.engineCap），
+									 * 也给弹窗阈值行显示**生效值**用（否则用户看到 80%、实际 75% 触发）。 */
+									criticalCap: typeof r.criticalCap === "number" && Number.isFinite(r.criticalCap) ? r.criticalCap : null,
+									/* R7（审查 E1/B1 修）：`occupancyRatio` / `occupancyWindow` 此前**漏搬** ⇒
+									 * 弹窗底部「距智能压缩线 …」分支永远拿到 undefined、永不显示，
+									 * 而 host 侧一直在算并下发（wire 签名也早就声明了这两个字段）。
+									 * 这是「host 算了 / wire 声明了 / client 不用」的三端漂移实例。 */
+									occupancyRatio: typeof r.occupancyRatio === "number" && Number.isFinite(r.occupancyRatio) ? r.occupancyRatio : null,
+									occupancyWindow: typeof r.occupancyWindow === "number" && Number.isFinite(r.occupancyWindow) ? r.occupancyWindow : null,
+									/* R18：智能思考判据（供「无档可切 ⇒ 已静默」提示行）。
+									 * ⚠️ 必须在这里透传——host 算了、这里不取，就永远到不了 UI。 */
+									effortEnabled: r.effortEnabled === true,
+									effortGate: (r.effort && typeof r.effort === "object" && r.effort.gate && typeof r.effort.gate === "object")
+										? {
+											canSwitch: r.effort.gate.canSwitch === true,
+											why: typeof r.effort.gate.why === "string" ? r.effort.gate.why : "",
+										}
+										: null,
+								};
+								/* C-own：引擎阈值上限（host 动态探测，方案 C 钳制用）——存 NS 供保存路径读取 */
+								if (typeof r.criticalCap === "number" && Number.isFinite(r.criticalCap) && r.criticalCap > 0 && r.criticalCap <= 1) {
+									NS.engineCap = r.criticalCap;
+								}
+								NS.hudDebug = { svc: true, ok: true, act: r.hudLastAct ?? null, gen: r.gen ?? null, acts: Array.isArray(r.actsDetail) ? r.actsDetail.length : null, sid: (NS.sid || "").slice(0, 13) || null, at: Date.now() };
+								renderHud();
+							} else {
+								NS.hudDebug = { svc: true, ok: false, r: r && r.error || JSON.stringify(r)?.slice(0, 120), at: Date.now() };
+							}
+						} catch (e) {
+							NS.hudDebug = { svc: true, err: String((e && e.message) || e).slice(0, 160), at: Date.now() };
+						}
+					};
+					NS.pullHud = pullHud; // C6：就绪回调可立即触发首拉（跨行桥；行移除时置 null）
+					myPullFn = pullHud;
+					pullHud();
+					/* 重挂防护：清掉上一行留下的旧轮询（弹窗每次重开都会重建本行） */
+					if (NS.hudTimer) { try { clearInterval(NS.hudTimer); } catch { /* 忽略 */ } }
+					myTimerId = setInterval(() => { try { pullHud(); } catch { /* 忽略 */ } }, 5000);
+					NS.hudTimer = myTimerId;
+					line1.appendChild(label);
+					row.appendChild(line1);
+					row.appendChild(thr);
+					return row;
+				};
+				/** 弹窗根定位（v3，源码取证版）：dsh-client-ui-conversation 的 ContextMeter 面板
+				 *  经 createPortal(…, document.body) 挂到 body 直下，role="dialog"、
+				 *  aria-label=context.used（zh「上下文已用」/ en "of context used"）——
+				 *  属性选择器一击命中；找不到时兜底扫同源 iframe（聊天视图若被沙箱进子框架）。 */
+				const PANEL_SELECTORS = [
+					'div[role="dialog"][aria-label="上下文已用"]',
+					'div[role="dialog"][aria-label="of context used"]',
+				].join(",");
+				const queryPanel = (doc) => {
+					try { return doc.querySelector(PANEL_SELECTORS); } catch { return null; }
+				};
+				const findPanel = () => {
+					const direct = queryPanel(document);
+					if (direct) return direct;
+					try {
+						for (const frame of document.querySelectorAll("iframe")) {
+							let inner; try { inner = frame.contentDocument; } catch { continue; }
+							const hit = inner ? queryPanel(inner) : null;
+							if (hit) return hit;
+						}
+					} catch { /* 跨域帧不可入 */ }
+					return null;
+				};
+			/* D3（审查）：开关行与 HUD 行拆独立安装（各自「已挂」守卫）——aria 定位/宿主改版导致其一失效时
+			 * 另一行不受牵连（原实现只守卫开关行，HUD 行会被连坐跳过），也为「HUD 行可关」留位。 */
+			const installToggleRow = (panel) => {
+				if (panel.querySelector("[data-dcp-toggle]")) return false;
+				panel.appendChild(buildRow(panel));
+				return true;
+			};
+			const installHudRow = (panel) => {
+				if (panel.querySelector("[data-dcp-hud]")) return false;
+				panel.appendChild(buildHudRow());
+				return true;
+			};
+			const tryInject = () => {
+				try {
+					sweepRows(); // C4：先退订已离开 DOM 的行的订阅
+					const panel = findPanel();
+					if (!panel) return;
+					installToggleRow(panel);
+					installHudRow(panel);
+				} catch { /* 注入失败不影响其他功能 */ }
+			};
+				const observer = new MutationObserver(() => {
+					if (scheduled) return;
+					scheduled = true;
+					setTimeout(() => { scheduled = false; tryInject(); }, 120);
+				});
+				observer.observe(document.body, { childList: true, subtree: true });
+				NS.popupObserver = observer;
+				/* 1.2s 轮询兜底：MutationObserver 时序/路径再诡异也漏不过轮询（query 成本可忽略） */
+				NS.popupTimer = setInterval(() => { try { tryInject(); } catch { /* 忽略 */ } }, 1200);
+				tryInject();
+				console.info(`${LOG} 上下文弹窗开关已挂（v3 aria 定位 + 轮询兜底）`);
+			} catch (error) {
+				console.warn(`${LOG} 弹窗开关安装失败（不影响其他功能）:`, error && error.message);
+			}
+		}
+		//#endregion
+		exports.apply = apply;
+		exports.inject = inject;
+		exports.name = name;
+		return module.exports;
+	}
+});

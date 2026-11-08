@@ -1,0 +1,303 @@
+#!/usr/bin/env node
+/**
+ * test/report.mjs —— 报告形状契约 + 取证工具自检。
+ *
+ * 为什么需要：`plugin/.data/m1-report.json` 是**唯一的重启后取证入口**，
+ * 但它的形状随时可能被改动无声破坏（本项目已踩两次：
+ * ① dump 脚本按报告顶层读 m3/m5，实际在 history 条目上 ⇒ 恒为 null；
+ * ② dump-report-tail 仍读已删除的 keywordHits 字段）。
+ *
+ * 本脚本做三件事：
+ *   ① 校验**代码产出的形状契约**（读 host.impl.mjs 源码，断言关键字段仍被写入）
+ *   ② 若存在真实报告，校验其结构自洽（history 条目字段、profile 标记、bfOnce 依赖项）
+ *   ③ 自检 dump 工具能跑通（防工具随形状变更失效）
+ *
+ * 用法：node test/report.mjs
+ * 退出码：0 = 全通过；1 = 有失败（无报告时跳过 ②，不算失败）
+ */
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const PLUGIN = join(ROOT, 'plugin');
+const REPORT = join(PLUGIN, '.data', 'm1-report.json');
+const HUD_ACTS = join(PLUGIN, '.data', 'hud-acts.json');
+const DUMP = join(ROOT, 'docs', 'reference', 'tools', 'dump-report.cjs');
+
+let failures = 0;
+let checks = 0;
+const ok = (name, cond, detail) => {
+  checks++;
+  if (cond) console.log(`  ✅ ${name}`);
+  else { failures++; console.log(`  ❌ ${name}${detail ? '\n       ' + detail : ''}`); }
+};
+
+const host = readFileSync(join(PLUGIN, 'host.impl.mjs'), 'utf8');
+/* R14：core 属宿主侧 ⇒ 「宿主侧形状」类断言查 hostOrCore。 */
+const coreSrc = readFileSync(join(PLUGIN, 'core.mjs'), 'utf8');
+const hostOrCore = host + '\n' + coreSrc;
+/* R3（2026-10-08）：智能思考功能域已抽独立模块，相关断言随之改指向模块。 */
+const effort = readFileSync(join(PLUGIN, 'effort.mjs'), 'utf8');
+/* R11：M5 HUD 域（含 getHud 聚合响应主体 + 启动回填主体）已抽 plugin/m5.hud.mjs ⇒ 断言改指模块。 */
+const m5 = readFileSync(join(PLUGIN, 'm5.hud.mjs'), 'utf8');
+
+/* ═══════════ ① 产出侧形状契约（源码断言）═══════════ */
+console.log('\n== 1. 产出侧形状契约（快照构建者必须写入的关键字段）==');
+/* R13：快照产出侧已搬进 plugin/m1.snapshot.mjs ⇒ 形状断言改查模块。
+ * `writeReport`（落盘 / HISTORY_CAP 淘汰）仍在宿主，故分两张表按来源判定——
+ * 不合并成「任一处命中即可」：那会让「字段到底由谁产出」这件事失去约束。 */
+const m1src = readFileSync(join(PLUGIN, 'm1.snapshot.mjs'), 'utf8');
+const m1Blocks = [
+  ['m3 块含 eff（生效参数快照）', /eff:\s*\{\s*\.\.\.M3\s*\}/],
+  ['m3 块含 liveEnabled（开关现值）', /liveEnabled:\s*effEnabled\(\)/],
+  ['m3 块含 heartbeat（心跳取证）', /heartbeat:\s*state\.heartbeat/],
+  ['m3 块含 m4Probe（schema 解析）', /m4Probe:\s*state\.m4Probe/],
+  ['m3 块含 lastAct（压缩结果）', /lastAct:\s*state\.m3\.lastAct/],
+  /* R7：`lastDecision`（决策审计）随 `agent/inbox/inserted` 审计监听器一起删除；
+   * 新增 `compactIntentMiss` —— 「本 sid 无意图但表里有别的意图」的现场留痕
+   * （session id 轮转 ⇒ 工具回了 scheduled 但压缩永不发生，这是唯一可诊断点）。 */
+  ['m3 块含 compactIntentMiss（意图未命中的现场）', /compactIntentMiss:\s*state\.m3\.compactIntentMiss/],
+  ['m5 块含 hud（HUD 状态）', /hud:\s*\{\s*\.\.\.\(state\.m5\.hud/],
+  ['m5 块含 hudFace（face 注册状态）', /hudFace:\s*state\.m5\.hudFace/],
+  ['m5 块含 lastPublish（发布留痕）', /lastPublish:\s*state\.m5\.lastPublish/],
+  ['services 枚举（服务可达性）', /for \(const k of \['tokenMeter'/],
+  ['m2 块含 skips（注入跳过统计）', /skips:\s*\{\s*\.\.\.state\.m2\.skips\s*\}/],
+  /* R7：`m55` 块（armed/attempts/channelProbe）随 M5.5 收官残留整体删除 —— 旧断言在此退役。
+   * 反向断言：报告里不得再出现 m55（防复活）。 */
+];
+for (const [name, re] of m1Blocks) ok(`${name}｜m1.snapshot.mjs`, re.test(m1src));
+ok('报告不再含 m55 块（M5.5 恢复通道已整体退役）',
+  !/state\.m55/.test(m1src) && !/state\.m55/.test(host.replace(/\/\*[\s\S]*?\*\//g, '')),
+  'm55 残留 ⇒ 旧恢复通道有复活路径');
+
+/* ═══════════ ② bfOnce 依赖项（回填链不能断）═══════════ */
+console.log('\n== 2. 回填链依赖（bfOnce 读取的字段必须存在）==');
+/* R11：`bfOnce` 主体（报告→hud-acts 迁移/去重/重发布）已搬进 m5.hud.mjs 的 `republishFromReport`；
+ * 宿主只留重试节奏。断言改从模块取切片。 */
+const bfOnce = /const republishFromReport = \(\) => \{([\s\S]*?)\n  \};/.exec(m5)?.[0] ?? '';
+ok('解析出 republishFromReport（原 bfOnce 主体，已在 m5.hud.mjs）', bfOnce.length > 0, '未找到回填主体（重命名了？回填链检查失效）');
+ok('bfOnce 按 reason==="m3-act" 筛选', /reason === 'm3-act'/.test(bfOnce),
+  'bfOnce 的筛选条件变了——回填会读错条目');
+ok('bfOnce 读 e.m3.lastAct（条目路径，非顶层）', /e\?\.m3\?\.lastAct|e\.m3\.lastAct/.test(bfOnce),
+  'bfOnce 未按「条目上的 m3」读取（历史 bug：按顶层读恒 null）');
+ok('bfOnce 回填 sid（会话过滤依赖）', /sessionId/.test(bfOnce), 'bfOnce 未取 sessionId ⇒ 按会话过滤失效');
+
+/* ═══════════ ③ 瘦身档位与关键事件保护 ═══════════ */
+console.log('\n== 3. C3② 瘦身档位（关键事件必须走 full）==');
+const slimMatch = /const SLIM_REASONS = new Set\(\[([\s\S]*?)\]\);/.exec(m1src)?.[1] ?? '';
+const slimSet = new Set([...slimMatch.matchAll(/'([^']+)'/g)].map((m) => m[1]));
+ok('解析出 SLIM_REASONS', slimSet.size > 0, '未找到 SLIM_REASONS（瘦身逻辑改了？）');
+const MUST_FULL = ['m3-act', 'm4-probe', 'activation+2s', 'boot+10s'];
+for (const mustFull of MUST_FULL) {
+  ok(`关键事件 ${mustFull} 不在精简档`, !slimSet.has(mustFull),
+    `${mustFull} 被列入 slim ⇒ 取证信息丢失（m3-act 还会破坏回填）`);
+}
+ok('slimSnapshot 由 refresh 按 isSlimReason 调用（判定口径在 M1 域）',
+  /let slimSnapshot = \(snap\) => \(\{ \.\.\.snap, profile: 'slim' \}\);/.test(coreSrc)
+  && /writeReport\(isSlimReason\(reason\) \? slimSnapshot\(snap\)/.test(coreSrc)
+  && /const isSlim = \(reason\) => SLIM_REASONS\.has\(reason\);/.test(m1src),
+  '瘦身未生效，或判定口径散在两处（R13 踩过：漏改 refresh 的引用 ⇒ ReferenceError ⇒ 报告永不落盘）');
+/* ═══ R8 修（审查发现的取证静默丢失）═══
+ * 现场：报告 120 条**全是 slim、full 0 条** —— 高频 slim 事件（heartbeat 120s / agent/status /
+ * m5-publish 400ms 防抖 / m2-inject）把 FULL 条目挤出环形缓冲，而 FULL 恰是「压缩成没成」的唯一留档位。
+ * 上面那条「不在 slim 名单」根本抓不到这件事，因为它只查**名单**、不查**历史里到底有没有**。 */
+ok('满环时优先淘汰最旧的 slim 条目（FULL 取证不得被挤出）',
+  /* R14：writeReport（含淘汰策略）已搬进 core.mjs。 */
+  /const slimIdx = next\.findIndex\(\(e\) => e\?\.profile === 'slim'\);/.test(coreSrc)
+  && /next\.splice\(slimIdx === -1 \? 0 : slimIdx, 1\);/.test(coreSrc)
+  && !/\.slice\(-HISTORY_CAP\)/.test(coreSrc),
+  '仍按整体最旧淘汰 ⇒ 高频 slim 会把 activation/m3-act 等 FULL 证据挤出 120 条窗口');
+
+/* ═══════════ 3.5 getHud 作用域契约（防 ReferenceError 回归）═══════════ */
+console.log('\n== 3.5 getHud 作用域契约（2026-10-07 真根因）==');
+// 实测事故：agents 声明在 occ IIFE 内部，criticalCap 却在 IIFE 外引用它 ⇒ 每次 getHud 抛
+// ReferenceError("agents is not defined") ⇒ client 永远拿不到数据、弹窗恒「暂无压缩记录」。
+const getHudBody = (() => {
+  /* R11：主体已搬进 plugin/m5.hud.mjs 的 `buildHudResponse` ⇒ 从模块取切片。
+   * R1（2026-10-07）历史：签名由 `onGetHud: (sid) =>` 变为 `onGetHud: async (sid) =>`。 */
+  const m = /const buildHudResponse = async \(sid\) => \{/.exec(m5);
+  if (!m) return '';
+  const s = m.index;
+  /* ⚠️ 结束标记必须是**赋值语句** `state.m5.hudPollReq = {`，不能只用字段名——
+   * 函数体内外的注释/说明里也会出现字段名（R16.10：注释里引用了它，
+   * 导致切片在注释处提前截断 ⇒ targetAgent/criticalCap 断言全部误报失败）。 */
+  const e = m5.indexOf('state.m5.hudPollReq = {', s);
+  return e > s ? m5.slice(s, e) : m5.slice(s, s + 4000);
+})();
+ok('解析出 onGetHud 函数体（m5.hud.mjs buildHudResponse）', getHudBody.length > 0, '未找到 onGetHud');
+ok('agents 在 onGetHud 顶层声明（不在 IIFE 内）',
+  /const agents = svc\('agents'\)/.test(getHudBody),
+  'agents 未在 onGetHud 顶层声明 ⇒ criticalCap 引用会抛 ReferenceError');
+const occStart = getHudBody.indexOf('const occ = (()');
+const occBody = occStart >= 0 ? getHudBody.slice(occStart, getHudBody.indexOf('})();', occStart)) : '';
+ok('occ IIFE 内不再重复声明 agents', !/const agents\s*=/.test(occBody),
+  'occ IIFE 内仍声明 agents ⇒ 外层 criticalCap 引用会 ReferenceError');
+ok('criticalCap 的 Agent 在作用域内解析（targetAgent 由 agents 选出）',
+  /const targetAgent = [\s\S]{0,200}agents\.find/.test(getHudBody) && /criticalCap:\s*criticalCapOf\(targetAgent\)/.test(getHudBody),
+  'criticalCap 未用作用域内解析出的 Agent ⇒ 可能又传 Session/未定义变量');
+ok('getHud 有常驻取证字段 hudPollReq（查 m5.hud.mjs）', /state\.m5\.hudPollReq = \{/.test(m5),
+  '缺 hudPollReq ⇒ 下次同类问题无法从报告判断 host 是否被调用');
+/* 实测缺陷（2026-10-07）：getHud 给 engineThreshold 传了 `?.session`（Session 本体），
+ * 而 resolveCompactionFor 要的是 Agent（走 agent.ctx / agentPresets.serviceFor(agent,...)）
+ * ⇒ 每次 5s 轮询都写 via:unresolved/fallback:true，criticalCap 恒为兜底 0.8。
+ * 证据：getHud 的 engineCapProbe 时间戳与 hudPollReq 逐次吻合，而 pre-step 全部解析成功。
+ * ⚠️ 2026-10-08：下发点由 `engineThreshold(targetAgent)` 改为 `criticalCapOf(targetAgent)`
+ *    （用户要求强制线恒低于引擎阈值 5pp，上限计算收敛到单一函数）；**传 Agent 本体的要求不变**，
+ *    且现在多了一层：实参若变成 `targetAgent.session`，engineThreshold 内部就会 unresolved。 */
+const capArg = /criticalCap:\s*criticalCapOf\(([^)]*)\)/.exec(getHudBody)?.[1] ?? '';
+ok('解析出 criticalCap 的实参（上限函数）', capArg.length > 0, '未匹配到 criticalCap 实参');
+ok('criticalCap 传 Agent 本体（不得传 .session）',
+  capArg.length > 0 && !/\.session/.test(capArg),
+  `criticalCap 传了 Session 而非 Agent（实参：${capArg}）⇒ resolveCompactionFor 返回 unresolved，cap 恒为兜底值`);
+
+/* ═══════════ ④ 真实报告结构自洽（有报告才跑）═══════════ */
+console.log('\n== 4. 真实报告结构自洽 ==');
+/* R50：读「**活插件正在写**的 JSON」——有界重读。
+ * 真机实测（2026-10-17 18:26）：会话活跃时插件边跑边写 `.data/*.json`，测试若撞上写盘窗口，
+ * `JSON.parse` 会拿到半截文件（`Unterminated string`）⇒ 套件**假红**。这不是产品缺陷而是测试竞态。
+ * 重读到成功或超时；仍失败才抛（真损坏照样报错，不掩盖问题）。 */
+const readJsonRetry = (p, tries = 6) => {
+  let last = null;
+  for (let i = 0; i < tries; i += 1) {
+    try { return JSON.parse(readFileSync(p, 'utf8')); } catch (e) {
+      last = e;
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200); } catch { /* ignore */ }
+    }
+  }
+  throw last;
+};
+if (!existsSync(REPORT)) {
+  console.log('  ⚠️ 跳过（报告不存在：' + REPORT + '）');
+} else {
+  const rep = readJsonRetry(REPORT);
+  ok('顶层含 history 数组', Array.isArray(rep.history));
+  const hist = rep.history ?? [];
+  ok(`history 非空（${hist.length} 条）`, hist.length > 0);
+
+  // 字段必须挂在条目上（本项目的历史 bug）
+  const topLevelBlocks = ['m3', 'm5', 'm55', 'm2'].filter((k) => rep[k] !== undefined);
+  ok('m3/m5/m55/m2 不挂在报告顶层（应在 history 条目上）', topLevelBlocks.length === 0,
+    `顶层出现了 ${topLevelBlocks.join(', ')} —— dump 脚本会读错路径`);
+
+  const last = hist[hist.length - 1] ?? {};
+  ok('条目含 at（时间戳）', typeof last.at === 'string');
+  ok('条目含 reason', typeof last.reason === 'string');
+  ok('条目含 m3.eff（生效参数）', !!last.m3?.eff, '最近条目缺 m3.eff');
+  ok('条目含 services（服务可达性）', !!last.services && typeof last.services === 'object');
+
+  // profile 标记（C3② 引入）
+  const profiled = hist.filter((e) => e.profile === 'slim' || e.profile === 'full');
+  ok('存在带 profile 标记的条目（瘦身生效）', profiled.length > 0,
+    '无 profile 标记 ⇒ 要么瘦身未生效，要么报告全是旧条目');
+  if (profiled.length) {
+    const slim = hist.filter((e) => e.profile === 'slim');
+    const full = hist.filter((e) => e.profile === 'full');
+    const avg = (arr) => (arr.length ? Math.round(arr.reduce((a, e) => a + JSON.stringify(e).length, 0) / arr.length / 1024 * 100) / 100 : 0);
+    console.log(`     档位分布：slim ${slim.length} 条（均 ${avg(slim)}KB）| full ${full.length} 条（均 ${avg(full)}KB）`);
+    /* ⚠️ R8：本段**不得再有嵌套条件断言**——原先两条 `if (...)` 让断言总数随报告数据
+     * 在 55/56/57/58 之间漂移（「护栏静默少跑」）。现全部改为无条件：缺数据即失败，
+     * 失败信息本身就说明「哪个档位没在产出」。 */
+    if (full.length === 0) {
+      console.log('     ⚠️ 历史里 0 条 FULL —— 若这份报告产生于 R8 之前，属预期旧数据；修复后新 FULL 条目不再被挤出。');
+    }
+    const slimLast = slim[slim.length - 1];
+    ok('FULL 档位条目存在（关键取证位在产出）', full.length > 0,
+      '历史里 0 条 FULL ⇒ activation+2s / m3-act / m4-probe 已被高频 slim 挤出（R8 已修：满环优先淘汰 slim）');
+    /* R16.6：slim 三条从「无条件失败」改为「有 slim 才细查」。
+     * 原因：R8 之后满环**优先淘汰 slim**，长期运行的真实报告（如压缩频繁的会话）
+     * 会出现「最近 120 条全是 full、slim 被挤光」的分布——那是 R8 修的**正确行为**，
+     * 不是瘦身失效。原断言把活数据当缺陷 ⇒ 套件对运行期状态过敏（今天实测误报）。 */
+    if (slimLast) {
+      ok('slim 条目确实比 full 小', avg(slim) < avg(full), `slim=${avg(slim)}KB full=${avg(full)}KB`);
+      ok('slim 条目仍含 m3（决策/压缩取证）', !!slimLast?.m3, 'slim 丢了 m3 ⇒ 回填链与压缩取证同时失效');
+      ok('slim 条目仍含 m2（注入取证）', !!slimLast?.m2);
+      ok('slim 条目丢弃 eventProbe（体积来源）', slimLast?.m3?.eventProbe === undefined,
+        'slim 条目仍带 eventProbe ⇒ 瘦身不彻底');
+    } else {
+      console.log('     ⚠️ 环内 0 条 slim —— R8 后满环优先淘汰 slim，长期运行属预期分布（瘦身逻辑本身由 m1 单测覆盖）');
+    }
+  }
+}
+
+/* ═══════════ ⑤ 压缩历史持久化（R92：per-session 文件）═══════════ */
+console.log('\n== 5. 压缩历史持久化（.data/acts/<sid>.json，每会话 ≤100）==');
+const ACTS_DIR = join(PLUGIN, '.data', 'acts');
+const actFiles = existsSync(ACTS_DIR) ? readdirSync(ACTS_DIR).filter((f) => f.endsWith('.json')) : [];
+if (!actFiles.length) {
+  console.log('  ⚠️ 跳过（目录不存在或为空，下次压缩时会创建）');
+} else {
+  ok(`存在 per-session 文件（${actFiles.length} 个会话）`, actFiles.length > 0);
+  let shapeOk = true, badCap = null, badSid = null, dup = 0, total = 0;
+  for (const f of actFiles) {
+    const j = readJsonRetry(join(ACTS_DIR, f));   // R50：防"活插件写盘窗口"竞态
+    if (typeof j.version !== 'number' || !Array.isArray(j.acts)) { shapeOk = false; continue; }
+    if (j.acts.length > 100) badCap = `${f}: ${j.acts.length}`;
+    const keys = j.acts.map((x) => `${x.at}|${x.sid}|${x.text}`);
+    dup += keys.length - new Set(keys).size;
+    for (const x of j.acts) {
+      if (!(typeof x.sid === 'string' && typeof x.text === 'string' && typeof x.at === 'string')) shapeOk = false;
+      else if (x.sid !== j.sid) badSid = f;
+    }
+    total += j.acts.length;
+  }
+  ok('每个文件含 version + acts；条目含 sid/text/at', shapeOk);
+  ok(`每会话条数 ≤ 100 上限${badCap ? `（超限：${badCap}）` : ''}`, !badCap);
+  ok('文件内条目的 sid 与文件一致（不再混存别的会话）', !badSid, `不一致：${badSid}`);
+  ok(`无完全重复条目（去重防护生效；共 ${total} 条）`, dup === 0, `发现 ${dup} 条重复`);
+  ok('旧共享 hud-acts.json 已迁移（不再是活动存储）',
+    !existsSync(HUD_ACTS) || existsSync(HUD_ACTS + '.migrated'));
+}
+
+/* ═══════════ ⑥ 思考强度调查结论契约（探针已退役，结论必须留档）═══════════ */
+console.log('\n== 6. 思考强度调查结论（探针退役，结论与参考实现必须留档）==');
+// R3（2026-10-08）：调查期的一次性探针 r1ProbeOnce（~170 行、且自带 selectModel 写入路径）
+// 已随「清理调查脚手架」退役——结论已入 docs 与 effort.mjs 文件头。
+// 本段用「结论留档」断言替代原来的「探针存在」断言：结论本身必须还在，否则实施期会再踩一遍。
+ok('调查期探针已退役（不留一次性脚手架）',
+  !/r1ProbeOnce|state\.r1Probe|r2Probe|r3Probe/.test(host),
+  '仍残留 r1ProbeOnce/state.r1Probe/snap.r*Probe ⇒ 调查脚手架未清理');
+const invDocPath = join(ROOT, 'docs', 'r1-reasoning-effort-investigation.md');
+const invDoc = existsSync(invDocPath) ? readFileSync(invDocPath, 'utf8') : '';
+ok('调查结论已入档（docs/r1-reasoning-effort-investigation.md）', invDoc.length > 0,
+  '缺少调查文档 ⇒ 结论只活在代码里，重构一次就丢');
+ok('负面结论已入档（selectionFor 不在命令门面上）',
+  /requestHeader/.test(invDoc) && /selectionFor/.test(invDoc),
+  '文档未记录「selectionFor 不可用」⇒ 实施期会再试一遍这条死路');
+ok('写档副作用已入档（selectModel 会改全局默认模型）',
+  /saveSelection|全局默认/.test(invDoc),
+  '未记录该副作用 ⇒ 实施期易踩（会顺带改掉新会话的默认档）');
+/* 结论必须同时固化在模块文件头（10 条「来之不易」）—— 只放 docs 不够：
+ * 改这个文件的人不一定先读 docs。断言几条最容易被当「冗余」删掉的。 */
+ok('关键实证结论固化在 effort.mjs 文件头',
+  /prepend: true/.test(effort) && /delete out\.maxTokens/.test(effort) &&
+  /UNSUPPORTED_REASONING_EFFORT/.test(effort) && /id 会轮转/.test(effort),
+  'effort.mjs 未固化 prepend / maxTokens / 两侧校验 / sid 轮转四条结论 ⇒ 下轮重构会误删');
+ok('读档唯一可靠路径仍是 requestHeader（代码与文档一致）',
+  /agent\?\.session\?\.requestHeader\?\.\(\)/.test(effort),
+  'effort.mjs 未走 requestHeader 读档 ⇒ 与调查结论不符');
+// 参考实现已存档（router-laya 的 agent/request 路线）
+ok('router-laya 参考源码已存档', existsSync(join(ROOT, '.data', 'ref', 'router-laya-index.js')),
+  '缺少 .data/ref/router-laya-index.js（参考实现证据）');
+
+/* ═══════════ ⑦ dump 工具可跑通 ═══════════ */
+console.log('\n== 6. dump 工具自检（--field / --history-acts）==');
+if (!existsSync(REPORT)) {
+  console.log('  ⚠️ 跳过（无报告）');
+} else {
+  for (const args of [['--field', 'm3.eff'], ['--history-acts'], ['--tail', '2']]) {
+    try {
+      const out = execFileSync(process.execPath, [DUMP, ...args], { encoding: 'utf8', stdio: 'pipe' });
+      ok(`dump-report.cjs ${args.join(' ')}`, out.trim().length > 0, '输出为空');
+    } catch (e) {
+      ok(`dump-report.cjs ${args.join(' ')}`, false, String(e.stderr || e.message).split('\n')[0]);
+    }
+  }
+}
+
+/* ═══════════ 汇总 ═══════════ */
+console.log(`\n${'='.repeat(52)}`);
+console.log(`报告契约：${checks - failures}/${checks} 通过${failures ? `，${failures} 项失败` : ' ✅'}`);
+console.log('='.repeat(52));
+process.exit(failures ? 1 : 0);

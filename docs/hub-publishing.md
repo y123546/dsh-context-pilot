@@ -1,0 +1,117 @@
+# 上架 DSH Plugin Hub / 社区市场：清单与现状（2026-10-10）
+
+> 面向「把本插件发布到任一 DSH 插件市场」的场景。**先满足基础项，再选市场**。
+> 每一项都标注了**取证方式**——不靠记忆，靠可复现的命令。
+
+## 0. 基础项现状总览
+
+| 基础要求 | 现状 | 取证 / 处置 |
+| --- | --- | --- |
+| **公开 GitHub 仓库**（私有仓库爬不到） | ✅ 公开 | 匿名 API：`Invoke-WebRequest https://api.github.com/repos/Shuffle-1992/dsh-context-pilot` → `visibility: public`、`private: false` |
+| **Topic `dsh-plugin`** | ✅ 已加 | 同上 API 的 `topics` 数组 |
+| **Topic `deepseek-harness`**（Cordis 插件建议） | ✅ 已加 | 同上 |
+| 附带：`cordis-plugin` / `context-compression` / `context-management` / `reasoning-effort` / `dsh` / `deepseek` / `llm-agent` | ✅ 共 9 个 | 同上 |
+| `dsh-skill` / `agent-skills` | ⛔ **不需要** | 这两个是 **Skill 包** 用的；本插件是 **Cordis Bundle**，加了反而误导 |
+| **README 有可直接复制的安装命令** | ✅ 已补（README「安装」段） | `dsh plugin --profile web add github:Shuffle-1992/dsh-context-pilot`（**git 规格**；本项目不分发 npm，见 §2） |
+| **package.json 的 name / version 准确** | ✅ `dsh-context-pilot` / `0.1.50` | 根与 `plugin/` 两份清单同版本；与 git tag `v0.1.44` 一致 |
+| **Bundle 分发需 `dsh.bundle.patch`** | ✅ 根与 `plugin/` 两处都有，指向**同一份**生产 patch | 根 → `./plugin/cordis.patch.yml`；`plugin/package.json` → `./cordis.patch.yml` |
+| **许可证** | ✅ MIT（`LICENSE`） | 原仓库无 license 字段；如需换协议只改 `LICENSE` + 两处 `package.json` 的 `license` |
+| 仓库元数据（repository / homepage / bugs / keywords / author） | ✅ 已补 | 根 `package.json` |
+
+**复核命令（匿名、只读，一条就够）**：
+
+```powershell
+$j = (Invoke-WebRequest https://api.github.com/repos/Shuffle-1992/dsh-context-pilot -UseBasicParsing).Content | ConvertFrom-Json
+$j | Select-Object full_name, private, visibility, license, homepage, topics
+```
+
+## 1. 结构：**单一身份** `dsh-context-pilot`
+
+2026-10-10 起包名统一为 `dsh-context-pilot`（去掉 `@local/` 前缀），三处必须一致：
+
+| 位置 | 值 |
+| --- | --- |
+| 根 `package.json` → `name` | `dsh-context-pilot` |
+| `plugin/package.json` → `name` | `dsh-context-pilot`（`private: true`，仅作本地挂载目标，不发布） |
+| `plugin/cordis.patch.yml` → `insert[0].name` | `dsh-context-pilot`（加载器按**包名**解析） |
+
+- 仓库根 = **可分发包**（市场爬虫按仓库根识别）；`plugin/` = 代码 + 本地挂载目标。
+- 本机 `node_modules` 下**两个 junction 指向同一目录**：
+  `dsh-context-pilot`（新，正式）与 `@local/dsh-context-pilot`（旧，兼容别名，勿删以免打断运行中的挂载）。
+- `plugin/cordis.patch.local.yml` 是**兼容补丁**（name = 旧别名），仅供回滚/旧挂载使用；
+  生产与新装一律走 `plugin/cordis.patch.yml`。
+
+## 2. 分发方式（2026-10-10 决定：**不发布 npm**）
+
+**决定**：不发布 npm 包。分发一律走 GitHub 仓库。
+因此 README 的首选安装命令是 **git 规格**，而 `dsh plugin --profile web add dsh-context-pilot`
+这条 npm 形式对本项目**不可用**（无 npm 包）——README 已明确标注。
+
+仍然保留**可发布状态**（清单齐备、`files` 用精确 glob + `plugin/.npmignore` 排除工作数据），
+这样将来若要改主意，`npm publish --access public` 直接可用即可，无需返工。
+
+### 上架剩余步骤
+
+1. **tag / Release**（利于市场展示版本，已完成 tag）：
+   ```bash
+   git tag v0.1.1 && git push origin v0.1.1     # ✅ 已推（v0.1.0 亦在）
+   git tag v0.1.2 && git push origin v0.1.2     # ✅ 已推（含 R17：用户手动改档的轮首知情）
+   git tag v0.1.3 && git push origin v0.1.3     # ✅ 已推（含 R18：单档模型零注入 + 工具静默 + 开关撤回）
+   git tag v0.1.4 && git push origin v0.1.4     # ✅ 已推（R18.1：隐藏/恢复落报告，真机可取证）
+   git tag v0.1.5 && git push origin v0.1.5     # ✅ 已推（R18.2：撤回也留痕，关开关在报告里可见）
+   git tag v0.1.6 && git push origin v0.1.6     # ✅ 已推（R19：档位说法改中文 深压8%/标准16%/浅压24%）
+   git tag v0.1.7 && git push origin v0.1.7     # ✅ 已推（R20：决策卡对称化 + 越线建议选深档）
+   git tag v0.1.8 && git push origin v0.1.8     # ✅ 已推（R21：语义锚点保留 keepFrom，失败退三档）
+   git tag v0.1.9 && git push origin v0.1.9     # ✅ 已推（R21.1 紧急修复：keepFrom schema 缺 additionalProperties ⇒ 工具整条不注册）
+   git tag v0.1.10 && git push origin v0.1.10   # ✅ 已推（R21.2 真机发现：不传 tier 会重置档位 + 锚点失败痕丢失）
+   git tag v0.1.11 && git push origin v0.1.11   # ✅ 已推（R22 档位说法全中文：工具返回值/回执/HUD 不再出现英文 id）
+   git tag v0.1.12 && git push origin v0.1.12   # ✅ 已推（R23 锚点中文描述 + 思考强度「低(low)」；client.js 变更需刷新页面）
+   git tag v0.1.13 && git push origin v0.1.13   # ✅ 已推（R24 占用口径对齐 DSH 表盘 + 回执念压缩后占用）
+   git tag v0.1.14 && git push origin v0.1.14   # ✅ 已推（R24.1 自算 DSH 投影公式，修「读 state 拿不到 projectedTokens」）
+   git tag v0.1.15 && git push origin v0.1.15   # ✅ 已推（R25 占用账本进报告 + 口径公式单源）
+   git tag v0.1.16 && git push origin v0.1.16   # ✅ 已推（R26 回执显式消歧：档位名百分比≠占用）
+   git tag v0.1.17 && git push origin v0.1.17   # ✅ 已推（R27 决策行节奏：每轮一次 + 变更再一次）
+   git tag v0.1.18 && git push origin v0.1.18   # ✅ 已推（R28 非插件压缩失败原因可见）
+   git tag v0.1.19 && git push origin v0.1.19   # ✅ 已推（R29 手动压缩不误报抢先 + 压缩后投影标注）
+   git tag v0.1.20 && git push origin v0.1.20   # ✅ 已推（R30 反重复备注：决策行每步重复）
+   git tag v0.1.21 && git push origin v0.1.21   # ✅ 已推（R31 反重复备注改为检测驱动）
+   git tag v0.1.22 && git push origin v0.1.22   # ✅ 已推（R32 动作背书的决策行不算重复）
+   git tag v0.1.23 && git push origin v0.1.23   # ✅ 已推（R35 持续重复上报面板 + 备注上限 1）
+   git tag v0.1.24 && git push origin v0.1.24   # ✅ 已推（R36 手动切档后不再写「保持 X」）
+   git tag v0.1.25 && git push origin v0.1.25   # ✅ 已推（R37 压后占用带 provider 待刷新提示）
+   git tag v0.1.26 && git push origin v0.1.26   # ✅ 已推（R38 压后占用后缀单源 + 自选范围报占用）
+   git tag v0.1.27 && git push origin v0.1.27   # ✅ 已推（R39 保留预算真实口径折算）
+   git tag v0.1.28 && git push origin v0.1.28   # ✅ 已推（R39.1 修折算未生效）
+   git tag v0.1.29 && git push origin v0.1.29   # ✅ 已推（R40 锚点口径 + 修回归）
+   git tag v0.1.30 && git push origin v0.1.30   # ✅ 已推（R41 锚点真实口径落点预估）
+   git tag v0.1.31 && git push origin v0.1.31   # ✅ 已推（R42 锚点语义定案：绝不折算）
+   git tag v0.1.32 && git push origin v0.1.32   # ✅ 已推（R43 决策卡两种模式 + 全中文）
+   git tag v0.1.33 && git push origin v0.1.33   # ✅ 已推（R44 真机锚点走查 + 下限保护）
+   git tag v0.1.34 && git push origin v0.1.34   # ✅ 已推（R45 回执给稳定后预计）
+   git tag v0.1.35 && git push origin v0.1.35   # ✅ 已推（R46 面板后缀也给预计值）
+   git tag v0.1.36 && git push origin v0.1.36   # ✅ 已推（R48 DSH 0.2.1 兼容：engines + 契约守卫）
+   git tag v0.1.37 && git push origin v0.1.37   # ✅ 已推（R49 锁避让 + 按模型阈值 + R49.1 隐患修复）
+   git tag v0.1.38 && git push origin v0.1.38   # ✅ 已推（R50 解耦 + 样本落盘 + 强制不变量 + 简化）
+   git tag v0.1.39 && git push origin v0.1.39   # ✅ 已推（R50.1 修掉账本加载失败连带压缩域失效的回归）
+   git tag v0.1.40 && git push origin v0.1.40   # ✅ 已推（R52 独立审计发现 #1 修复：official() 闭包 TDZ）
+   git tag v0.1.41 && git push origin v0.1.41   # ✅ 已推（R53 自审：落盘原子性 + 在飞标记按会话）
+   git tag v0.1.42 && git push origin v0.1.42   # ✅ 已推（R54 千问审计 4 条真缺陷 + 测试盲区）
+   git tag v0.1.43 && git push origin v0.1.43   # ✅ 已推（R55 注入可视化 + 参数可配 + 文案模板）
+   git tag v0.1.44 && git push origin v0.1.44   # ✅ 已推（R56 pct1 作用域）
+   git tag v0.1.45 && git push origin v0.1.45   # ✅ 已推（R56b getSnapshot 自递归 —— 真根因）
+   git tag v0.1.46 && git push origin v0.1.46   # ✅ 已推（R56c dsh.client 形状 + 清单核对）
+   git tag v0.1.47 && git push origin v0.1.47   # ✅ 已推（R56d 失败可见 + 探针补盲）
+   git tag v0.1.48 && git push origin v0.1.48   # ✅ 已推（R56e 照 PANEL-HOWTO 自查 + NS_EXACT）
+   git tag v0.1.49 && git push origin v0.1.49   # ✅ 已推（R57 面板易用性：放大输入框 + 内置文案按钮）
+   git tag v0.1.50 && git push origin v0.1.50   # ✅ 已推（R57b 空模板显示成 0 + 清空被拒）
+   ```
+   > 建 GitHub Release 页面需仓库写权限的 API/网页操作（本机无 `gh`、无 token），由用户完成。
+2. **按所选市场提交**：填仓库 URL + 包名 `dsh-context-pilot`；若市场要求 Bundle 清单，
+   指向 `plugin/cordis.patch.yml`（唯一的**生产** patch）。
+3. 若某市场**硬性要求 npm 包**：届时需要重新评估（要么发布 npm，要么不投该市场）。
+
+## 3. 自动化护栏（防止这些要求日后漂移）
+
+`test/static.mjs` 里有对应断言：**根清单必需字段 / 单一身份（根=plugin=patch 名）/ 兼容别名 patch 存在 /
+无残留双身份文件 / README 含安装命令 / LICENSE 一致 / 发布卫生（files 不收 `.data`）**，
+`npm test` 会一并校验。改动清单文件后若断言变红，说明上架基础项被破坏了。

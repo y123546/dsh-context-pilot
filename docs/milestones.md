@@ -1,0 +1,5307 @@
+# 里程碑档案（M1 → 现在）
+
+> 从 README 拆出（2026-10-07）。README §3 保留**结论清单**，这里保存**完整过程**（含当时的术语、踩坑、实测数值）。
+> ⚠️ 历史条目中的术语与字段名**保持原样不改写**（如「危险线」「决策卡」「policyCardMinRatio」），
+> 它们记录了当时的真实状态；现行术语见 README §2.1。
+> 文内 `§` 引用指向原 README 章节，拆分后对应：原 §2/§3 → [`api-notes.md`](api-notes.md)、
+> 原 §4/§8/§9 → [`setup.md`](setup.md)、原 §7 → README §4 + [`cost-model.md`](cost-model.md)。
+
+### M1 用量读取 + 激活验证
+- 部署空插件（见 §8），确认激活日志可见；
+- 解决关键未知：**如何拿到活动 Session 句柄**（`ctx.agents.list()`？`sessions`/`sessionQuery` 服务？——用 Inspect host Service 目录查 `sessions`/`sessionController`/`sessionQuery` 签名）；
+- 对活动会话调 `tokenMeter.measure()`，把结果写日志验证。
+
+**已实证（2026-10-05 编码时目录实证 + 2026-10-06 00:03 重启运行实测）：**
+- 句柄双路径：`ctx.sessions.list(): Session[]`（内存会话 store）+ `ctx.agents.list(): Agent[]`。**实测 Agent 形状：`agent.id === agent.sessionId === session.id`，`agent.session` 持有 Session，`agent.status` idle⇄running**；`measure(agent.session)` 直接可用。
+- 服务访问惯用法：`ctx.get('name')`；事件通道 `session/created`、`agent/status` 实测触发正常。
+- **⚠️ 顶层 ctx 上 `compaction: absent`（实测）**——压缩服务确实按 agent 作用域隔离（§7.1 风险坐实），M3 必须解决作用域解析。
+- **measure() 字段实况（修正探索报告）**：返回 `{ logRevision, baseline, surfaceDeltaTokens, totalTokens, surfaceTokens, nodes }`——`contextPressure/contextBreakdown` **不在 measure 结果上（为 null）**，拆分与压力经 `ctx.sessionProjections.stateOf(session, 'contextPressure' | 'contextBreakdown' | 'tokenUsage')` 读取；**`contextPressure.contextWindow` 直接给模型容量**（本机 1M 路由实测 1000000），M2/M3 分母首选此路径，`resolveModelInfo` 兜底。
+- 读数实例：会话 total=117,991→118,073（本轮增长实时反映）；surface=101,303；nodes=131。
+- M1 实现落点：`plugin/entry.mjs`（薄壳）+ `plugin/host.impl.mjs`（测量/监听/心跳/落盘 `.data/m1-report.json`，history 上限 120 条）。
+
+### M2 每轮注入 —— ✅ 已实现上线（2026-10-06 00:10），待复述验证
+- **实现路线改判**：探索报告原拟 `systemPrompt.variable()`，实际采用**官方 dsh-time-context 同款惯用法**（抽源码确认，asar 存档 `.data/asar-out2/`）：`agent/pre-step` waterfall → `await next()` 拿决策 → 追加一条 `createUserMessage({ content:[{type:'text',text}], source:{ kind:'context-pilot', form:'snapshot', sections:[{name,text}] } })`。该消息持久入日志、模型每轮可见（本项目 README 头部的 "Time sampled..." 块就是 time-context 注的，同一机制）。
+- 注入门控：仅 `step === 1`（轮首一次，M2 语义）；异常/measure 失败/工厂未就绪一律放行原决策不注入（激活安全）。
+- **官方包导入坑 P2**：第三方目录裸 import `@deepseek-ai/*` 必失败（无 @deepseek-ai 作用域可寻）；解法沿用 zcode-dispatch ZB-01：bare → env → `process.resourcesPath/app.asar` → 硬编码路径，×`import(pathToFileURL)`/`require` 候选链。**实测命中 `resourcesPath/app.asar|import`**。
+- 文本形态：`Context usage before this turn (by context-pilot, estimate): window 1,000,000 ｜ used 169,892 (17.0%) ｜ surface 148,445 ｜ system ≈2,113 ｜ messages+tools ≈162,707 (heuristic).`
+- **复述验证 ✅（2026-10-06 00:13）**：模型对注入三元组逐字复述，报告 `injections/lastText` 与会话内所见一致。
+- **坑 P4（形状取证）**：`stateOf(session,'contextBreakdown')` 返回 `{ nodes: [{seq,heuristicTokens,system}…], breakdown: {systemTokens,messageTokens,toolsTokens} }`——聚合数在 `breakdown` 子对象，条目列表在 `nodes`（"三聚合数直读"不成立）。修复经一次 toggle 热换完成。
+- 注入成本：每轮 ~50 token（持久入会话日志），M4 会加 config 开关与频率。
+
+### M3 复杂度决策 + compactNow —— ✅ 实弹验证通过（2026-10-06 00:32），正常运行模式
+- **v1 结论（inbox/inserted 方案被实测否决）**：消息进收件箱时 agent 已是 waking 状态，`compactNow` 抛 `ManualCompactionError("busy")`（报告 `actErrors.busy=2`）——"requires an idle agent with no waking queued work" 的语义比预想严格。
+- **v2 设计（现行）**：挂 `agent/status` 翻到 **idle** 的瞬间（turn 刚结束、无排队工作）→ 纯比率决策 → `compactNow`（`agentPresets.serviceFor` 实例 + `AbortSignal.timeout(180s)` + `sourceCommandId='context-pilot'`）。语义转为"空闲扫除"：会话闲着且占用超线就腾空间，为下一个任务留最大余量。防重入：in-flight 集合 + 同会话 10min 最小间隔。
+- inbox/inserted 降级为**纯审计**（decisions/wouldCompact/lastDecision），记录"该任务场景是否会想压"。
+- **作用域解析已解（§7.1 关闭）**：`agent.ctx.get('compaction')` ✗ 不可达；**`agentPresets.serviceFor(agent, 'compaction')` ✓**（多次激活探针均命中）。
+- 官方参照（compaction-basic 源码）：自动压缩走 pre-step `compactIfNeeded(agent, "pressure", signal)`（固定 80% 阈值，trigger 就是字符串）；手动 `compactNow` 首行 `signal.throwIfAborted()` 无守卫——**signal 必传**。
+- 决策逻辑（启发式，M4 进 config）：`ratio ≥ 0.85` 无条件压；`ratio ≥ highRatio 且任务文本 ≤ 4000 字符` 压；高占用+重任务 → 保留全上下文不压（inbox 审计口径）。idle 扫除纯比率。
+- 决策审计全落报告 `m3` 块：decisions / wouldCompact / acts / actOk / lastDecision / lastAct（shadowedNodes/shadowedTokens/range）/ actErrors / sweeps。
+- **实弹结果（2026-10-06 00:32:47 触发，00:32:52 完成）**：turn 结束后 idle 翻转触发扫除 → 决策 `high-usage-light-task(21.0%, 2ch)` → `compactNow` 成功：**shadowedNodes 289 / shadowedTokens 181,327（seq 10–751）**，耗时 ~5s，`actErrors:{}`。下一条注入行 **used 195,622 (19.6%) → 31,352 (3.1%)**。实测保留语义比预估激进（近端保留不是 16 万整，实际总结后总占用仅 ~3.1 万）——符合"腾空间"目标，但 M4 起阈值按实测重校。验证后 highRatio 已回调 0.6 热换。
+- 验证标准（全部达成）：报告 `m3.actOk ≥ 1` ✓ + `lastAct.shadowedNodes > 0` ✓ + 后续注入 used 明显回落 ✓。
+
+### M3.5 三通道重构 —— 决策主体移交「模型语义判断 + 用户确认」（2026-10-06 00:50 上线）
+- **动因（用户对照原始设想复盘）**：M3 的"占用驱动空闲扫除"只覆盖了时机（任务前），缺三块——①场景1"任务与远端关联小"是**语义判断**，字数启发式够不着；②场景2"重任务提前腾退"与 M3 原逻辑（重任务→不压）方向相反；③注入没告诉 agent 有压缩选项，agent 无从参与。
+- **官方源码新证据**（`docs/reference/@deepseek-ai/dsh-compaction-basic/lib/index.js`，本仓库已提取）：
+  - `compactIfNeeded(agent,"pressure",signal)` 就是官方 pre-step 自动压缩的原话调用（阈值走引擎自身 config，默认 80%，与本插件阈值无关）；
+  - **`"context-overflow"` 触发绕过引擎阈值**：`selectCompactableRange(session, measure, 0)` → `compactRegion(..., owner:"current-turn")`，任意占用都能立即压——这是关键词通道低于 80% 仍能生效的合法路径；
+  - `compactNow` 必须 idle（`runMaintenance` 包装），轮内不可用 → 只归 idle 安全网。
+- **通道1（执行）pre-step 轮内先压**：在注入监听器内、`await next()` **之前**执行（先压再组消息 → 本步请求即用新表面）：
+  - `ratio ≥ 0.85` → `compactIfNeeded(agent,"pressure",signal)`（必然越过引擎 80% 阈值而生效；引擎已压则返回 null，幂等）；
+  - inbox 检测到消息以「**先压缩**」开头 → 置 `keywordArmed`（TTL 120s）→ pre-step 消费 → `compactIfNeeded(agent,"context-overflow",signal)`（占用 ≥0.2 才执行，否则纯浪费）。
+- **通道2（告知）政策卡**：注入行占用 ≥30% 时追加 ~100 token 政策文——教会模型场景1（关联小→建议压缩）、场景2（重任务→建议腾退）、场景4（模型可预判任务体量）与否定场景（依赖远端细节→不建议），以及触发短语「先压缩」。模型建议 → 用户一个词确认 → 通道1 执行，闭环成立。
+- **通道3（兜底）idle 扫除降级**：仅 `ratio ≥ 0.85` 才 `compactNow`（防 runaway），不再按 highRatio 主动清场（那是无任务语义的盲压，与"任务摄入时决策"相悖）。
+- **保留启示（实测修正认知）**：pressure 路径 retain = messageBudget × retainRatio ≈ 16 万近端保留，压缩对"接下来要干的活"几乎无损；真正代价只是一次摘要调用（实测 ~5s）。故高占用下"先压"几乎总是划算，分歧只在"任务要不要远端细节"——恰是模型能判断而启发式不能的。
+- **报告新字段**：`m3.preStepActs / preStepOk / lastPreStep{trigger,ratio,acted,shadowedTokens,range,ms} / preStepErrors / keywordHits / policyCards`。
+- **待实弹验收**：① 占用 ≥30% 时注入行出现政策卡且模型正确解读（建议或不建议）；② 用户消息「先压缩 …」→ 报告 `lastPreStep.trigger='overflow'`、`acted:true`，本轮回复照常且注入行 used 回落；③ critical 兜底可在占用 ≥85% 的会话上观察。
+
+### M3.6 标记闭环 —— 模型建议、零输入自动执行（2026-10-06 01:03 上线）
+- **用户提案**："模型建议压缩时在回复尾部写 `[cp:compact]`，后台完成后重新拉起会话触发压缩"。落地时简化：**无需结束/拉起会话**——回复结束瞬间 agent 自动翻 idle（M3 实弹已证即 `compactNow` 合法窗口），全事件驱动、零定时器。
+- **事件链**：模型回复尾行 `[cp:compact]` → `ctx.on("session/event")`（`event.type==='assistant/message'`，compaction-basic 官方同款通道）解析武装 `markerArmed`（TTL 120s）→ `agent/status→idle` → 扫除器 **marker 模式**：`ratio ≥ 0.2` 即 `compactNow`，不受 critical 限制、不受 10min 冷却（显式请求不设防）。
+- **竞态处理**：assistant/message 事件可能晚于 status→idle——武装时查 `agents.list()` 内该会话 agent 的 `status`，已 idle 则立即触发扫除。
+- **政策卡同步改写**：模型被教导"值得压缩时在回复最后单独写 `[cp:compact]`"（主通道，用户零操作）+「先压缩」关键词（本任务执行前就要压缩时的快速路径）。
+- **报告字段**：`m3.markerHits`；`lastAct.reason='marker'|'safety-net'` 区分两模式。
+- **透明性**：标记写在回复正文里，用户看得见（相当于模型"公开提案"）；不想要可等 M4 把 `marker` 配成空串关闭。
+- **实弹通过（2026-10-06 02:18:39，本插件模型自己按政策卡写标记触发）**：22.8%（used 227,659）回复自检（关键产物已落盘 README+报告）后尾行写 `[cp:compact]` → idle 翻转 → marker 扫除 → `lastAct{at:02:18:39, reason:'marker', shadowedNodes:471, shadowedTokens:181,485, range:seq 761–1952}`，官方引擎事件 `compaction/start→summary→end` 各 1 次全见，`acts:1 actOk:1 actErrors:{}`。占用轨迹 **227,659 (22.8%) → 52,205 (5.2%，摘要落定中) → 17,214 (1.7%)**；最终 measure：totalTokens 17,356 / nodeCount 10（压缩前 ~480 节点）。
+- **用户疑问裁决（2026-10-06 02:2x）：「是不是要结束会话→重新拉起→拉起前压缩？」——不需要，实测证伪**。压缩前后 session id 同为**同一个**（同一 Session 对象存活，无 `session/created`），插件宿主计数（markerHits/acts）跨事件连续（DSH 与插件宿主均未重启）。观察到的「结束/重新拉起」是两层渲染假象：① harness 对长对话自身的 checkpoint 摘要块（模型上下文管理，与本插件无关）；② 压缩后客户端把折叠上下文重新呈现。底层机制 = **存活会话内就地影子化 + 摘要**。时序上用户的直觉「拉起前已压完」成立：02:18:39 压完，02:20 用户下一条消息看到的已是压后读数。原方案（挂定时器+结束会话+重拉）也能通（武装态在插件宿主内存，比会话活得久），但纯多余且有真实代价：120s TTL 可能在拆/拉间隙过期、用户可见中断；idle 本身就是免费压缩窗口。
+
+### M4 自身 Config 面 —— ✅ 编码完成 + 加载验证，配置卡片待重启验证（2026-10-06 01:3x）
+- **三件套**：`plugin-config.schema.mjs`（schemastery 四级候选链，独立解析 OK）+ entry 静态 `export Config`（薄壳备案例外）+ impl `M3_DEFAULTS` 与 apply 内 config 字段级类型守卫合并（报告 `m3.eff` 落生效值）。
+- **重启后验证（2026-10-06 01:21）**：`include:dsh-context-pilot` `fiberPhase:"active"`（JSON 字面量死法未发生）；报告 `m3.eff` 十字段=默认值，config 布线正确。
+- **坑（实测）**：详情页配置区**不是 schema 自动出现的**——它是 client 半段注册的 `plugins.bundle.config` 插槽卡片（用户截图对照 browser-kit/zcode 后定位）。M4.5 补 client 半段 `client.js`（照抄 dsh-connect-zcode 实证结构）：ModuleLoader 信封 + `require("react")` + configForms 软探测命名空间重绑定（**inject 必须含 remote**，否则 configForms 恒 undefined、面板永久只读——zcode :459 血泪）+ 写后回读校验 + 主题 token 用 dsw-alias 真名（回退值主题无关）。package.json 加 `./client` 导出 + `dsh.client.inject` 七件套。**待重启**：卡片渲染 + 改 `policyCardMinRatio`→0.05 → 报告 `m3.eff` 随变。
+- **坑 2（实测，2026-10-06 01:4x）**：schemastery 在插件宿主内解析失败（我的候选链只有 `import()`，asar 内嵌模块 ESM import 会失败；zcode 链有 `require(esm)` 兜底）→ Config=undefined → provider `absent` → **卡片注册成功但页面无落点**（一切正常唯独不出现的真凶）。修复 = **vendor**：schemastery+cosmokit 复制进 `plugin/node_modules`（裸导入从导入文件向上走 node_modules 必命中，不赌宿主魔法）；探针 `m3.m4Probe` 宿主内验证已绿。
+- **坑 3（预防，zcode 实测移植）**：面板写入字段必须 `.volatile()`（DSH 写入门禁：条目无 volatile 字段 → 每次保存静默拒绝且 set() 照样 resolve）；host 端读 config 必须剥 `{get()}` 活引用，否则类型守卫跳过 → 面板改值 host 永远用默认。
+- **M4.6 上下文弹窗总开关（2026-10-06 01:5x，用户需求）**："在上下文弹窗加开关，开=插件功能，关=恢复原生 DSH"。两半实现：① host `effEnabled()` 活读 volatile 活引用——注入/审计/pre-step/idle 四路全部即时受控（此前注入不看开关，已补）；② client `installPopupToggle()`——MutationObserver 找「上下文已用」文本叶 → 沿纯包裹祖先爬到浮层根 → 插入开关行，写 `settingsScope.set('enabled')` + 回读校验，P37 纪律（新 apply 断旧观察器）。妥协声明：弹窗是宿主内部组件无官方插槽，DOM 注入 DSH 升级可能失效（失效=开关不见，其他功能不受影响）。**状态（2026-10-06 02:1x）：v1（浅层 div/span 扫描）与 v2（文本节点 TreeWalker + open shadow root 穿透）均未命中——弹窗疑似在更深的 shadow 层或非 light 文本。诊断版已部署（2026-10-06 10:0x，仅刷新生效）：`attachShadow` 陷阱登记 closed root（`window.__DSH_CONTEXT_PILOT_CLOSED_ROOTS__`）+ `elementFromPoint` 指针采样（悬停即抓弹窗组合树 DOM 链，穿透 closed shadow）+ 宽松文本候选扫描；诊断出口为控制台 `__DSH_CONTEXT_PILOT_POPUP_DEBUG__.dump()`（client 侧无法写 host 报告，走控制台导出；定位成功后拆陷阱）。10:1x asar 全量探针取证命中：弹窗 = `dsh-client-ui-conversation` ContextMeter 面板——`createPortal(…, document.body)` 挂 body 直下、`role="dialog"`、`aria-label=context.used`（zh「上下文已用」/ en "of context used"；触发器 `button[aria-label="上下文已用 {percent}"]` 带百分号可区分）；**桌面壳有 DevTools：F12 → `openDevTools({mode:"detach"})`**（lib/main.js @377763 输入拦截 + @470873 菜单 accelerator，"没有浏览器控制台"问题解除）。定位器 v3 = aria 属性选择器 + 同源 iframe 兜底 + 1.2s 轮询防时序脱靶。10:2x **v3 验收通过**（用户截图：弹窗底部出现开关行）；v1/v2 未命中根因未单独归位（疑似旧 client 未随刷新生效/文本扫描脆弱），v3 属性定位 + 轮询双保险后稳定。按用户要求改名「上下文领航（注入+压缩）」并把勾选框换成滑动 switch（原生 checkbox 隐入底层保点击/键盘可达，dsw 主题 token 自适应深浅色）。诊断陷阱（attachShadow 补丁/指针采样/dump 户籍册）已拆除，client.js 回归干净版。其余 M4 链路已全通：面板渲染 ✓ / policyCardMinRatio 0.1 保存并 host 生效 ✓ / 决策卡 v2 文案在场 ✓。**M4.6 关闭 → M4 全部收官。**
+- **M4.6 微调（2026-10-06 10:4x，用户反馈）**：① 开关行去掉写死的 `font-size:12px` 改继承弹窗面板字号（`.panel` 本身就是 12px）；② **左对齐最终方案（用户拍板：加图标对齐「对话消息」）**：结构复刻原生明细行——行 = `[8px 图标 + 6px 间距] + 文字`，行 `padding-left:0`（行左缘即面板色块列起点）→ 图标列对齐色块列、文字列对齐 dt 文字列，**零测量天然同轴**（此前 Range 校准两版都败在参照系：行在面板 content box 内自带 12px，以面板边界为原点恒多 12px，已弃）；图标 8×8 圆角 2px，填开关同款品牌蓝 `#4c7dff`；③ 开关配色改双主题自适应——`isDarkBg()` 沿面板祖先找第一个不透明背景按亮度判暗/亮（兜底 body 文字色反推）：开=品牌蓝 `#4c7dff`（两主题通用），关=轨道/旋钮按明暗反色（暗主题 `rgba(255,255,255,.22)`+浅灰旋钮 / 亮主题 `rgba(0,0,0,.24)`+白旋钮）。注：portal 面板挂 body 直下，`--dsw-alias-*` 变量不一定可达，故用字面量+探测而非 token。
+
+### M5 弹窗 HUD —— ✅ 编码完成，待重启验证（2026-10-06 11:0x，用户定址：「上下文领航」下面）
+- **形态改判（用户拍板）**：不做独立浮层，直接在上下文弹窗的开关行下面加一行 HUD——复用 M4.6 注入点，零新插槽。
+- **host→client 状态通道（核心）**：`configEditor` 服务（Inspect Service 目录取证：`entries()/configuration()/edit(entry, change)`，自述 "Persist complete raw configs and apply them through the normal Loader path"）——host 在压缩/武装事件时 `edit()` 写两个 volatile 字段：`hudLastAct`（"HH:MM · 标记/兜底/危险线 · 省 xxK"）、`hudArmed`（"armed"/""）。与面板保存同款路径（实测不重跑 apply、client 配置镜像活更新）；**且 configEditor 持久化 → 重启后上次记录仍在，白赚跨重启显示**。
+- **写点（全事件驱动，无轮询）**：idle 扫除成功（写 hudLastAct + 熄武装灯）、pre-step 危险线先压成功（同）、标记武装（亮灯）、武装 TTL 过期随扫除清灯。发布器 `publishHud`：首次 `entries()` 按 JSON 含 "context-pilot" 匹配缓存 Entry，in-flight 合并排队，写失败只留痕绝不碍主流程。
+- **client 渲染**：HUD 行（padding-left 26px 文字轴同轴）：左「最近压缩 …」/「本会话暂无压缩记录」，右 chips「武装中」（品牌蓝描边）/「演习」（灰）；settingsScope.subscribe 活更新。
+- **待验证**：重启 DSH（schema 新增字段，Config 静态导入必须重启）→ 弹窗出现 HUD 行；下次压缩后字段实时更新；报告留 `M5 HUD 已发布` 日志线。
+
+### M5 HUD 通道改判 —— configEditor 推送判死 → 内存 + client 轮询 getHud（2026-10-06 12:0x–12:2x）
+- **三层排查实证**：① `entry-not-found` 根因 = 纯 `JSON.stringify(e)` 匹配——entry 携带 schemastery schema（循环引用）stringify 抛错→所有条目一律 miss；改 id/patchId/name 字段匹配后直达 `editor.edit()`。② 随即 `HMR transactions cannot be nested`：2.5s→30s→60s→120s 退避全被拒（**激活后 3 分半仍未关**）⇒ 非暂态窗口，是**结构性拒绝**——插件上下文的 service 调用被包在 apply/HMR scope 里；面板保存能成（patch.yml 11:55:47 落账）恰因 client→remote 不经该 scope。③ 结论：**host→configEditor 推送通道判死**。
+- **新通道**（browser-kit/zcode 同款已验证形态）：新增 `wire.host.mjs`（exports["./typert"]，face=`dshContextPilot`，方法 `getHud()`）+ host `ctx.provide` 注册（报告 `m5.hudFace='provided'` 实证）+ client `$mount(REMOTE_CONTRIBUTION)`/`ctx.inject(['remote.dshContextPilot'])` 捕获句柄 → **HUD 行每 5s 轮询**；host `publishHud` 改写内存 `state.m5.hud`（原 5 个调用点不变）；跨重启显示由启动回填（读报告最近 m3-act，激活 +1.2s）补齐——回填已实证（`11:57 · 标记 · 省 112.3K`）。
+- **Client 半需页面刷新生效**（client.js 无 dev watcher 不热换）；configEditor 字段（hudLastAct 等）留作面板可见兜底，不再依赖。
+- **HUD v2：按会话过滤 + 最近多条（2026-10-06 13:2x，用户点名两升一级）**：getHud 加可选参 `sid`（wire 方法表/TYPERT/client 描述符三端同步，可选项 acceptsUndefined）；host `state.m5.acts`（新→旧 cap 8，{sid,text,at}）——动作时 `recordHudAct(sid,text)`（marker/pressure 两发布点）、启动回填从报告 m3-act 重建最近 5 条（含 sessionId）；getHud(sid) 返回该会话 `hudLastAct`（最新）+ `acts`（最多 5 条）。client 捕获会话 id：钩 `window.fetch` 抓任意 API URL 的 `sessionId=`（+resource timing 一次性补捞），存 `window.__DSH_CONTEXT_PILOT_SID__`，会话切换 5s 内跟随；弹窗主行=本会话最新，悬停=本会话列表+gen/sid 指纹；带参被拒自动退回无参全局查询（协议未热载时优雅降级）。**部署注意：wire.host.mjs 无 query 不热换 + typert 注册驻留 ⇒ 本轮协议变更需重启一次 DSH**（重启前刷新=旧行为，不炸）。
+- **首测空态根因（12:3x–13:0x，重启+刷新后弹窗仍「暂无压缩记录」）**：三连环，逐一实证——① client `ctx.inject` 回调**参数签名错**：参数是 scope，服务在 `scope.remote.dshContextPilot`（browser-kit client.js:579 同款）；旧码把 scope 当服务存 ⇒ `getHud` 非函数 ⇒ pullHud 每 5s 静默 return。② **inject 声明缺 `typert`**（console 实锤：`$mount 失败: cannot get property "typert" without inject`）——browser-kit client.js:504 注释明写「typert 是 $mount 的硬依赖」，其声明 `['slots','remote','typert']`。③ **remote 代理 {ok,value} 信封未拆**（gen 指纹排除僵尸面后定位）：face 代理把返回值包成 `{ok,value}`，`r.ok` 恒 true（信封层）、`r.hudLastAct` 恒 undefined ⇒ 永远空态；browser-kit client.js:2098 注释原话「face 代理返回 {ok,value} 信封——必须 unwrap（漏了 = 永远显示「—」，实测踩坑）」——P29 对账教训延伸：**两端清单要连消费端一起对**。已修：unwrapEnv 拆包（兼容无信封直连）。宿主全程无辜（报告/面状态始终满值）。附带强化：HUD 启动回填改「激活同步立即一次 + 1.2s/4s/10s 幂等重试」消激活空窗；state.m5.hud 加 gen 实例指纹（client debug/悬停可验 face 归属）。
+
+### M2.5 新会话 Agent 自说明 —— 一次性插件说明注入（2026-10-06 12:2x）
+- **需求**（用户）：插件压缩流程/用法要让**新会话的 Agent 完全明白**并在实际使用中会用，不依赖外部文档。机制：`briefedBySid`（每激活每会话一次）——`agent/pre-step` 注入时，该会话首次注入额外追加 `M2_BRIEF` 段（~200 字）：说明 Context usage 行、决策卡触发、「待执行：<任务>」+ 尾行标记协议、自动压缩+自动拉起（`(context-pilot 自动恢复)` 开头）、85% 危险线、勿连续写标记。落账 `m2.briefings`。
+- **Agent 可见的三层提示词**：① 每轮 usage 行（测量）；② 占用≥阈值决策卡（行动指令，v3 全本）；③ 新会话一次性 M2_BRIEF（插件自说明）；④ 恢复轮开头 `(context-pilot 自动恢复)` 提示（续任务指令）。四层覆盖「测量→建议→教学→续跑」。
+
+### M5.5 任务挂起-自动恢复 —— 首测：压缩环 ✅ / 恢复环 ❌ 静默黑洞 → 已改多通道+全程取证（2026-10-06 11:5x）
+- **用户定义的目标流程**：任务进来 → 条件满足时模型分析后本轮**先不执行** → 回复中写「待执行：<任务>」+ 尾行标记 → 结束回复 → idle 自动压缩 → **系统自动拉起新一轮（压缩后的干净上下文）→ 继续执行原任务**，用户零重发。
+- **首测 E2E（2026-10-06 11:33–11:38）**：标记捕获 ✓（`marker=1`，待执行行同源捕获）→ 插件压缩 ✓（`lastAct.reason='marker'`，shadow 303 节点 / 213,476 tok，used 263,713→52,582，报告 `m3-act` 实证）→ **恢复环无任何动作**（用户观察「没有拉起新会话」）。铁证：代码里 `prompt()` 无论成功/被拒都会排 `m5.5-resume` 报告条目——**一条都没有** ⇒ 执行流在调用前静默退出，且旧版所有退出路径只写 `ctx.logger`（宿主日志无处可查）= log-only 黑洞。
+- **根因排查（11:4x）**：`sessionController` 服务从插件 ctx 实测**可达**（快照 `services.sessionController: "object"`，Inspect 目录同证：`@Remote('prompt') prompt(SessionPromptRequest)`，服务名确为 `sessionController`）⇒ 剩余嫌疑收敛为「`ctrl.prompt` 属性访问/调用在包装对象上抛错或非函数」（旧代码该分支 log-only 不落报告）。官方实现取证（asar 提取 `dsh-api-session-controller`）：`prompt()` = 校验 → `createUserMessage({content, source:{kind:'user',rpcId,clientTimeZone}})` → `agent.followup(message)`（queue 模式）→ `{accepted:true}`；`followup` = `send(input,"next-turn",true)`（agent-loop 实证）。
+- **修复（11:5x，已热换部署）**：① **多通道恢复** `resumeViaAnyChannel`——A `sessionController.prompt`（请求体 `mode:'queue'` + `{type:'text',text}` content，契约以 asar 为准不再猜）→ B `ctx.remote.session.prompt` 代理 → C **直通入队**（与官方同原语：`createUserMessage` + `agent.followup`，M2 已实证工厂可用；投递后 `inbox.nextTurn.some(rpcId)` 确认）；② **全程落报告**：`state.m55 = {armed（捕获详情）, attempts[]（每通道每相位）, channelProbe（ctor/ownKeys/protoKeys/toStringTag/promptAccessError）}`，`Promise.resolve().then()` 包裹使同步抛错走 rejection，setTimeout 回调兜底；③ 服务可达性清单加 `sessionController/typertGateway`；④ `publishHud` 同步留痕 `state.m5.lastPublish`（11:33/11:35 两次 HUD 发布 cordis mtime 未动 = 也在静默失败，entry-not-found/edit-rejected 从此可辨）。
+- **首测占用背景**：压缩由插件 marker 通道执行（非 harness 检查点），harness 侧另有独立上下文检查点机制，二者勿混。防循环：`resumeCountBySid` 上限 2 次；HUD：挂起亮琥珀「待执行」徽章，投递后熄灭。
+
+### M5.5 二测 ✅ 闭环全通 —— 通道 C（direct-followup）投递（2026-10-06 11:56–11:58）
+- **E2E 全链**（`markerMinRatio` 临时降到 0.1）：11:56:32 `m3.6-marker` 武装（`via='reply-defer-line'`，待执行 146 字符完整捕获）→ 11:57:19.7 `m3-act` 压缩（used 139,856→**30,231**，节点 132→3）→ 11:57:21.2 2s 后三通道依次尝试 → 11:57:21.8 agent running、`m2-inject` 第二轮注入 → 模型零重发继续执行原任务。**用户观察与报告取证一致。**
+- **通道裁定**（`state.m55.attempts` + `channelProbe`）：A `sessionController.prompt` **rejected**——`Cannot read properties of undefined (reading 'throwIfAborted')`，即官方 `prompt(request, signal)` 第二参不可缺省，请求体没带 AbortSignal（可修：补 `AbortSignal` 或改走 remote 方法）；B `ctx.remote` 探针 `cannot get property "remote" without inject`——插件 ctx 无 inject 权限，不可用；**C `direct-followup` delivered**（`createUserMessage`+`agent.followup`，与官方 prompt 同原语），agentProbe `{status:'idle', hasFollowup:true}`，4ms 内接跑。channelProbe 实证 `SessionController` 形状（ctor/ownKeys/protoKeys 含 `prompt`）与 asar 取证吻合。
+- **占用对照**：二轮 used 30,231（3.0%）/ surface 5,249 / nodes 6 vs 一轮基线 138,868（13.9%）/ 114,215 / 129 ⇒ 省 ~108.6k tok（-78%）。
+- **遗留**：① ~~HUD 发布仍 `entry-not-found`~~ **已终判+换通道**（见 §6「M5 HUD 通道改判」：configEditor 判死，内存+轮询已上线）；② 通道 A 补 signal 后可作首选通道（当前 C 已可靠，优先级低）；③ **面板「标记最低占用」需改回 0.2**（现为 0.1，仅为二测放宽）。
+
+### M5.5 三测 ✅ 复现稳定 + HUD 记录链实证（2026-10-06 12:24–12:26）
+- **E2E 全链**（HUD 通道改判 + M2.5 自说明上线后首测）：12:24:33 决策卡+一次性插件说明注入（`m2.briefings=1`）→ 12:24:46 `reply-defer-line` 武装（待执行 174 字符）→ 12:26:10.9 `m3-act` 压缩（reason=`marker`，shadow **196 节点 / 91,543 tok**）→ 12:26:12.9 三通道：A `sessionController.prompt` rejected（同款 `throwIfAborted`，符合预期）→ **C `direct-followup` delivered**（4ms，agentProbe `{status:'idle', hasFollowup:true, hasSteer:true}`）→ 12:26:13 `m2-inject` 第二轮（仅用量行，说明不重复 ✓）→ 模型零重发续跑。**二连通过，通道 C 复现稳定。**
+- **占用对照**：基线 used **125,656（12.6%）** / surface 93,433 → 压缩后 **37,951（3.8%）** / surface 5,262 / nodes 3 ⇒ **省 87.7k tok（-70%）**（HUD 省 91.5K = shadowedTokens 口径，实际净省含压缩摘要+恢复消息开销）。
+- **HUD 记录链（本轮新证）**：压缩即时发布 `lastPublish={step:'ok', channel:'memory'}`，`hudLastAct='12:26 · 标记 · 省 91.5K'`，armed/pending 徽章正确清空，`hudFace='provided'`——内存发布+5s 轮询+重启回填三层全实证；弹窗侧待用户刷新页面后目视确认。
+- **M2.5 复核**：injections 2 / briefings 1——首轮带说明、恢复轮只带用量行，会话内恰好一次 ✓；dump 脚本被清理后已重建 `.data/dump-m55-fields.cjs`。
+- **HUD v2 实证（13:3x，用户截图）**：主行「最近压缩 12:26 · 标记 · 省 91.5K」✓、悬停列表+指纹（gen=新实例 muw8q34m、sid=本会话前 13 位）✓、会话过滤 ✓、信封拆包 ✓。悬停仅 1 条 = 报告 120 条环形缓冲已剪掉 11:33/11:57 的 m3-act（预期；可选 hud-acts.json 持久化未排期）。
+- **遗留清账**：~~markerMinRatio 改回 0.2~~ → **用户 13:3x 面板改为 0.15，后续按 0.15 走**；通道 A AbortSignal 补参（低优先）。
+
+### 只读审查（docs/review-findings.md，23 条）—— ✅ 批次 1/2/3 全部落地（2026-10-06 14:1x–14:3x，单次 toggle 热换）
+- **依据**：`docs/review-brief.md`（任务书 + §2 铁约束）→ `docs/review-findings.md`（外部审查员，23 条：A7 / B6 / C6 / D3 + C1 附注）。全条已对照 §4 已知档案去重（无重复项）。
+- **部署**：host.impl.mjs 21 处 + client.js 10 处，改完 `node --check` 双通过 → 单次 `set_plugin include:dsh-context-pilot` false→true 热换（entry/wire/protocol 未动，无需重启 DSH）；client.js 侧待用户刷新页面生效。
+- **批次 1（机械执行，零行为变更）**：
+  - **B3** 死代码退役：`publishHud` 的 `_hudRetry` 过滤删（configEditor 通道残留）、`state.m3.keywordHits` 恒 0 字段删、`state.m3.dryRun` 静态镜像删（双轨失真，真值看 `m3.eff.dryRun`）、`pendingBySid.resumes` 写入删（从未读取）。**报告形状变化**：新条目不含 `m3.keywordHits`/`m3.dryRun`（历史条目原样保留，dump 脚本不受影响）。
+  - **B1** `hudActText` → `formatAct(reason, tokens, at?)`：运行期（at 缺省=现在）与启动回填（at=记录时刻）共用一套「hh:mm · 原因 · 省 xK」模板，消除两处手写同构。
+  - **B2** 抽 `measureRatio(session) → {ok,used,surface,window,ratio}`：`decideCompaction`/`renderUsageText`/`preStepCompaction` 三处重复的 measure+pressure+ratio 计算收敛到一处。
+  - **A4** 事件武装门 `!M3.enabled` → `effEnabled()` 活读（与 pre-step/idleSweep 口径一致，堵住「开关刚关事件仍武装亮灯」窗口）。
+  - **A3** `M2_BRIEF` 冻结常量 → `renderBrief()` 函数：每次注入现拼 `M3.marker` 与 `criticalRatio`（原实现写死初始 marker 与「85%」，config 热改后说明文本与活值检测自相矛盾）。
+  - **A7** 2s 恢复 `setTimeout` 入 `resumeTimers` 表，随 `ctx.effect` 卸载清理（防禁用/热换窗口内旧实例仍向 agent 投递恢复消息）。
+- **批次 2（行为修正，报告/日志可证）**：
+  - **A1** 心跳 disposer 修复（`host.impl.mjs` 原 `if (typeof h === 'function')` 只收 cordis disposer；`setInterval` 分支返回 Timeout 对象被漏 ⇒ 热换后旧实例心跳永生、与新实例交错写报告）→ 改 `else if (h && typeof h.unref === 'function') disposers.push(() => clearInterval(h))`。**该项在实施中扩展为三层根因（见下「追加发现」）**。
+  - **A2** ① TTL 清灯前移到 `sweepInFlight`/measure 早退之前（原顺序：早退 ⇒ 过期 armed 与 hudArmed 灯不熄）；② **压缩失败重武装**：`reason==='marker'` 且仍在原 TTL 窗口内 → `markerArmed.set(sid,{at:armedAt})` + `hudArmed='armed'` + `m55Attempt{phase:'act-failed-rearm'}`，下次 idle 自动重试（原实现 catch 直吞，armed 已消费 ⇒ 挂起任务无人恢复、徽章永亮）。
+  - **A5** pre-step signal 缺失守卫：`signal ?? AbortSignal.timeout(180_000)` 兜底 + `sig.aborted` 早退（官方契约 `compactIfNeeded(agent,trigger,signal)` 首行 `throwIfAborted`，undefined 放行=首跑即败；M5.5 通道 A 同款已实证）。**该项待 pre-step critical 实弹 E2E。**
+  - **A6** `M5_RESUME_MAX` 用尽路径改为**上限判定前置**：不删 pending、不熄灯，徽章改文案「(自动恢复已达上限 N/2，请手动继续)」（原实现先删 pending+熄灯再 abort ⇒ 用户/模型都失去挂起提示）。计数清零（可选子项）未实施。
+  - **C1** catch 分级补痕：① `mergeConfig` 异常一次性 warn（原静默 ⇒ 面板改值不生效无从排查）；② bfOnce 4 发（同步+3 重试）全败终态 warn；③ 报告基线读取失败/形状异常 warn（原「首写」分支会静默覆盖损坏文件）。**C1 附注**：通道 A `sessionController.prompt(request, AbortSignal.timeout(30_000))` 补官方契约第二参（原缺参 ⇒ 必被 `throwIfAborted` 拒；M5.5 三测实证）。**通道 A 首次实际投递行为待 E2E 观察**（可能改变 A/C 通道胜负序）。
+  - **C3** 报告写入缓存化：基线 apply 期读一次（`loadReportBase`），后续内存追加 —— 原实现每次写入全量 `readFileSync`（**实测 1.46MB×每次**，触发点含 400-500ms 防抖高频 reason）。bfOnce 回填也改用同一读盘路径。**补丁（实施中发现）**：缓存基线在**多写入者共存**时会互相覆盖，`writeReport` 增加**尾部对账**（详见下文 C3 附带缺陷）。**稳态瘦身（keys/probe 采样裁剪）未实施**（改报告形状会牵连取证脚本，留待 D1 切分批次一并评估）。
+  - **C4** client 泄漏面：① 订阅登记 `liveRows` + `sweepRows()`（每次 tryInject 先退订已离开 DOM 的行）——原实现每次弹窗重开都 `subscribe` 且不持 off，死回调随 notify 空转累积；② 5s `pullHud` 加「曾连过又断开」自停（`everConnected` + `stopPolling()` 所有权校验，防旧行误清新行计时器）。**实施中发现并修掉一个自伤 bug**：首拉时 row 尚未 append（`isConnected=false`）会误判为已关窗 ⇒ 首帧数据丢失，故用 `everConnected` 门。
+  - **C6** client 降级补齐：① face 就绪回调里立即 `NS.pullHud()` 一次（首帧不再干等 5s tick）；② `$mount` 失败退避重试（3s/10s，共 3 次尝试）。
+- **批次 3（静态改，首次生效需重启；本次已随 toggle 热换）**：
+  - **B4** `host.impl.mjs` 顶部 `import * as hudWire from './wire.host.mjs'` → 动态 `import(\`./wire.host.mjs?ts=${seq}-${ts}\`)`（face 注册块）。根因 P16：相对导入解析回**无参规范 URL**，命中进程缓存 ⇒ face 逻辑冻结在重启版本。改后 wire 随 impl 同批热换（`TYPERT` 声明走包 exports 不受影响；wire 模块纯导出、无顶层副作用，已逐行核对）。**热换后实证**：`m5.hudFace='provided'` ✓（新 face 已注册）。
+- **client 侧另外**：**B6** `let react`→`const`；6 个散挂全局名收敛为单命名空间 **`window.__DSH_CONTEXT_PILOT__`**（`sidHook/sid/hudDebug/popupObserver/popupTimer/hudTimer/pullHud`）。**控制台取证路径已变更**：`__DSH_CONTEXT_PILOT__.sid`、`__DSH_CONTEXT_PILOT__.hudDebug`。**C5** `parseInput` 空串拦为 `null`（原 `Number('')=0` ⇒ 清空「标记武装有效期」保存即 0、标记通道废）。**D3** `tryInject` 拆 `installToggleRow`/`installHudRow` 独立守卫（原实现开关行已挂时连坐跳过 HUD 行）。
+- **热换后报告取证**（14:22:5x 条目）：`m5.hudFace='provided'`、`hudLastAct='14:08 · 标记 · 省 110.1K'`（回填链 ✓）、`gen=muwakxuc-sqnn`（新实例）、`m3.eff.markerMinRatio=0.15` / `policyCardMinRatio=0.15`（面板值保留）、`m3.keywordHits`/`m3.dryRun` 已消失（B3 生效）、`services.compaction='absent'`（顶层作用域隔离，符合 §7.1）。
+- **未实施（明确挂起）**：**D1** 按 M 切分模块（风险中/代价 M-L，动骨架，报告自列批次 4 —— 建议单独一轮 + 静态契约断言脚本）、**D2** wire 样板共享（优先级低于 D1，建议先在两仓 README 互链同步清单）、**B5** dump 脚本收敛到 `docs/reference/tools/`（3 处散落）、**C2** 无界 Map/Set 统一 LRU 上限（当前规模无实际风险）、**C3②** 报告稳态瘦身、**A6** 恢复计数按任务周期清零、**A2/A5/A6 的真机 E2E 验收**（挂起→压缩→恢复全链，按 §6 M5.5 流程复跑）。
+- **M5.7 压缩历史持久化（hud-acts.json）—— ✅ 2026-10-06 16:0x（用户反馈：重启丢历史 + 只显示 1 条）**
+  - **根因**：历史只存内存（`state.m5.acts` cap 8）；重启后回填源 = 报告 120 条环形缓冲，被心跳/状态等高频事件快速剪掉 `m3-act`（实测 15:0x 报告内 m3-act 已 **0 条**）⇒ 回填无源；且每次 toggle/重启/页面刷新（重激活）都重置内存。本会话 4 次部署 toggle 正是截图「暂无压缩记录」的直接原因。
+  - **修法**：专文件 `plugin/.data/hud-acts.json`（cap 50，`{version,savedAt,acts:[{sid,text,at}]}`）——`recordHudAct` 压缩时同步落盘；激活即 `loadHudActs()` 恢复；报告**降级为迁移/兜底源**（bfOnce 合并去重 `at+sid` 导入，**不再覆盖式写 acts**——顺带修掉 C2 记录的「回填覆盖运行期记录」竞态）；`getHud` 悬停条数 5 → **8**（内存 cap 8 → 50）。
+  - **E2E 验收**：① 写入带 BOM 的测试文件 → 加载失败安全回退（暴露并修掉 **BOM 坑**：`JSON.parse` 不容忍 `\uFEFF`，已剥）；② 剥 BOM 后 toggle → 报告 `hudLastAct` 恢复文件最新条 ✅；③ 删文件 + toggle → 干净基线（无残留）✅。**写入路径**待下次真实压缩验证（文件将以真实数据重建）。
+  - **诚实声明**：修复前的历史（11:56 / 12:26 / 14:08 / 15:29 四次压缩）已被报告环形缓冲剪掉，**无法找回**；从下次压缩起历史跨重启累积（cap 50）。
+- **⚠️ 实施中的追加发现：心跳自项目起从未运行（超出审查 A1 范围）——根因是 `ctx.effect` 语义误用（重大，已修复并验收）**。
+  - **表层**：`const every = t?.interval ?? ctx?.interval` 取**未绑定方法引用** ⇒ 丢 `this` 必抛 ⇒ 被 catch 吞（`timer.interval` 实现首行即 `this.ctx.effect(...)`）。
+  - **真因（决定性，cordis `lib/index.js:1142` 源码实证）**：`ctx.effect(execute)` 语义 = **execute 立即执行（=setup），其返回值才是卸载器**。而「卸载清理」块把清理语句**内联写在 execute 体内** ⇒ ① 清理在 **apply 期**被立刻执行，此时 `disposers` 里已含刚入册的心跳 timer ⇒ **心跳当场被 `clearInterval` 掉**（这解释了为何修好 `this` 绑定、换 setTimeout 链、换 setInterval、去 unref 全部「注册成功却零触发」）；② 真正的卸载时**反而毫无清理**（`pending`/`resumeTimers`/心跳全部泄漏）——A1 僵尸 interval 之所以能扛过每一次 toggle，正因它的 disposer 在清理块跑完之后才入册、永不被调用。
+  - **证伪过程（记录以免重蹈）**：曾误判为「apply 同步体内注册的长定时器被宿主丢弃」——该结论**错误**，是上述 apply 期误清理造成的假象；所谓「回调内注册才成功」的判别实验，也因那次探针**恰好没把自己的 disposer 入册**而失真。
+  - **修法**：清理块改为 `ctx.effect(() => () => { … })`（execute 返回卸载器，与官方 TimerService 同款）；心跳回到 apply 内同步注册，disposer 现在只在真正卸载时调用。
+  - **验收（2026-10-06 15:0x，toggle 热换实测）**：① 新实例 `muwbw280-35g3` 注册 06:59:29 → **首条 heartbeat 07:01:29（精确 120s）**，随后持续触发；② 热换前实例 `muwbszjo-1z5c` 末次写入恰在热换时刻 06:59:06，此后**静默 307s（>2 个心跳周期）** ⇒ **A1 disposer 清理面成立**（对比：此前僵尸实例扛过 5 次 toggle）。
+- **🔬 A1 泄漏的野外实证（副产品）**：判别实验留下的探针实例 `muwbcv25-wjtp` 未把 interval 登记 disposer → **连续多次 toggle 都没能杀掉它**，仍以 15s 周期往报告写（P37 同族交错写）。已由 DSH 重启清除（末次写入 06:52:22；重启后无新写）。
+- **⚠️ C3 附带缺陷（由僵尸暴露，已补丁）**：C3 的「apply 期读一次缓存基线」在**多写入者共存**时会互相覆盖——僵尸用自己的旧基线整段写回，**抹掉新实例在它之后写入的条目**。补丁：`writeReport` 每次写入前做**尾部对账**（磁盘尾条目 ≠ 本实例上次写入 ⇒ 判为他人写入 ⇒ 以磁盘为准重新接续），正确性优先、仍避免无条件全量解析。
+- **重启后复验结论（2026-10-06 14:53–15:04）**：僵尸清除 ✅、B4 动态 import 生效 ✅（`hudFace='provided'`）、B3 字段退役 ✅（`keywordHits` 已消失）、`markerMinRatio=0.15` 保留 ✅、**心跳真实运行 ✅**、**A1 disposer 生效 ✅**。
+
+### C3② 报告稳态瘦身 + B5 取证工具收敛 —— ✅ 2026-10-07（挂起项清偿）
+
+**C3② 报告瘦身**（审查遗留，实测触目）：
+- **动因**：报告 **3.77MB**、history 满 120 条、**单条均值 16KB**。构成——`heartbeat` 52 条占 888KB、
+  `agent/status` 20 条占 330KB、`m3-decision` 13 条占 214KB。体积主体是 `buildSnapshot` 的
+  **全量 sessions/agents 枚举**（每会话 `keys[40]` + measure + pressureProjection + breakdownSummary）。
+- **安全性调研（关键）**：history 的全量内容**只被一处读取**——启动回填 `bfOnce`（筛 `reason==='m3-act'`
+  取 `m3.lastAct`）。其余字段纯取证、不进任何逻辑分支 ⇒ 分级瘦身安全。
+- **实现**：`SLIM_REASONS` 集合（heartbeat / agent/status / m5-publish / m2-inject / m3-decision /
+  m3.6-marker / m5.5-resume / session/created）+ `slimSnapshot()`。精简档保留：读数（用量最高 2 会话）、
+  `m2`（含 `lastText`/`injections`/`skips`）、`m3`（决策/压缩/错误/`eff`/`heartbeat`，仅丢 `eventProbe`）、
+  `m5`/`m55`、`services`、`totals`；丢：全量枚举明细、`llmProviders`、`compactionProbe`。
+  每条带 `profile: 'slim'|'full'` 标记，dump 可直接区分。
+- **实测效果**：slim 单条 **2.06KB** vs full **13.99KB** ⇒ **降 85%**（预估 -84%，吻合）。
+  history 满 120 条时预计 **1936KB → ~308KB**，报告文件 3.77MB → **约 600KB**。
+- **`m3-act` / `m4-probe` / `activation` / `boot` 等关键事件保持全量**（回填与取证不受影响），
+  已专项校验。
+
+**B5 取证工具收敛**（审查遗留）：
+- **清理前**：3 处散落共 **18 个**一次性脚本（根 `.data/` 9 个、`plugin/.data/` 4 个、
+  `docs/reference/tools/` 5 个），其中 `dump-m55-fields.cjs` **存在两份内容不同的副本**。
+- **收敛为 2 个统一工具**（`docs/reference/tools/`）：
+  - `dump-report.cjs` —— `--tail N` / `--kind` / `--field` / `--history-acts` / `--full` / `--report`，
+    取代 dump-m55-fields / dump-hud-tail / dump-report-tail / dump-m55 四个
+  - `asar-query.cjs` —— `list` / `extract` / `grep` / `pkg` 四个子命令，取代 asar-extract ×3 /
+    asar-find ×2 / asar-probe
+- **顺带修掉两个脚本 bug**：① 旧 `dump-m55-fields.cjs` 按**报告顶层**读 `m3`/`m5`（实际在
+  **每个 history 条目上**）⇒ 恒为 null；② 旧 `dump-report-tail.cjs` 仍读已删除的 `keywordHits` 字段。
+  统一工具按正确路径读，并在文档里写明该约定（防再踩）。
+- **目录语义恢复**：`plugin/.data/` 现在只剩**运行时数据**（`m1-report.json` + `hud-acts.json`），
+  取证脚本归 `docs/reference/tools/`。
+
+### 测试骨架 + 通道 A 验收 —— ✅ 2026-10-07
+
+**测试骨架**（`test/`，项目此前**完全没有测试**）：
+- 3 套件 / **127 项断言** / <1 秒，`npm test` 一键跑：
+  - `contract.mjs`（55）——**三端契约对账**：face 方法表 ↔ client 描述符 ↔ TYPERT（FACE_NAME／方法集／
+    参数名／可选项标记）；Config 字段在 FIELDS ↔ schema ↔ M3_DEFAULTS 三处齐全且互相可达；
+    退役字段（policyCardMinRatio/highRatio/lightTaskChars）防复活；`mergeConfig` 读取集 ⊆ schema 键
+  - `static.mjs`（29）——真实 `node --check`；**client 自足性**（无 import、require 仅 react）；
+    **entry 薄壳**（有效代码 <40 行、静态 Config、动态 import 带 `?ts=`、不在顶层 import impl）；
+    模块依赖方向（无循环、host 不引用 client）；热换纪律；无调试残留
+  - `report.mjs`（43）——产出侧字段契约（13 项 m3/m5/m55/m2 关键字段）；**bfOnce 回填链依赖**
+    （必须按 `reason==='m3-act'` + `e.m3.lastAct` 读）；C3② 关键事件必须走 full 档；
+    真实报告结构自洽（含「m3/m5/m55 不在顶层」断言）；`hud-acts.json` 去重；dump 工具自检
+- **有效性验证**（关键）：注入 3 个人为 bug——`m3-act` 误入精简档 / client `HUD_FACE` 改名 /
+  host 代码引用 client.js——**三套件全部抓到且定位精准**，随后还原。
+- **发现并修掉测试自身的 3 处误报**：① 用括号配平启发式校验 ESM 会误判（改用真实
+  `node --check`，client.js 信封按 CJS 校验）；② `host 引用 client.js` 把**注释里的提及**也算了
+  （改为剥注释后再查）；③ 依赖图漏掉**模板字符串形式的动态 import**（补了 `import(\`./x.mjs?` 模式，
+  修正后正确显示 `host.impl.mjs → wire.host.mjs`）。
+- **对 D1 的价值**：模块依赖图与「无循环」断言就位，切分时可直接验证；`entry` 薄壳约束、
+  动态 import 纪律也有断言——**D1 现在有安全网了**。
+
+**通道 A 验收**（此前 README 记「实际走通道 C」，需更正）：
+- 历史 `m55.attempts` 取证：唯一一次真实投递 = **`sessionController.prompt` → `{"accepted":true}`**
+  （05:58:34），**一次命中、零 rejected**（补 AbortSignal 后直接成功，未回退到 B/C）。
+- `channelProbe` 佐证：`sessionController.found=true`、`hasPrompt=true`、`ctor=SessionController`；
+  通道 B `ctx.remote` 报 `cannot get property "remote" without inject`（插件 ctx 无该权限）⇒ 结构性不可用。
+- **结论**：恢复投递当前首选**通道 A**，通道 C 作兜底。README §2.2 已更新三通道状态表。
+- **附带澄清一个误判**：`m55.attempts` 是**累积数组**（每次刷新把当前全部 `slice(-10)` 写进各条目），
+  故同一次尝试会在连续多个报告条目里各出现一次——排查时曾误读为「重复执行 23 次」，实为展示放大。
+
+### D2 两仓同步清单 —— ✅ 2026-10-07
+
+**背景**：`dsh-context-pilot` 与 `dsh-browser-kit` 共享同一套「入口薄壳 + mtime 热换 + remote face 轮询」
+机制，但各自独立部署、无共享构建 ⇒ 样板只能复制。审查建议「至少在两仓 README 互链同步清单」。
+
+**做法**：不写空泛的「改一处同步另一处」，而是**逐文件对照实测**后分类（`docs/cross-repo-sync.md`）：
+- **7 个强同步点**（漂移 ⇒ 静默失败）：`REMOTE_METHOD_DESCRIPTOR` 常量值、`FACE_METHOD_TABLE` 四元组结构、
+  TYPERT 三处派生关系、entry 薄壳四要素、`dsh.bundle.patch`、`exports` 三个键、
+  **client→host 消费三连环**（scope 参数 / 信封 unwrap / inject 含 typert）
+- **5 个弱同步点**（结构对齐、内容独立）：目录布局、`apply` 签名、报告落盘形态、
+  schemastery 四级候选链、`cordis.patch.yml` 挂载形态
+- **6 处有意差异**（**明确标注不要强行同步**）——依据实测证据，其中最值得注意的一条：
+  **`volatile()` 只有本仓用**（browser-kit 0 次，本仓全字段用）。本仓依据是「DSH 设置写入门禁要求
+  条目存在 volatile 字段，否则保存被静默拒绝」（zcode 实测）；browser-kit 未触发该问题。
+  ⇒ 结论：**按各自实测，勿盲目抄**（这条如果没有实测对照，很容易被写成「必须都加 volatile」的错误规则）
+- **漂移检测**：给了手动对比脚本；并说明「跨仓自动断言」属可选增强——
+  会引入跨仓路径依赖，两仓不同步时反而误报，故本仓 `test/contract.mjs` 只做**仓内三端对账**
+
+### 方案 C 引擎上限 + 滑块/精简 —— ✅ 2026-10-07
+
+**方案 C（插件线钳制到引擎阈值之下，用户两轮讨论定稿）**：
+- **需求**：插件开启时插件强制线生效、引擎 80% 不抢跑；插件关闭/卸载后引擎 80% 自动恢复。
+  静态改法（patch 写 `auto:false`）无法满足第二条——被用户正确否决。
+- **实现**：`engineThreshold(agent)` 动态读引擎实例 `config.thresholdRatio`
+  （源码实证：compaction-basic L826 `this.config = resolveConfig(config)`，deepFreeze 公开属性）；
+  生效强制线 = `min(用户配置, 引擎阈值)`，三处同源钳制（pre-step / idle sweep / getHud 下发
+  `criticalCap` → client persist 收敛 + HUD 显示「（上限 80%）」+ 面板备注动态标注 + 计算器推荐行收敛显示）。
+- **取证**：`m3.engineCapProbe {at,via,ratio,fallback}` —— 实测 `ratio:0.8, fallback:false`（真实实例属性）。
+- **参数**：用户强制线 0.8 → **0.7**（profile patch + toggle）；顺带清理 patch 里已退役的
+  `policyCardMinRatio` 残留键。生效线 = min(0.7, 0.8) = 0.7。
+- **边界**：引擎服务不可达 → fallback 0.8（同官方默认）；client 未拿到 cap → 不钳（host min() 兜底）。
+- **A5 附带解锁**：把线临时设低于当前占用即可真机验证 pre-step pressure 路径（不再被引擎 0.8 挡）。
+
+**面板滑块 + 演习模式退役（用户截图需求）**：
+- 总开关（bool 字段）改**开关滑块**（纯 CSS `.dcp-switch`，无依赖；label 包裹 input+slider，点击即切换）
+- **演习模式（dryRun）完全退役**：面板行 / schema / M3_DEFAULTS / mergeConfig / 两个压缩门控
+  （`!effEnabled() || M3.dryRun` → `!effEnabled()`）全链路删除；contract 退役清单 +1。
+  语义说明：压缩路径不再有影子模式——观察注入可用 dryRun 之外的手段（报告即全量取证）。
+- 面板字段 **7 → 6**。
+
+### 压缩记录「丢失」终极定位与修复 —— ✅ 2026-10-07
+
+**症状**：弹窗常显示「本会话暂无压缩记录」，但用户确知本会话压缩过、且**曾经显示过**。
+持久化（hud-acts.json）与回填（bfOnce）各修过一轮，仍复现。
+
+**排查链（三次修正假设，最终靠运行时取证定案）**：
+1. 假设①「记录没落盘」→ 否：文件有记录、报告 `m3.lastAct` 曾正常。
+2. 假设②「DSH 压缩轮转 session id，线性血统链可修」→ **部分成立但模型错误**：
+   报告确实出现 3 个 sessionId（16616c07 / cb8d115e / f4154f01），据此实现 C-lineage 并
+   回填 2 条种子边，离线模拟命中 ✅——**但线上仍不显示**。
+3. **运行时取证定案**（新增 `m5.hudPoll` 快照字段，把 getHud 链路逐状态落盘）：
+   ```
+   actsCount=1 ✅   lineageSize=3   agentSid=16616c07   chainSize=3   matched=1（首 agent 可命中）
+   运行时又抓到第 3 条边：f4154f01 ← 16616c07（**双向摆动**）
+   lastSid=cb8d115e ≠ agentSid=16616c07 ⇒ 宿主在**同时处理多个会话**的事件
+   ```
+   ⇒ **真相：不是单会话 id 轮转，而是多会话交错活跃**。插件 XHR 钩子拿到的 `NS.sid` 是
+   「UI 最后请求的那个会话」，多对话场景下会漂移 ⇒ 按 id 过滤必然间歇性为空。
+   线性血统链模型不成立（回填的 2 条种子边属错误假设，已清除）。
+
+**修复（最终方案：本会话优先 + 全局兜底并标注）**：
+- host `getHud` 同时返回：本会话（血统链过滤）`hudLastAct`/`acts`/`sessionMatched`，
+  以及全局 `hudLastActGlobal`/`actsGlobal`
+- client：本会话有记录 → 原样显示；为空但全局有 → 显示「最近压缩 X（**其他会话**）」，
+  悬停注明「本会话无匹配记录，显示全局最近压缩」⇒ **记录永不消失，且不谎报会话归属**
+- C-lineage 机制保留（若真出现单会话轮转仍能命中），运行时按真实观察积累边
+- 新增 `m5.hudPoll` 取证字段（actsCount/lineageSize/lastSid/agentSid/chainSize/matched）
+  ——同类问题下次直接定位断点，不必再猜
+
+### 阈值速览行截断修复 + 强制线生效实证 —— ✅ 2026-10-07
+
+**用户反馈**：「上限 80% 没显示完整」+「压缩已经生效」。
+
+**① 截断根因（排版层，非数据层）**：阈值行原为 `font-size:10px` + `white-space:nowrap` +
+`text-overflow:ellipsis`。窄弹窗下 `nowrap` 使行宽超出容器，`ellipsis` 把尾部「（上限 80%）」
+裁成「（上限 80...」——**信息静默丢失**（比折行更糟：用户以为上限没配置）。
+- 修复：`9px` + `white-space:normal` + 去掉 ellipsis（宁可折两行，绝不吞信息）；
+  分隔符全角「｜」→ 半角「·」（全角竖线占一个汉字宽，三个分隔符吃掉 ≈27px，是挤掉尾部的直接原因）；
+  「（上限 80%）」→「· 上限 80%」省一对全角括号。
+- **过程中自查修正**：第一版用 `word-break:keep-all` 想「只在分隔符处断行」——但 keep-all
+  **禁止汉字间断行**，对无空格中文串等于完全不能折行 ⇒ 反而更容易溢出。已改 `word-break:normal`
+  + `overflow-wrap:anywhere`，并把该坑写进 `contract.mjs` §6.6 断言（含 6 条防回归）。
+- 断言：`contract.mjs` §6.6 —— 不得用 ellipsis / 必须 normal 换行 / 不得 keep-all /
+  字号 ≤9px / 分隔符必须是半角 ·（**同类「静默截断」以后跑测试就拦住**）。
+
+**② 强制压缩线生效实证（用户设 0.5，本轮结案）**：
+- `m3.lastPreStep 12:50:06`：`ratio 50.7%`、`trigger pressure` ⇒ **越线**；
+- `m3.lastAct 12:51:11`：`reason safety-net`、`shadowedTokens 350454`（省 350K）、
+  sessionId 16616c07 —— idle 兜底路径真实执行；
+- 下一轮用量行 **51% → 16%** ⇒ 压缩确实生效。
+- **关键旁证**：若生效线仍是引擎 0.8，50.7% 的 `safety-net` 会被 `if (d.ratio < min(...)) return;`
+  直接跳过、不会有这次压缩 ⇒ 反证 `min(0.5, 0.8) = 0.5` 的钳制链路真实生效。
+- 后续观察：用户已在面板把线改到 **0.8**（`markerMin` 同步 0.15→0.3，心跳 13:10:51 起
+  `crit/markerMin = 0.8/0.3`）——即 0.8 恰为引擎上限，钳制在此值上**不产生差异**（符合预期）。
+  记录：`crit` 历史轨迹 0.7 → 0.5 → 0.75 → 0.5 → 0.7 → 0.8（面板写入实时到达 host，
+  `mergeConfig` 活引用现读机制再次被验证）。
+
+### 方案 C 潜伏缺陷：getHud 传 Session 而非 Agent —— ✅ 2026-10-07
+
+**发现方式**（在上一轮验证「阈值行截断」时顺带核对报告，非用户报障）：
+`m3.engineCapProbe` 按事件分组统计后出现**两类互斥结果**：
+```
+35 x m3.5-prestep  -> agentPresets.serviceFor ratio=0.8 fallback=false
+24 x heartbeat     -> agentPresets.serviceFor ratio=0.8 fallback=false
+ 4 x heartbeat     -> unresolved            ratio=null fallback=true
+ 1 x m5-publish    -> unresolved            ratio=null fallback=true
+```
+`unresolved` 的时间戳与 `m5.hudPollReq`（13:18:50.660Z）**逐次吻合** ⇒ 锁定唯一嫌疑路径：
+getHud（client 5s 轮询）。
+
+**根因**：`criticalCap: engineThreshold(...?.session || agents[0]?.session || ...)` 传了
+**Session 本体**，而 `resolveCompactionFor(agent)` 的解析链是
+`agent.ctx.get('compaction')` / `agentPresets.serviceFor(agent,'compaction')` —— 两者都只认
+**Agent**，传 Session 全部落空 ⇒ 返回 `unresolved` ⇒ `engineThreshold` 走兜底
+`DEFAULT_ENGINE_THRESHOLD = 0.8`。
+
+**影响评估（诚实结论：当前无可见症状，但机制是坏的）**：
+- 引擎阈值恰为 0.8（官方默认），与兜底值相同 ⇒ **此刻 cap 恰好正确**，用户看不到任何异常；
+- 但方案 C 的**全部价值就在「动态跟随引擎阈值」**：一旦 DSH 改 `thresholdRatio`
+  （或未来换 provider/policy 导致阈值变化），client 拿到的 cap 会**静默停留在 0.8**，
+  钳制失效——即"看起来在工作、实际已失效"的典型潜伏故障。
+- 这正是我上一轮刚修完 `agents is not defined` 的同一函数里的**第二个作用域/实参错误**：
+  两个 bug 都藏在 getHud 里，且都被"恰好正确"的兜底值掩盖。
+
+**修复**：传 Agent 本体（`agents.find(...) || agents[0]`），删掉 `?.session` 两处。
+**防回归**：`report.mjs` §3.5 新增 2 条断言（解析 criticalCap 实参 + 断言不含 `.session`），
+并**实测验证断言是有效绊线**——对旧代码 `flaggedBad=true`（失败），对新代码通过；
+「两边都通过的测试等于没测」。
+
+### 阈值行：删除「上限」+ 字号改大 —— ✅ 2026-10-07
+
+**用户要求**：「智能压缩线 30% · 强制压缩线 80% · 上限 80%，删除上限。然后字体改大一些。」
+
+**背景**：上一轮为修「上限 80% 没显示完整」把字号压到 9px + 折行。用户现在改主意——
+不要这个信息，且嫌字小。
+
+**改动**：
+- **删除「上限 NN%」**：引擎阈值（`criticalCap`）是**内部钳制细节**，用户不需要在弹窗里看；
+  面板备注（`hintFor` 动态追加）与计算器推荐行仍会说明该约束 ⇒ 信息没有丢失，只是移出了 HUD。
+  client 侧 `capTxt` 变量随之删除（`NS.engineCap` 仍保留——**保存路径的钳制逻辑不变**，
+  只是不再显示）。
+- **字号 9px → 11px**：删掉上限后行变短，11px 仍能一行放下（`智能压缩线 30% · 强制压缩线 80%`
+  ≈ 22 字符），不再需要靠缩小字号换空间。opacity .6 → .68 同步提亮。
+- 保留 `word-break:normal` + `overflow-wrap:anywhere` 作为窄容器兜底（**不是** keep-all：
+  keep-all 禁止汉字断行，反而更易溢出——这个坑记在上一节）；仍不用 ellipsis。
+
+**防回归**（`contract.mjs` §6.6 改为 8 条，含 2 条新增 + 1 条反转）：
+- 字号断言由「≤9px」**反转为「≥11px」**（用户要求改大，旧断言会误报）
+- 新增「阈值行已删除『上限』」（同时断言 `capTxt` 变量不复存在）
+- 保留：不得 ellipsis / 必须 normal 换行 / 不得 keep-all / 分隔符半角 ·
+- **三条绊线均实测验证有效**（字号缩回 9px、上限复活、ellipsis 复活 → 全部 FIRES）
+
+**取证分离（测试细节）**：样式与文本此前从同一段源码取；本轮新增断言需要**单独取
+`thr.textContent` 的模板串**（文本在 renderHud 内，样式在 thr 定义处，相距较远）——
+故 `thrCss` 与 `thrText` 分别正则提取。
+
+### R1 智能思考：注入落地 + `briefedBySid` 真 bug 修复 —— ✅ 2026-10-07
+
+**用户要求**：「相关提示词也要增加吧，让 Agent 明白这个功能的使用方法是基础逻辑。
+不然可能暴漏了，模型不会去调用。」+「开关打开后 Agent 就能收到提示词注入和直接开，
+关闭的话，提示词也不注入也无法改。」
+
+**① 教学文本（`renderEffortBrief`）——覆盖度必须 6/6**
+沿用本项目已踩过的教训（`policyCardMinRatio` 注释）：**「暴露能力但不教用法 = 功能等于不存在」**。
+
+| 要素 | 文本 |
+| --- | --- |
+| ① 当前值 | `当前思考强度档位：xhigh` |
+| ② 可选档 | `（本模型可选 low/high/xhigh）` |
+| ③ 标记语法 | `[cp:effort <档>]` |
+| ④ 何时该用 | `更深推理（复杂设计、疑难排查、长链规划）或更快响应（简单查询、机械修改）` |
+| ⑤ 生效时机+不中断 | `下一步生效，上下文与任务不中断，用户无需操作` |
+| ⑥ 代价提醒 | `换档可能使前缀缓存失效，一次任务 1-2 次为宜` |
+
+档位**现拼活值**（沿用 `renderBrief` 的 A3 教训）；无档可调时返回 `null` ⇒ 不注入不打扰。
+
+**② 每轮后缀（`renderEffortSuffix`）**：用量行追加 `｜ 思考强度 xhigh`（≈7 token/轮）。
+作用：模型知道**当前实际生效值**——它只知道自己请求过什么，不知道插件是否应用成功
+（例如档位非法被忽略时）。`adapterDefault` 时标注「(默认)」。
+
+**③ 门控解耦（用户强调的「全程允许」）**：effort 走**独立门控 `effortEnabled`**，
+与压缩的 `markerMinRatio` 完全无关——低占用也必须能注入/换档（压缩的卡在低占用时不注入）。
+断言用**剥注释后**的源码检查（注释里说明「与 markerMinRatio 解耦」是正常文字，
+第一版断言被自己的注释绊倒，已修）。
+
+**④ 真 bug 修复：`briefedBySid` 永不失效**
+原实现只有 `add`、全文无 `delete`/`clear` ⇒ 压缩把一次性说明收进摘要后，插件认为
+「讲过了」**永不再讲**；摘要由模型生成、**不保证保留该段** ⇒ 模型可能永久失去用法说明。
+实测佐证：`m2.briefings=2` 而 `m2.injections=5`。
+修复：新增 `clearBriefed(sid)`，**两条压缩路径**（pre-step 与 idle）成功后均调用，
+同时清 `briefedBySid` 与 `effBriefedBySid` 两个集合。
+
+**防回归**（`contract.mjs` §6.10/§6.11，共 19 条）：
+门控必须独立、教学 6 要素逐条断言、无档不注入、`clearBriefed` 存在且清两个集合、
+两条路径都调用、声明早于调用（防 const TDZ）。**5 条绊线均实测验证有效**。
+
+### R1 换档通道：agent.ctx 作用域 + 标记独占一行 —— ✅ 2026-10-07
+
+**① 执行 seam 的关键发现（差点埋雷）**
+源码实证：`waterfall("agent/request", {turn, step, signal}, seed)`
+（`dsh-agent-loop` L1179）——**payload 里没有 agent**，只有 turn/step/signal。
+
+⇒ 第一版实现用 `payload.agent.session.id` 找会话，**per-session 查找会恒不命中**、
+换档**静默失效**（不报错、只是永远不生效——最难查的一类故障）。
+
+官方 `installModelSelection` 的做法（`dsh-agent/lib/types/model-selection.js` L45/L61，
+调用方 `api-session-controller` L310 传 `agent.ctx`）：**注册在 agent.ctx 上**。
+本插件同款：按 agent **懒安装** + WeakSet 去重，sid 由闭包捕获；
+`ensureEffortHooks()` 在每次 pre-step 调用（新会话自动覆盖）。
+
+**② 标记正则必须独占一行（E2E 前自查发现的真风险）**
+宽松正则 `/\[cp:effort\s+(\w+)\s*\]/g` 会误触发**散文提及**：
+本插件注入的教学文本本身就含「在回复最后一行单独写 [cp:effort <档>]」，
+模型引用/复述它（「你可以写 [cp:effort high] 来换档」）时会被当成指令 ⇒ **非预期换档**。
+压缩标记用 `text.trimEnd().endsWith(M3.marker)` 天然规避（要求结尾），
+effort 标记因位置自由才暴露该问题。
+
+修复：`/^[ \t]*\[cp:effort[ \t]+([A-Za-z0-9_-]+)[ \t]*\][ \t]*$/gm`（锚定行首行尾 + m 标志）。
+实测 8 个用例：散文/文档/引用教学全部不再误触发；正常独占一行、带空格、与 compact 共存均正常。
+**残余风险（诚实标注）**：代码块内独占一行仍会触发——正则无法识别 markdown 上下文，
+但该场景远少于散文提及，可接受。
+
+**③ 四道必备防护**
+1. **档位合法性校验**：`dsh-llm resolveCallWithInfo` L2182 对非法档**直接抛错**
+   （`UNSUPPORTED_REASONING_EFFORT`）⇒ 会中断该次请求。不在可选集内 ⇒ 忽略 + 留痕（不硬送）。
+2. **冷却 30s**：换档可能使前缀缓存失效（`call-config.js` 注明 effort 属 cache-affecting 状态）。
+3. **让位他人显式指定**：当前 config 带 effort 且**不是本插件上次写的**（用户手动选档 /
+   subagent 自带 `reasoning_effort`）⇒ 不覆盖（router-laya `carriesExplicitRoute` 语义）。
+   用 `appliedEffortBySid` 区分「自己的足迹」与「他人选择」——否则第二轮起每轮都看似显式，会自我锁死。
+4. **删除 maxTokens**：换档不应把上个 adapter 的 cap 钉到新档（router-laya `applyRoute` 同款教训）。
+
+**④ 声明顺序修复**：R1 块（`EFFORT_MARKER_RE` / `installEffortRequestHook` /
+`ensureEffortHooks`）原在 pre-step 之后，而 const 无提升 ⇒ **TDZ 抛 ReferenceError**。
+已整体前移到 `readEffort` 之后，并加断言锁死三者「声明早于使用」。
+
+**取证字段**：`m3.effortMarkerHits / effortSwitches / effortSkips{cooldown,invalid,foreign,noRoute}
+/ effortHooks / lastEffortMarker / lastEffortApply`（含 from→want、options、applied:false+error）。
+
+**防回归**：`contract.mjs` §6.12（15 条）+ §6.13（7 条，含**行为验证**——用真实正则跑
+误触发用例），总计 219 断言。标记正则绊线实测有效（结构检查 + 行为检查双 FIRES）。
+
+### R1 收尾：prepend 真根因 + 零轮询显示 + 冷却可见 —— ✅ 2026-10-08
+
+**① 用户一问挖出的真 bug：换档「报成功」但实际未生效**
+用户看到 chip 一直 `xhigh`，怀疑「5s 轮询不智能」。取证发现远比显示严重：
+`lastEffortApply.applied = true`（xhigh→low），但**之后每一轮注入后缀仍是 xhigh**。
+
+根因：官方 `installModelSelection` 挂在**同一个** `agent/request` waterfall 上，
+且在**外层**（`dsh-agent/lib/types/model-selection.js` L61-75）：
+```js
+const resolved = await next();
+const { reasoningEffort: _inheritedEffort, ...withoutInheritedEffort } = resolved;
+return { ...withoutInheritedEffort,        // ← 内层写的 effort 在这里被 delete
+         ...selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort } };
+                                           // ← 再套回持久化 header 的值（xhigh）
+```
+⇒ 内层写入必被剥掉。**先剥内层、再套自己的**——waterfall 组合语义。
+
+修复三点（联动，缺一不可）：
+1. **`prepend: true`** —— 本插件成为最外层，每轮最后覆盖
+2. **pending 改持久态** —— 不再「用一次就删」：既然每轮都被剥，就得每轮都覆盖回去
+3. **冷却基准只在档位真变化时更新** —— 第 2 点引入的副作用：pending 持久后每轮都跑，
+   若每轮刷新冷却，**模型后续的新标记会被全部挡掉**
+配套：让位判断补 `pend.effort` 比较；`effortSwitches` 只在真变化时自增（否则变「请求次数」）；
+同值标记幂等短路（不消耗冷却，`effortSkips.sameValue`）。
+
+**验证**：修复后注入行实测变为「｜ 思考强度 low」⇒ **端到端闭环成立**。
+
+**② 去掉 5s 轮询（用户要求「不要5S轮询」）**
+改用**官方响应式投影**：`props.useProjection("modelSelection")`
+- `useProjection` 是 `conversation.input.right` slot 的**标准 prop**（官方 contract 列表实证）
+- 官方 UI 同款：`dsh-client-ui-conversation` L17240 `useProjection("plan")`
+- 投影由**会话事件驱动**（`applyModelSelectionProjection` L2072-2088：
+  `model/selection`→pending、`request/header`→lastUsed）⇒ 换档落库即重渲染，**零轮询**
+- **pending 优先显示** + 「· 下一步」小字 ⇒ 已选待生效的状态也能提前看到
+
+**③ 冷却显示（用户要求「把 30 秒冷却加到档位后面显示」）**
+- host 返回**绝对时间戳** `cooldownUntil` + `cooldownTotalMs`（低频调用不会过时）
+- chip 显示「· 冷却 23s」，**仅冷却时占位**，结束自动消失
+- 本地 1s tick **只在 cooling 时启用**，结束即 `clearInterval`（非常驻定时器）
+- host 信息在**投影变化时重问**（依赖 `[effort, pendingNow]`）⇒ 换档即刷新冷却状态
+
+**④ 一个自我修正（断言过严）**
+上一轮加的「chip 内不得出现 setInterval」过严——倒计时需要定时器。
+改为精确判据：定时器回调**不得含 `getHud`/`pullOnce`**（那才是被禁的「定期问 host」）；
+且**必须按 `cooling` 启停**（否则是变相常驻轮询）。
+
+**防回归**：`contract.mjs` §6.9/§6.12 共 15 条相关断言，总计 **233 断言**。
+**6 条绊线均实测有效**：恢复 5s 轮询 / 倒计时不按 cooling 启停 / 冷却不显示在档位后 /
+去掉 cooling 判断 / 加回 setInterval / 去掉 useProjection → 全部 FIRES。
+
+### R2：换档改「工具」——用户指出标记方案的根本缺陷 —— ✅ 2026-10-08
+
+**用户诊断（完全正确）**：
+> 「我发起问题，第一步思考时就获取到当前档位和可选档位和提示词，换档位，执行标记，触发，
+> 重新进入思考（以新档位），继续干活，过程中如果有必要就继续换，完成任务结束。」
+> 「需要我再发起才能触发标记。这个就失去意义了。」
+> 「最好是无感换档执行的，不要像压缩标记那样重新自动拉起——
+> **压缩标记的自动拉起本质是调用我的输入框发起新的内容拉起的**。」
+
+**R1 标记方案的两个致命缺陷**：
+1. 标记写在回复末尾 ⇒ 本轮已结束 ⇒ 档位只在**下一轮**（用户下次说话）生效
+2. 若仿压缩用 `agent.followup()` 自动拉起 ⇒ 往 `inbox.next-turn` **伪造一条用户消息**（替用户发言）
+
+**正确的机制（源码实证）**：`dsh-agent-loop` L1152-1155
+```js
+const toolCalls = message.content.filter((b) => b.type === "tool-call");
+if (toolCalls.length === 0) return { kind: "completed" };   // 无工具 ⇒ 本轮结束
+return concluded ? { kind: "completed" } : null;            // 有工具 ⇒ null = 继续下一步
+```
+⇒ **工具调用让本轮继续**（turnEnds 保持 null ⇒ L1005 不 break ⇒ `target="next-step"`），
+而每步都重走 `prepareRequest` → `agent/request` waterfall（L1179）
+⇒ **下一步的请求即带新档位**。零用户输入、零伪造消息、同轮内生效。
+
+**对比**：
+
+| 方案 | 生效时机 | 需用户输入 | 模型知道结果 | 误触发风险 |
+| --- | --- | --- | --- | --- |
+| 文本标记 | 回复末尾 → 本轮结束 | ❌ **需要** | ❌ 不知道 | ❌ 散文提及会误触发 |
+| **工具调用** | **同轮下一步** | ✅ 不需要 | ✅ 有返回值 | ✅ 无（结构化参数） |
+
+**参考项目原理（补充分析）**：`dsh-router-laya` 在 `agent/request` 里直接改 config
+（L886-975），任务文本从 `agent/inbox/claimed` 抓（L875），难度由本地小模型判（L582）——
+**换档发生在「请求组装时」，无需用户输入**。但它"外部模型替你决定"，
+与用户要的"Agent 自己决定"不同 ⇒ 取它的「生效时机」，决定权仍交 Agent。
+
+**前置验证（不建立在假设上）**：先加一次性只读探针 `snap.r2Probe` 实测：
+`toolsService: "object" | hasRegister: true | agentHasCtxTools: true` ⇒ 注册路径可达。
+
+**实现**（照官方 `dsh-tool-ask-user` 范式）：
+- `loadDefineTool()`：与 `createUserMessage` 同款候选链（bare → env → resourcesPath → 硬编码）。
+  实测 `via: "resourcesPath/app.asar|import"`（bare import 第三方目录必失败——本项目已有教训）
+- `registerEffortTool()`：`defineTool({ name, description, parameters, output, execute })`
+  + `tools.register(def)`
+- **工具不抛错**：非法档/冷却中返回结构化结果（`{ok:false, error, options}` /
+  `{ok:false, cooling:true, remainSec}`）让模型自行纠正——抛错会中断本轮。
+  这与 `agent/request` 侧必须校验（否则 llm 抛 `UNSUPPORTED_REASONING_EFFORT` 中断请求）
+  是**两层不同的保护**
+- `effortEnabled` 关闭时**不注册**（完全不介入）；会话中途打开开关则懒注册
+- 教学文本改写为教工具用法（6/6 覆盖度，③ 由「标记语法」→「工具名+调用方式」，
+  ⑤ 由「下一步生效」→「本次任务内立即生效」）
+- **移除**：`EFFORT_MARKER_RE` 正则、`session/event` 里的标记解析、§6.13 散文误触发断言
+  （工具方案无正则误判面，该断言随之退役）
+
+**取证字段**：`m3.effortTool`（注册结果）、`m3.effortToolLoader`（加载链）、`m3.effortToolCalls`。
+
+**实测**：`effortTool = {ok:true, name:"set_reasoning_effort", via:"tools.register"}` ✅
+注入文本已变为工具版本（本轮上下文可见）。
+
+**防回归**：`contract.mjs` §6.13 重写为 16 条工具契约断言（标记已移除 / 工具名 /
+官方 defineTool / tools.register / 候选链 / 关闭不注册 / 懒注册 / 不抛错 / 冷却返回 remainSec /
+写持久 pending / 参数与 output schema / 异常吞 / 取证字段），总计 **242 断言全通过**。
+
+### 压缩全线失效定位：workbuddy provider 对摘要请求 400 —— ✅ 2026-10-08
+
+**现象（严重）**：上下文到 95%，压缩是唯一能降占用的手段，但它**两条路径全败**——
+`preStepActs=16 / preStepOk=0`、`acts=2 / actOk=0`，错误码 `INVALID_REQUEST`。
+
+**取证卡点**：报告此前只记错误**码**，错误**正文**只进 log ⇒ 报告里看不到原因，无法定位。
+先补 `m3.lastPreStepError` / `m3.lastActError`（at/code/message/name/stack 三段栈），
+下一步立即拿到根因：
+
+```
+400: {"message":"workbuddy upstream client (http 400): 模型不支持该思考强度，请调整"}
+  at finishError ← summarizeWithLlm（dsh-compaction-basic lib/index.js L361/L324）
+```
+
+**排除法（逐条实证）**：
+1. **不是我们的档位值错** —— 把档位设成 `high` 仍 400；
+2. **不是本插件引起的** —— 首次压缩失败 17:45:25 **早于**首次成功换档 17:58:52；
+3. **不是 compaction-basic 传了档位** —— `summarizeWithLlm` 的源码里 `reasoningEffort` 一词
+   **完全不存在**，摘要请求的档位由 llm 侧从 `agent.options` / 持久化 header 补全，
+   而 workbuddy 声明 `off/low/high/max`、upstream 却拒绝 ⇒ **声明≠实现**；
+4. **确认是 provider 侧** —— 用户切到 `trae/deepseek-v4.1-flash` 后，同一标记路径
+   （`compactNow`）**一次成功**：`lastAct.shadowedTokens=733850`、`markerHits=1`、
+   占用 95% → **1.9%**。
+
+**结论**：workbuddy provider 插件缺陷（摘要请求的思考档位被 upstream 拒绝），**非本插件 bug**。
+另观察到第二种失败形态 `lastActError={code:"summary", message:"manual compaction could not
+produce a smaller summary"}`（摘要不够小），与 400 是两回事。
+
+**旁证（对本插件有用）**：切换后的 `r3Probe` 显示 `agent.options = {provider:workbuddy,
+model:hy4-preview-f, reasoningEffort:null}`（agent 创建时的**陈旧值**）vs
+`requestHeader().config = {provider:trae, reasoningEffort:xhigh}`（**实时值**）——
+再次确认「读档必须走 `requestHeader()`，`agent.options` 不可信」。
+
+**文档**：`docs/compaction-failure-diagnosis.md`（完整证据链与两条修复选项）。
+
+### R3：智能思考全面 review → 模块解耦（8 步） —— ✅ 2026-10-08
+
+**动因**：R1+R2 把智能思考铺进 host 13 处、约 520 行，且**已因耦合产出过一个真 bug**
+（懒安装塞在 M2 注入分支的 `step !== 1` 早退之后 ⇒ 工具接受成功却永不变档）。
+审查见 `docs/r3-effort-review.md`：10 项缺陷（S1–S10）+ 8 步实施顺序 + 10 条必须保留的结论。
+
+**实施（每步测试全绿）**：
+
+| # | 动作 | 结果 |
+| --- | --- | --- |
+| 1 | 命名统一（去 R1/R2 版本前缀）+ 删死字段 | 日志前缀改「智能思考 ⋯」；删 `effortMarkerHits`（文本标记时代，恒 0）与 `lastEffortMarker`（名不副实） |
+| 2 | 抽 `sidOf` / `checkEffort` / `bumpSkip` | 消除 3 处 sid 解析、2 处档位校验、5 处跳过计数的重复 |
+| 3 | `readEffort` 改纯 async | 原先同步对象 / Promise 混用 ⇒ 漏 `await` 会静默拿到 Promise 当对象用 |
+| 4 | 三张 Map → 单一 `bySid` 状态对象 | `pending/冷却基准/已写入档` 同键同生命周期，合并后**只有一个删除点**，孤儿在结构上不可能出现 |
+| 5 | 懒安装移出 M2 注入分支 | 由 pre-step **最前面** `await ensureEffort()`（+ `session/created` 双保险）；注入分支内不再有任何安装调用 |
+| 6 | 拆两个巨型函数 | 108 行钩子 → `applyTo`（决策）+ `installHook`（薄壳）；133 行工具 → `toolSpec`（定义）+ `runTool`（执行） |
+| 7 | **抽 `plugin/effort.mjs`** | 功能域整体搬出：配置/状态/读取/钩子/工具/注入文本/HUD 载荷；host 只留 4 个出口 |
+| 8 | 冷却可配（S7）/ output 收敛（S8）/ 开关字段分离（S9） | `effortCooldownMs` 三端打通；工具 output 7 字段 → 4 字段（冷却秒数并入 error 文案）；getHud 显式返回 `effortEnabled` 布尔 |
+
+**结构收益**：`host.impl.mjs` **2348 → 1563 行**（-785），新增 `effort.mjs` 415 行
+（净 -370 行，且功能域自成一域）。`effort.mjs` 是依赖图的**叶子节点**（不 import 任何内部件），
+`static.mjs` §4 依赖方向护栏自动覆盖。
+
+**热换纪律**：`effort.mjs` 用 `import(\`./effort.mjs?ts=${IMPL_TS}\`)`，`IMPL_TS` 取自 impl
+自身的 `?ts=`（entry.mjs 按「mtime + 激活序号」构造）⇒ 每次 toggle 必变 ⇒ 与 impl 同批换新。
+（静态相对 import 会命中**无参 URL** 永久缓存——P16 实测踩过。）
+
+**调查脚手架清理**：删 `r1ProbeOnce`（~170 行一次性探针，且自带 `selectModel` 写入路径）、
+`state.r1Probe`、`snap.r2Probe` / `snap.r2Probe2` / `snap.r3Probe`（共 -28269 字节）。
+结论不丢：`report.mjs` §6 由「探针存在」断言改为**「结论留档」**断言
+（docs 调查文档 + `effort.mjs` 文件头 10 条 + router-laya 存档）。
+
+**顺带发现并修掉一个测试自身的假绿**：§6.10 教学覆盖 ③ 的正则
+`/EFFORT_TOOL_NAME \+ '（参数 effort=<档位>）'/` 自 R2 起就写错了（多了个 `）'` 收尾，
+实际文本是 `）切换：'`），一直被同一行的 `|调用工具 '` 兜底**掩盖**；
+R3 去掉兜底后暴露并修正为 `/TOOL_NAME \+ '（参数 effort=<档位>）切换：'/`。
+⇒ 教训：「多分支正则」里的一条分支失效可以长期不可见。
+
+**防回归**：`contract.mjs` 181 条（§6.12/§6.13 断言改指向 `effort.mjs`，
+并新增 S3/S4/S5/S6/S7/S8/S9 与「结论清单固化」判据）+ `static.mjs` 33 条 + `report.mjs` 57 条，
+**总计 271 断言全通过**（原 245）。6 条关键绊线实测有效（改回旧结构即 FIRES）。
+
+### 配置面板「首帧就绪门」：消除「先显示一个值再跳变」 —— ✅ 2026-10-08
+
+**用户实测反馈**：新增「换档冷却(秒)」行后，面板出现「刚出现时显示 600 秒，随后才变成 30 秒」。
+
+**取证（先排除「新行读错值」）**：
+- `stored` 按**字段键**索引（`unwrapLiveDeep(snapshot.value)[field.key]`），不存在位置错配；
+  `el = react.createElement`，`key: field.key` 生效，插入新行不会复用旧行 DOM。
+- 持久化文件 `~/.dsh/profiles/desktop/cordis.patch.yml` 实测：
+  `dsh-context-pilot.config = {enabled, effortEnabled, criticalRatio:0.8, markerMinRatio:0.3}`
+  ⇒ **其余字段全部走 schema 默认值**。故 600 是**紧邻的「强制压缩冷却(秒)」**的默认值
+  （`sweepMinIntervalMs` 未持久化 ⇒ 恒 600s），不是新行的值；新行的默认是 `effortCooldownMs=30000` → 30s。
+
+**找到的真缺陷（这才是「先显示再跳变」的机制）**：
+`PilotPanelCard` 在快照未就绪时 `stored = {}` ⇒ **每一行都退回 `field.def`**，而默认值与已存值不同：
+`criticalRatio` 默认 0.85 vs 已存 0.8、`markerMinRatio` 默认 0.2 vs 已存 0.3
+⇒ 第一帧渲染的是默认值，快照到达后才跳成真实值。新增一行让这一帧最扎眼，故被用户看见。
+
+**修复（就绪门）**：`const ready = snapshot.value !== void 0 && snapshot.value !== null;`
+未就绪时**只渲染占位**（page 视图「配置读取中…」+ 说明；summary 视图同款一行），
+就绪后才渲染字段表 ⇒ 值一出现即为终值，**不存在「先错后对」的帧**。
+判据用「`value` 已定义」而非 `writable`（后者在只读就绪态也为 false，会误判为未就绪）。
+
+**防回归**：`contract.mjs` §6.7b 新增 5 条（主体可解析 / 判据是 value 非 writable /
+page 占位 / summary 占位 / 声明早于使用无 TDZ），**4 项变异全部被抓住**，总计 **278 断言全通过**。
+
+**部署**：`client.js` 改动 ⇒ **刷新页面**生效（host 侧无改动）。
+
+### 摘要归属可查：`deepseek-account` 摘要可用 + 结论锐化 —— ✅ 2026-10-08
+
+**任务**：验证标记压缩在**当前主力 provider**（`deepseek-account/deepseek-flash`）下是否成立。
+（此前 workbuddy 全败、trae 已验证，`deepseek-account` 未测。）
+
+**结论：✅ 可用**——并顺带找到一条**比报告更硬的一手证据源**。
+
+#### 决定性证据：`compaction/summary` 记录自带 `provider` / `model`
+
+回到 DSH 会话存盘（`~/.dsh/sessions/<slug>/<sid>/session.v4.jsonl.zstd`）逐条解析。
+该文件是**多帧 zstd 拼接的 JSONL**（本会话 8752 帧 / 15.9 MB），两个坑：
+
+1. `zstdDecompressSync(buf)` 只解**第一帧**（否则只得 210 字节）⇒ 必须按帧头魔数
+   `28 B5 2F FD` 哨兵扫描、逐帧解压；
+2. **一帧内可能含多条 JSON 记录** ⇒ 只取 `split('\n')[0]` 会漏约 1/3 记录，
+   必须**逐帧解压 + 逐行 `JSON.parse`**（修正后记录数 8752 → 15606）。
+
+由此得到本会话**全部 10 次成功压缩的归属**（`compaction/summary` 自带
+`provider`/`model`/`maxTokens`/`usage`/`shadowedRange`）：
+
+| # | 时间 | provider / model | 压掉 tokens | 发起方 |
+|---|---|---|---|---|
+| 1–6 | 10-05 ~ 10-06 | `zcode/glm-5.3-flash` | 91K ~ 213K | context-pilot |
+| 7 | 10-07 09:38 | **`workbuddy/glm-5.3-flash`** ✅ | 433,684 | 自动 |
+| 8 | 10-07 12:51 | `trae/deepseek-v4.1-flash` | 350,454 | context-pilot |
+| 9 | 10-07 18:25 | `trae/deepseek-v4.1-flash` | 733,850 | context-pilot |
+| 10 | **10-07 18:45** | **`deepseek-account/deepseek-flash`** ✅ | **217,768** | context-pilot |
+
+#### 两处结论锐化
+
+1. **workbuddy 不是全废** —— 第 7 次 `workbuddy/glm-5.3-flash` **成功**。
+   坏的是 **`workbuddy × deepseek-v4.1-flash` 这个 provider×model 组合**
+   （呼应既有结论「`reasoning.efforts` 声明随 provider 变、且声明≠实现」）。
+   若止步于上一轮的排除法，结论会错写成「workbuddy 坏了」。
+2. **`deepseek-account` 摘要可用** —— 第 10 次即本轮标记压缩：
+   `provider:"deepseek-account"`、`model:"deepseek-flash"`、`shadowedTokenCount:217768`、
+   `usage:{inputTokens:468, outputTokens:6244, cacheReadTokens:323072}`。
+
+#### 失败总量与时间线（存盘口径，比报告更全）
+
+```
+compaction/start = 322 ｜ compaction/end = 322 ｜ 其中带 400 error = 312
+最后一条 400：2026-10-07T18:23:14.228Z (seq 14719, turn 150)   ← 切换 deepseek-account 之前
+切换之后 (seq > 14795) 的 400 条数 = 0
+```
+
+**成功链条完整闭环**（相邻三条 seq）：
+
+```
+15506  18:45:39.506  compaction/summary   sourceCommandId:"context-pilot"  provider:deepseek-account
+15508  18:45:39.508  compaction/end       （无 error 字段）
+15509  18:45:41.593  agent/inbox/spliced  target:"next-turn"  ←「（context-pilot 自动恢复）」
+```
+
+⇒ 标记路径「发起 → 摘要成功 → 收口 → 自动拉起」四步全部有据；占用 ~31% → **11.1%**。
+与报告侧取证一致：`m3.markerHits=1`、`acts=1/actOk=1`、`reason:"marker"`、
+`shadowedTokens=217768`、`lastActError=null`。
+
+#### 附带发现
+
+- **摘要请求的 `maxTokens` 恒为 `65536`**（10 次全同）——与「换档时必须 `delete maxTokens`」
+  的既有结论同源：档位/上限留给 upstream 自行推导。详见诊断文档 §5。
+- **可观测性缺口**：312 次失败、历时约 40 分钟，**用户全程无感**（插件只记 `acts/actOk`，
+  压缩失败不会冒泡到 HUD）。本轮靠人工挖报告才发现。已列入诊断文档 §8 待办。
+- **方案 A（独立摘要模型）降级**：本会话在「主力避开坏组合」下已恢复正常，
+  故 A 从「救火」变为**纵深防御**，优先级由「最高」降为「建议」。
+
+#### 文档与数字
+
+- `docs/compaction-failure-diagnosis.md` **全文重写**：新增 §6（决定性证据 / 全量压缩史 /
+  锐化结论 / 失败时间线）、§7 方案 A 降级说明、§8 待办、§9 三条教训
+  （含「provider 不可用」须切到 provider×model 粒度、报告是二手证据而存盘是一手证据）。
+- `README.md` §4.1 断言数由 **181/33/57 = 271** 更正为 **187/34/57 = 278**（`npm test` 实测）。
+  说明：本条目之前的历史台账数字**保持原样**（记录当时事实），仅在 README 汇总处对齐现状。
+- **无源码改动**，故无部署动作（三端状态不变）。
+
+### chip 两态样式 + 弹窗完整时间 / 严格会话过滤（血统链退役） —— ✅ 2026-10-08
+
+**用户两项 UI 要求**（附截图）：① 输入框 chip 删除「档位」与「冷却」显示，文案改「智能思考就绪」
+（后补充：**冷却时显示「智能思考冷却」**），
+冷却中/冷却完成各一套样式，并**像进度条一样按冷却时间在两样式间过渡**；
+② 悬浮压缩记录里显示**完整日期时间**，且**按会话过滤**（当时显示的是全 DSH 的记录）。
+
+#### ② 的根因：C-lineage 血统链在跨会话误连（一手证据定案）
+
+先复现：`hud-acts.json` 实际含 **3 个 sid**，`lineage` 为
+
+```
+f4154f01→16616c07 ｜ cb8d115e→f4154f01 ｜ 16616c07→f4154f01（回边，成环） ｜ 899bfaca→16616c07
+```
+
+从本会话 `16616c07` 回溯得链 `{16616c07, f4154f01}` ⇒ **命中 4/5 条**，而严格 sid 只应命中 3 条。
+用户截图里悬停列表正好 **4 条** —— 第 4 条 `13:58 · 标记 · 省 198.4K` 属 `f4154f01`，
+该 sid 位于 **`--F-My Code-keysion-dac-vue--` 另一个 workspace**（`cb8d115e` 则在 `zcode-dispatch`）。
+⇒ **串会话的确是血统链干的，不是「记录丢失」的反向问题。**
+
+**并且血统链的存在前提被证伪**：本会话 12:51、18:25、18:45 三次压缩**全部**记录在同一 sid 下
+⇒ 「DSH 压缩会轮转 session id」不成立，「按当前 id 过滤永远匹配不上」是误判。
+
+**处理：整体退役 C-lineage**（不是打补丁）——删 `noteSessionId`（+4 处调用）、`state.m5.lineage`、
+`state.m5.lastSid`、`hud-acts.json` 的 `lineage` 键（旧文件读入即忽略）、`m5.hudPoll` 的
+`lineageSize`/`chainSize`/`chainHeads`；`getHud` 与快照取证**同一口径 = sid 精确相等**。
+同时退役「全局兜底」显示路径（`actsGlobal` / `hudLastActGlobal` 三端清零）与 client 侧
+「带参失败即退回无参全局查询」的回退——那两条都会把全部会话的记录灌进弹窗。
+
+**教训**：用「启发式推断的关联」去补「以为丢了的记录」，会把别的对象的数据当成自己的。
+匹配不到就如实显示「本会话暂无压缩记录」，比拿别会话数据顶替更正确。
+
+#### ① chip 重做（两态 + 进度条式过渡）
+
+- 文案**两态**：冷却中「智能思考冷却」、冷却完成「智能思考就绪」（用户补充要求）；
+  **档位值与剩余秒数移入 title**（信息不丢，只是不抢视觉）。
+  文字与样式**同源判据 `cooling`**，不会出现「文字说冷却、颜色说就绪」的不一致。
+- 底层铺满 `--dsw-alias-state-warn-primary` = 冷却态；上层 `--dsw-alias-state-success-primary`
+  按 `progress` 从左往右扫过 ⇒ 冷却走完正好扫满 = 就绪态。
+- 关键判据：`cooling=false ⇒ progress=1`，**「冷却结束」与「扫满」同一时刻**，
+  不会出现「样式已就绪但条没满」。1s tick + `transition: width 1s linear` 补帧 ⇒ 肉眼平滑。
+- 顺带：`data-state="cooling|ready"` 作为可测锚点；未新增定时器（沿用既有 1s 冷却 tick）。
+
+#### 弹窗时间格式
+
+`hh:mm` → **`YYYY-MM-DD HH:MM:SS`**（本地时区）。host 新增结构化 `actsDetail:{at,text}[]`
+（带 `at`），client 用 `fmtFullTime(at)` 渲染并用 `stripHhmm` 剥掉 host 文本里的前导 `hh:mm`，
+避免同一行出现两个时间；旧记录同样适用（模板自 B1 起未变）。
+
+#### 防回归（294 断言全通过）
+
+`contract.mjs` **187 → 203**：§6.9 重写为 10 条 chip 两态契约，新增 §6.14 共 10 条
+（精确过滤 / 血统链退役 / `actsDetail` / 全局兜底清零 / 完整时间 / 无参回退已删 / wire 一致 /
+取证口径一致），退役清单新增 `actsGlobal`·`hudLastActGlobal`·`lineage`。
+**12 项变异全部被抓住**（文案回退 / 重新内联档位值 / 重新内联冷却秒数 / 去掉 transition /
+progress 不收敛 / 不用完整时间 / 恢复无参回退 / 过滤退回全局 / 去掉 actsDetail /
+恢复 actsGlobal / 血统链调用复活 / lineage 重新持久化）——含 1 次**测试自身 TDZ 真 bug**
+（`chipBody` 声明晚于新断言 ⇒ `Cannot access before initialization`，整套件 0 通过）。
+
+**文案两态补充轮次又抓到一条「测试不够紧」**：把判据改成 `!cooling ? "智能思考冷却" : …`
+（文字与颜色相反）时，原正则 `cooling \? …` **仍匹配**——因为它只是子串，`!cooling` 里也含
+`cooling`。补 `!/!\s*cooling\s*\?/` 反向锚定后该变异被抓住（6/6）。
+⇒ 教训：**「有没有这个字符串」不等于「是不是这个判断」**；断言布尔判据时必须连**取反形态**一起排除。
+
+#### 部署
+
+`client.js` ⇒ **刷新页面**；`host.impl.mjs` + `wire.host.mjs`（后者仅签名散文）⇒ **plugin toggle 热换**。
+
+### R4：自动压缩改「工具触发」——彻底删除伪造用户消息 —— ✅ 2026-10-08
+
+**需求（用户原话）**：「现在可以开始自动压缩优化内容了，前面好像有落袋计划内容。就是自动压缩时，
+**不用伪造一条我的信息**重新拉起会话。」
+
+**落袋计划的定位**：`docs/r2-tool-switch-design.md` §6 早已提出「压缩能否也做成工具」，
+其中**方案 A（工具 + 轮末执行）**被列为推荐。本轮先去 asar 把 API 面摸清，结论是
+**方案 A 需要修正**，且三条「绕开消息」的捷径全部不通。
+
+#### 源码级事实（asar 实证，全部可复现）
+
+| 路径 | 事实 | 结论 |
+|---|---|---|
+| inbox | 只有 `next-turn` / `next-step` 两个队列；`agent/inbox/inserted` 载荷类型是 **`UserMessage`** | 往 inbox 塞东西**必然是消息** ⇒ 时机不是问题，**通道**才是 |
+| `system/developer` message | `session.append("developer/message", {message: createDeveloperMessage({source:{kind:'tool-registry'}})})` 确实存在 | 能写**非用户**内容，但**只写对话、不唤醒 agent** ⇒ 无法拉起 |
+| `mode:"steer"` | `placement = running ? (mode==='steer' ? 'steering' : 'queued') : 'transcript'`；`turn-stopping` 条件含 "no fresh steering" | 能注入当前回合，但**内容仍是用户发言**，且 idle 后 `status!=='running'` 用不了 ⇒ 不解决诉求 |
+| **工具调用** | 工具 ⇒ 必须回灌 tool result ⇒ **下一步必然存在**；`agent/pre-step` 在下一步请求前执行 | ✅ **在 pre-step 压缩 ⇒ 压缩天然作用于下一步，全程零消息** |
+
+**轮内 trigger 语义**（`compactIfNeeded`，源码原文）：
+`"context-overflow"` **bypasses the normal threshold and retained-tail policy**；内部走
+`selectCompactableRange(session, measurement, 0)` ⇒ 第三参是**保留 token 预算**，`0` = 只留最后一个节点。
+`"pressure"` 则未达阈值时**在任何 LLM 调用之前**就 return null。
+
+#### 与落袋方案的偏差（重要）
+
+方案 A 的推理是「模型调工具 → 本轮正常结束 → idle 执行 → 不需要恢复消息」。
+**但这在「压缩是为了腾空间继续干活」的主用例上不成立**：推迟到轮末 ⇒ 本轮内不腾空间，
+且与既有 idle safety-net 几乎重合，工具形同虚设。
+⇒ 改为**压缩落在下一步开始前**（工具调用保证下一步存在）。此方案**严格支配**原方案：
+本轮内腾空间、模型不必停、零消息、且压缩**必然发生**。
+
+#### 实施
+
+- **新模块 `plugin/compact-tool.mjs`**（依赖图叶子，与 `effort.mjs` 同构）：
+  工具 `compact_context`（可选 `reason`）**只登记意图并立即返回** `{ok:true, scheduled:"next-step"}`；
+  意图表 `Map<sid,{at,reason}>` + TTL 120s；**注入教学本体也在此模块**
+  （`renderBrief` 一次性说明 + `renderCard` 决策卡 + 工具自描述）。
+- **host 消费**（`preStepCompaction`）：意图门**在 critical 门之前**（`if (!wanted && ratio < effCritical) return`）；
+  `takeIntent` 先于执行（失败也不逐步重试）；主动请求**先试 `pressure`**（≥阈值时用引擎正常保留策略），
+  为 null 才退 `context-overflow` 强制。
+- **删除**：`maybeResumeAfterMarker` / `resumeViaAnyChannel`（三通道整函数删除）/
+  `resumeCountBySid` / `M5_RESUME_MAX` / `resumeTimers`。代码中
+  `sessionController.prompt`·`agent.followup`·`createUserMessage(source.kind:'user')` **零出现**。
+- **三处教学同步改写**（最易漏、且漏改是**静默失效**）：三处都明确「调用后直接继续，
+  **不要为了压缩而停下**」，并**反向澄清**「没有任何自动拉起动作」。
+  若只改机制不改文案，模型会继续写标记并**等一个永远不来的恢复**。
+
+**结构收益**：`host.impl.mjs` **1563 → 1500 行**；新增 `compact-tool.mjs` 241 行。
+
+#### 验收
+
+- **321 断言全绿**（contract **203 → 227** + static **34 → 37** + report 57）。
+- **14 项变异全部被抓住**：门控接错开关 / 工具名字面量散落 / 工具改为抛错 / TTL 失效 /
+  懒安装排在消费之后 / 意图门被 critical 门吞掉 / 直接走 overflow / 意图不消费 /
+  **伪造恢复被重新接上** / 教学丢掉「不要停下」/ 消费不留痕 / 说明退回旧文案 /
+  说明出口内联 / 说明不做反向澄清。
+- 过程中修掉 2 处**我自己写错的断言**：① 顺序断言比的是 `indexOf` 首次出现，而首次出现在
+  **注释**里（`compactIfNeeded 契约首行…`）⇒ 断言恒假；② `!/本轮先不执行任务/.test(ct)`
+  被**文件头里描述旧机制的那句话**判失败 ⇒ 须先剥注释。
+  ⇒ 教训：「未出现某字符串」类断言**必须先剥注释**，否则把解释性文字当成违规。
+
+#### 待办（下一步）
+
+1. **真机 E2E**：让模型调 `compact_context`，核对 `m3.compactToolCalls` / `compactIntents` /
+   `lastCompactIntent.trigger` / `preStepOk`，确认本轮不中断且**零消息注入**。
+2. **marker 通道彻底退役**：删 `M3.marker` / `armedTtlMs` / 标记解析 / 武装灯 / 「待执行」徽章 /
+   `pendingBySid` / `lastUserTextBySid` / `state.m55` / 面板两字段（`markerMinRatio` 保留——
+   它同时是决策卡注入门槛）。
+3. **保留策略可选**：`context-overflow` 的 `retain=0` 较激进；若真机显示「压太狠」，
+   可由插件自行算范围后调 `compactRegion`，复刻引擎 `retainRatio` 预算。
+
+#### 部署
+
+`host.impl.mjs` + 新模块 `compact-tool.mjs` ⇒ **plugin toggle 热换**（无 client / schema 改动）。
+
+### 强制压缩线恒低于 DSH 内置阈值 5pp（面板 + 计算器 + 弹窗）—— ✅ 2026-10-08
+
+**用户要求**：「设置的强制压缩线永远低于 DSH 内置 5%（内置 80% ⇒ 面板最高 **75%**），计算也改」。
+
+> ⚠️ **首版做错了量级**：我按「0.5 个百分点」实现（上限 79.5%），用户随即更正为 **5 个百分点**。
+> 记在这里的原因：用户原话写的是「低于 DSH 内置 0.5%」，我按 `80% − 0.5%` 读成了 0.5pp；
+> 正确读法是 **5pp**（他这句里的 `0.5%` 指的就是面板最终要用的 75% 那档的量级）。
+> ⇒ 教训：**百分比余量这类「量级敏感」的需求，实现前先复述一遍具体数字让用户确认**
+> （「内置 80% ⇒ 上限 75%，对吗？」），比事后返工便宜得多。
+
+**为什么要留余量**：两线相等时，谁先命中取决于**各自的测量时机**——
+DSH 引擎也在 step 边界自己 `measure()` 一次。若引擎先命中，就会出现
+「插件线已到、却什么都没做、占用却降了」：插件的 HUD 记录与压缩原因**双双失真**。
+5pp 同时吸收两边测量的抖动，并留出足够提前量让插件线**确定性先行**。
+
+**实施**：
+
+- **host 单一上限函数**：新增 `ENGINE_CAP_MARGIN = 0.05` 与
+  `criticalCapOf(agent) = max(0, engineThreshold(agent) − ENGINE_CAP_MARGIN)`；
+  **三处消费点全部改用它**（pre-step 门控 / idle safety-net 门控 / getHud 下发的 `criticalCap`），
+  确保面板钳制、弹窗显示、实际触发三者同源。
+- **取证**：`engineCapProbe` 同时记 `ratio`（原始引擎阈值）、`cap`（减余量后）、`margin`——
+  否则报告里看不出那 5pp 扣在哪。
+- **面板**：提示改为「上限 = DSH 内置阈值 − 5 个百分点（当前 75%），超出自动钳到该值」；
+  上限用**一位小数**显示（`Math.round(x*1000)/10`）——引擎阈值若不是整十，余量的实际落点才看得见。
+- **弹窗阈值行**：显示**生效值** `min(配置, 上限)`，并在配置高于上限时追加
+  「（已按上限 75% 收敛）」。这是**过渡态**提示（用户下次保存即被钳到 75%），
+  与 2026-10-07 删掉的「恒定显示上限」噪声不同。
+  「距强制线还差多少」也改用生效值——否则会在**不会真正触发的线**上报告「已达强制压缩线」。
+- **不改用户已存配置**：隐式改写用户配置是更坏的行为；只由生效值钳制，面板照实显示。
+  （用户实际已自行把配置设为 **0.75**——正好等于新上限，因此不再出现「收敛」提示。）
+
+**真机复核**：`engineCapProbe = {via:"agentPresets.serviceFor", ratio:0.8, fallback:false, cap:0.75, margin:0.05}`
+⇒ 生效线 = min(0.75, 0.75) = **0.75**，本会话注入的决策卡也如实显示「占用达 75%」✅
+
+**防回归**：contract 新增 §6.16 共 12 条（余量常量 / 单一上限函数 / 三处同源 / 无裸 engineThreshold 残留 /
+取证记双值 / 提示语规则 / 一位小数 / 弹窗生效值 / 距线用生效值 / hudRemote 带 cap），
+`report.mjs` 的 C-own 契约同步到 `criticalCapOf`（**传 Agent 本体的要求不变**）。
+**9 项变异全部被抓住**（含「上限不再扣余量」「余量改错值」「三处任一处绕过」「取证不记上限」
+「弹窗改回裸配置」「上限退回四舍五入」）。总计 **337 断言全通过**。
+
+**部署**：host.impl 走 plugin toggle；`client.js` 改动 ⇒ **刷新页面**。
+
+#### 真机追修（用户截图 ×2）：面板不钳制 + 教学显示配置值
+
+用户实测两处，**都是「显示/钳制用了配置值而非生效值」这一类的漏网**：
+
+1. **面板设 0.8 保存后没钳回 0.75**（截图显示「已保存并回读校验通过（1 项）」而值仍是 0.8）。
+   根因：生效上限原先**只由悬浮弹窗的 `pullHud` 写入 `NS.engineCap`**，而**设置面板是独立表面**——
+   用户没开过弹窗时 `NS.engineCap` 恒为 `null` ⇒ ① 备注一直显示「待探测」② `persist` 拿不到上限、
+   **完全不钳制**。另：`NS` 是普通对象，改它**不触发重渲染**，本来就该用 React state。
+   **修**：面板挂载时**自己拉一次**无参 `getHud("")`（上限与会话无关），存进 `engineCap` state；
+   `hintFor` / `persist` / 计算器 / 回读提示**四处统一用它**，不再读 `NS.engineCap`。
+   （`pullHud` 里的 `NS.engineCap = r.criticalCap` 保留，供弹窗面板共用。）
+2. **注入的决策卡写着「占用达 80%」而实际生效线是 75%**（本轮卡片实录）。
+   根因：`renderPolicyCard` / `renderBrief` 把 **`M3.criticalRatio`（配置值）** 传给模块，
+   而门控用的是 `min(配置, 引擎阈值 − 5pp)` ⇒ **教了个不会触发的数字**。
+   **修**：注入分支先算 `effCrit = min(M3.criticalRatio, criticalCapOf(agent))`，两个出口都传它；
+   出口内部**不得**再读 `M3.criticalRatio`（两个出口各一处，断言按**出现次数 = 2** 校验）。
+
+**用户另要求删除弹窗的「（已按上限 75% 收敛）」注释**——显示生效值本身已说清事实，再加解释是噪声
+（与 2026-10-07 删「上限 80%」同一取向，且面板修好后保存即被钳到上限，该过渡态基本不再出现）。
+
+**防回归**：contract §6.16 增至 19 条（面板自取上限的**取值表达式本身** / 保存路径用 state /
+计算器与回读同源 / 教学传 effCrit / **两个出口都得改** / 收敛注释已删）；
+`client 删除了记录回退` 与 `M2 注入主体` 两条旧断言相应收窄放宽（新代码合法地多了一次无参查询、
+多了一个参数）。**7 项变异全部被抓住**——其中两项**先没抓住，暴露了我的断言太弱**：
+① 只查「有 pullCap / 有 setEngineCap」被「写了函数但 `const c = null`」蒙混；
+② 只匹配到**一处**出口，另一个出口仍读配置值也照样通过。
+⇒ 教训：**断言要盯「取值/传参的那个表达式」，而不是「函数存在」**；多处同源的判据必须**数出现次数**。
+总计 **343 断言全通过**。
+
+**真机复核**：`engineCapProbe = {ratio:0.8, cap:0.75, margin:0.05}`、`m3.eff.criticalRatio = 0.8`
+⇒ 生效线 = **0.75**；刷新页面后面板备注应显示「上限 = DSH 内置阈值 − 5 个百分点（当前 75%）」，
+保存 0.8 会被钳成 0.75，弹窗阈值行只显示「强制压缩线 75%」（无附加注释）。
+
+#### 真机追修 2（用户截图「面板不见了」）：跨组件引用面板 state
+
+**事故**：插件页整个配置卡消失，只剩「包含的组件 共 1 个」。
+根因是我在上一轮把 `PriceCalculator` 里的 `NS.engineCap` 改成面板 state `engineCap`——
+**而 `PriceCalculator` 是独立的函数组件**（`function PriceCalculator({ writable, saving, onApply })`），
+`engineCap` 根本不在它的作用域里 ⇒ `ReferenceError: engineCap is not defined` ⇒ React 抛错 ⇒ **整卡消失**。
+
+**为什么测试没拦住**：
+- `static.mjs` 的 `node --check` **只查语法**；未定义标识符是运行期错误，它看不见；
+- 该组件没有局部错误边界，一崩就是整张卡。
+
+**修**：`engineCap` 走 **props** 传入（签名 + 渲染处两头都改）。
+
+**并补一类全新的护栏（contract §6.17「组件作用域对账」）**：抽出 `PriceCalculator` 的函数体，
+把它引用的**面板 state 名**与它的 **props 列表**逐一对账，出现「用了但没传」即失败。
+这填补了 `node --check` 与运行时之间的盲区——**跨组件引用**这类错误此前完全无人看守。
+**3 项变异全部被抓住**（去掉 props 的 engineCap / 渲染处不传 / 直接引用另一个面板 state `snapshot`）。
+总计 **346 断言全通过**。
+
+⇒ 教训：**机械替换字符串前，先确认那个标识符在不在目标作用域里**。本轮我是把 `NS.engineCap`
+（跨作用域可读的句柄）替换成 state 名——替换本身合理，但**目标组件并不是持有该 state 的那个组件**。
+
+#### 真机追修 3：钳制要发生在**输入时**与**进入面板时**，而不只是保存时
+
+用户反馈：「设置 0.8，没有钳回 0.75，**保存按钮变灰不可点击**」，随后自己定位到
+「因为之前是 0.8 保存的，进面板就显示 0.8 导致的」。
+
+**根因（两条路径都断在「保存时钳制」这一步）**：
+1. `保存` 按钮的 disabled 条件含 **`!dirty`**；用户输入 0.8 而**已存值也是 0.8** ⇒ `dirty=false`
+   ⇒ 按钮灰掉 ⇒ **保存时钳制那段代码根本走不到**。
+2. 更根本的：**已存值本身就超限**（早先存过 0.8，之后余量规则把上限收到 0.75）⇒
+   进面板时输入框显示 0.8 = 已存值 ⇒ 依然 `dirty=false` ⇒ 用户**没有任何可行的收敛路径**。
+
+**修法（两处，都发生在「保存时」之前）**：
+- **输入即时钳制**（`setField`）：`criticalRatio` 一旦构成完整数字且超过 `engineCap`，
+  当场把草稿值改为上限 ⇒ 输入框立即显示 0.75 ⇒ `dirty` 变真 ⇒ 保存可用。
+  只钳完整数字（`parseInput(...) !== null`），空串/半成品不改写（否则边打字边被改）；
+  上限未探测到时不钳。
+- **进面板自动钳回并保存**（`autoClamped` ref 守卫）：`ready && writable && engineCap != null`
+  且 `stored.criticalRatio > engineCap` 时，直接 `writeField` 写入上限 + **回读校验**，
+  并提示「已把强制压缩线由 0.8 自动钳到 0.75 并保存」。只做一次；失败复位以便重试。
+  （用户明确要求：「如果原保存值超过钳回值，应该也直接钳回保存」。）
+
+**防回归**：contract §6.16 增至 24 条（输入即时钳制 / 不误伤半成品 / 上限未知不钳 /
+已存超限自动钳回保存 / 一次性守卫 / 回读校验 / 仅就绪可写时执行）。
+**6 项变异全部被抓住**（取消即时钳制 / 对半成品也钳 / 取消自动钳回 / 去掉一次性守卫 /
+去掉回读校验 / 未就绪也执行）。总计 **351 断言全通过**。
+
+⇒ 教训：**「钳制」要放在用户能触发的每一条路径上**。只在保存时钳，等于假定用户一定能走到保存；
+而 `dirty` 门控恰恰在最需要钳制的那两种情形（输入值 = 已存值、或已存值本身超限）把门关上了。
+
+> ⚠️ 过程记录：本轮实施到「改台账」一步时被用户中断，且我犯了个流程错误
+> （未先 `read` 就直接 `edit` 该文件，工具拒绝）。恢复时先核对 `git status` + 跑测试确认
+> 代码与测试是自洽的（client.js +45 / contract.mjs +28 / 351 断言全绿），再补文档、提交。
+
+### chip/弹窗两处 UI 微调（用户截图）—— ✅ 2026-10-08
+
+1. **弹窗「智能思考」行补色块**：原本只有「智能压缩」行有 8px 圆角色块（`#4c7dff`），
+   右侧「智能思考」组只有文字标签 ⇒ 两行视觉不成对。现补同款色块（8px / 圆角 2px / 同色）。
+   刻意与「智能压缩」同色（本插件的强调色）；若想区分两个开关的色相，改一处即可。
+2. **chip 就绪色 绿 → 发送按钮蓝**（用户要求「参考输入框的发送按钮」）。
+   ⚠️ **这一步真机返工过一次，教训值得记**：
+   第一版我**按 token 名字**选了 `--dsw-alias-brand-primary`，结果 chip 渲染成**灰白色**（用户截图反馈）。
+   去 `app.asar` 用 `asar-query` 查真值才发现：
+   - `--dsw-alias-brand-primary` = `--dsw-static-neutral-bluish-1000`（深色）/ `neutral-bluish-50`（浅色 = #f9fafb）
+     —— 它是**随主题反转的中性高对比色**（`--dsw-alias-button-primary-fill` 正是它，即「白底黑字」那类主按钮），**根本不是蓝**；
+   - 真正的发送按钮在 `dsh-client-ui-conversation/lib/client.js`：
+     ```css
+     .RlGAzG_primary{ background: var(--dsw-alias-button-info-fill); border-radius:999px; width:34px; height:34px; }
+     ```
+     （该按钮的 i18n 键是 `input.send` = 「发送消息」）
+   - 而 `--dsw-alias-button-info-fill: var(--dsw-static-deepseek-500)` ≈ **#4176e6**。
+   ⇒ 最终**复用同一个 token**（`--dsw-alias-button-info-fill`）而非近似色值，
+   chip 与发送按钮在任何主题下都自动一致；回退值取该 token 的真值 `#4176e6`。
+   **教训：按名字挑 token 等于猜。** 色值必须从源码/计算样式里**查证**——
+   同一轮里我用 `getComputedStyle` 复制邻居圆角/字号是对的，这次却偷懒按名字选了。
+
+**防回归**：contract §6.5/§6.9 各补绊线（色块存在 + 尺寸色值一致 / 就绪色必须是 **button-info-fill**
+且不得含绿、不得退回 `brand-primary`），**9 项变异全部被抓住**
+（含「退回硬编码绿」「退回中性 brand-primary」「换成非发送按钮 token」「色块尺寸/颜色不一致」）。
+色值判据改为**精确抽取 `C_OK`/`C_WARN` 声明行**，不扫整段——本轮又栽在「注释里引用了错误 token 当反例」
+导致「不得出现」断言被注释判失败（**第二次**同类问题）。
+总计 **325 断言全通过**。
+
+#### 真机部署当场抓到一个真 bug（懒安装留痕的又一次回报）
+
+首次 toggle 后读报告：
+
+```
+m3.compactTool = { ok:false,
+  error:"unsupported JSON schema: parameters.reason.required must be true when present" }
+m3.compactToolDiag = { calls:2, enabled:true, installed:false }
+```
+
+⇒ 工具**从未注册成功**，而现象仅仅是「模型不会用这个工具」（完全静默）。
+根因：可选参数写成了 `required: false`，而 defineTool 的约定是
+**`required` 出现即必须为 `true`，可选参数要整个省略**。
+修复后复核：`compactTool = {ok:true, name:"compact_context", via:"tools.register"}`、
+`compactToolDiag.installed=true`，且 harness 随即把该工具 schema 下发给模型（生效实证）。
+
+**这条经验再次印证 R3 的教训**：懒安装/注册**必须留痕**——若无 `m3.compactTool` 字段，
+本次故障会与「工具接受成功却永不变档」一样无从定位。已补绊线（剥注释后不得出现
+`required: false`，变异 1/1 被抓住）。
+⇒ 教训：「未出现某字符串」类断言**必须先剥注释**——本轮**第二次**栽在这一点上
+（第一次是 `本轮先不执行任务` 被文件头描述旧机制的那句话判失败）。
+
+### R4 真机 E2E 通过 + R5 保留范围自选 —— ✅ 已实现（2026-10-08）
+
+#### 一、R4 E2E：`compact_context` 真的跑通了（这是 R4 落地时唯一没验的假设）
+
+调用时占用 **52.5%**（低于引擎 80% ⇒ 预期走 `context-overflow`）。**全部核对项一次通过**：
+`compactToolCalls 0→1`、`compactIntents 0→1`（`compactIntentExpired 0`）、
+`lastCompactIntent.trigger = context-overflow`、`acted true`、`shadowedTokens 361,769`、
+`preStepActs/preStepOk 0→1`、`lastPreStepError null`，**本轮未中断**，
+且**无任何 `agent/inbox/inserted`**（8 类 inbox 记录只有 `spliced` 358 条 = 插件自己的用量行/决策卡）。
+
+**逐帧时序**（会话存储 `session.v4.jsonl.zstd`，seq 连续，可直接证明「工具调用 → 下一步 pre-step」）：
+
+```
+18300 tool/call      name=compact_context            ← 模型调用
+18301 tool/result    {"ok":true,"scheduled":"next-step"}
+18302 step/end
+18303 compaction/start                                ← 下一步的 pre-step 触发（不是工具调用当场）
+18304 compaction/summary  shadowedRange{15507..18296}  provider=deepseek-account
+18305 user/message   source.kind="compact-checkpoint"  ← DSH 官方摘要载体（不是伪造的用户发言）
+18306 compaction/end
+18307 step/start     (step 7)                          ← 压缩后的下一步
+18309 assistant/message                                ← 模型继续，未中断
+```
+
+**摘要 LLM 调用成功**：`usage{input 396 / output 7442 / cacheRead 531328 / total 539166}`。
+（此前 `workbuddy × deepseek-v4.1-flash` 的 312/322 次失败是 provider×model 问题，换 provider 即通。）
+
+#### 二、E2E 顺带挖出 R5 的动因（数字，不是形容词）
+
+报告在同一轮里自动记下了前后对照，**无需任何人工测量**：
+
+| | 压缩前 `20:02:29` | 压缩后 `20:02:58` |
+| --- | --- | --- |
+| `surfaceTokens` | 367,794 | **8,603** |
+| `nodeCount` | **1117** | **4** |
+
+⇒ `context-overflow` 的 `retainTokens = 0` 在**只有 53% 占用**时就把 97.7% 的 surface 砍掉。
+我此前在 R4 文档里写的「保留近端 ≈0」**是对的，但量级完全没传达出来**——是报告的 `nodeCount`
+把「1117 → 4」摆到眼前才看清。**教训：结论要带数字。**
+
+> 附带解掉一个悬案：新报告条目里 `measure` 少了 `nodeCount/keys`，一度怀疑「磁盘代码 ≠ 运行代码」。
+> 实际是 `slimSnapshot` 的精简档位**刻意**只留 `{totalTokens, surfaceTokens}`。核对运行代码新旧
+> 要看**同一份报告的不同历史条目**（有 `nodeCount` 的条目即证明运行代码是新的）。
+
+#### 三、R5 实现（用户确认：「自己算范围 + 沿用官方兜底」）
+
+- 引擎 `selectCompactableRange` / `systemHead` / `validateSurfaceRegion` **均未导出**（只导出
+  `BasicCompactionEngine`），但 **`compactRegion(start, end, agent, signal)` 是公开方法** ⇒ 范围可由我们给。
+- **关键源码事实**：`validateSurfaceRegion`（:452）在 `compaction/start`（:469）**之前** ⇒
+  边界被拒是**零副作用、零 LLM 成本**的纯读错误 ⇒ 可以「让引擎替我判配对，被拒就回退一个节点」，
+  **不必复刻引擎的 `toolPairingBalancedBefore/After`**（那会造成两套真相）。
+- 起点按引擎规则：`session.eventAt(seq)?.type === 'system/message'`（引擎 `systemHead` 同款公开 API）
+  ⇒ surface 节点 0 的系统消息**永不进范围**。
+- 保留比例 = 模块常量 `RETAIN_RATIO = 0.16`（**与引擎 `DEFAULT_RETAIN_RATIO` 同源**，contract 与引擎源码对账）。
+  1M 窗口 ⇒ 保留预算 **160,000 token**（取代 8,603）。
+- 新模块 `plugin/compact-range.mjs`（纯函数叶子，无 IO）；host 侧 `compactWithOwnRange`：
+  `own` →（边界拒绝则回退重试 ≤64）→ 仍不行/压完仍越线 ⇒ `official` ⇒ 兜底 `own+official`。
+  **「没什么可压」且未越线 ⇒ 收手**（回退官方 = retain 0 = 与「没得压」自相矛盾）。
+- `trigger` 现在只表触发原因，**实际保留策略记在 `rangeSource`**；新增 `rangeProbe` 留最后一次范围读数。
+
+#### 四、验证
+
+- contract **275** + static **40** + report **57** = **372 断言**全过。新增 R5 段**真跑纯函数**
+  （不是正则）：预算-范围-影子量、`retainTokens=0` 精确复现引擎语义、系统头起点后移、
+  一致性拒绝、`prevEnd` 边界、非法预算 ⇒ 0、引擎 5 种错误文案逐字对账 + 分类。
+- **变异验证 9/9 被捕获**：其中「去掉 `MAX_WALK_BACK` 回退上限」**第一次逃逸**——
+  原断言只匹配 `return official('boundary-exhausted')`，文本还在、上限没了。
+  已改为连 `walkBacks + 1 > api.MAX_WALK_BACK` 一起钉死。
+  **又一次证明：「两边都通过的测试等于没测」。**
+- ⚠️ `retainRatio` 起初想放进 `M3_DEFAULTS`，被既有护栏「M3 字段必须在 schema 中」拦下
+  ⇒ 归位为模块常量（`M3` 的语义是**用户可配项**）。要面板可调需 schema + **DSH 重启**，未做。
+
+#### 五、R5 真机 E2E（两支都过）
+
+**判据**：toggle 后报告 `m3.rangeProbe` 键**存在**（旧代码没有这个键）⇒ 新代码确实生效。
+
+**支一 · 收手**（占用 17.8%，surface 126,656 < 预算 160,000）：
+`rangeProbe` 给出 `window 1000000 / retainRatio 0.16 / budget 160000 / surfaceNodes 260 /
+firstIdx 1 / retainedTokens 126656 / ok:false / why:nothing-to-compact`；
+`rangeSource:'none'`、`acted:false`、`ms:1`。**独立核对确实没压**：会话存储
+`compaction/start 323→323`、`compaction/summary 11→11`，最后一条仍是 R4 E2E 那次。
+⇒ 旧行为在此会把 260 个节点砍到 ~4 个。
+
+**支二 · own**（预算 160k > surface，自然状态走不到 ⇒ **临时注入 `RETAIN_RATIO=0.10`**，
+验证后已还原、`git status` 干净、372 断言复跑全过）：
+`budget 100000 / ok:true / surfaceNodes 278 / ownRange{18305,18397} /
+retainedTokens 100317 / shadowTokens 28265`；`rangeSource:'own'`、`walkBacks:0`、
+`ms:27666`、`preStepErrors {}`。会话存储 `compaction/summary`(18989)
+**`shadowedRange {18305,18397}` 与 `ownRange` 逐字一致**、`shadowedTokenCount 28265`、
+随后 `step/start` 正常推进 ⇒ **自选范围被引擎原样接受，本轮未中断**。
+
+**顺带钉死一个载荷性事实**：`firstIdx` 两次都是 1 ⇒ surface 节点 0 是 `system/message`。
+查 12 次压缩的 `shadowedSeqs`：`15513`（2,161 token）**从未被阴影化**，而另一条 `14800`
+**被阴影化** ⇒ **只有 surface 头受保护**；R4 那次 `shadowedRange{15507..18296}` 边界**包含**
+15513 却仍排除了它 ⇒ 引擎在范围内部也保住系统头。
+**⇒ `isSystemHead` 不是防御性样板：按 index 0 取起点，第一刀就落在系统消息上。**
+
+⚠️ **未真机覆盖（如实记录）**：① 边界回退（`prevEnd` 重试）两次都 `walkBacks 0`，
+只由单测 + 变异覆盖，无真机观测；② 阈值触发那一支（占用 ≥75%）与「强制线收口」需冲到线上才有条件测。
+
+### R6 教学补强：「先说，再调用」+ 把「自己算范围」教给 Agent —— ✅ 已实现（2026-10-08）
+
+用户要求（原话）：模型调用**压缩/换档**工具时「要在信息里面说出来，再调用工具」，
+优化这两处提示词让 Agent 明白**先说再调用**；「自己算范围」**也要暴露给 Agent**、要教会它。
+
+**为什么必须教**：工具调用对用户是**静默的**——对话里只显示「调用了某个工具」，
+看不到模型为什么压/为什么换档。理由不写进正文，用户就无法当场判断这个决策对不对。
+
+**改在哪（4 个教学面 × 2 个功能域）**：
+
+| 面 | 压缩（`compact-tool.mjs`） | 换档（`effort.mjs`） |
+| --- | --- | --- |
+| 一次性说明 | 新增「**先说，再调用**」整段 + 保留范围说明 | 新增同款整段（覆盖度由 6/6 升为 **7/7**） |
+| 每轮卡片 / 后缀 | 卡片首条改为「**先在回复正文里用一句话说明你要压缩的理由**，**再**调用」+ 新增「保留多少」一行 | （后缀保持精简，见下「为什么不加后缀」） |
+| 工具 description | 新增「**调用本工具前，先在回复正文里用一句话说明你要压缩的理由**」 | 同款 |
+| 参数说明 | `reason` 追加「**同一句话也要写在你的回复正文里**」 | `effort` 追加「换档理由请同时写在回复正文里」 |
+
+**「自己算范围」怎么教**：新增 `retentionClause(retainRatio, retainTokens)`——
+**两个数都是活值**（host 新增 `retentionTeach(win)`：比例读 `compact-range.mjs` 的 `RETAIN_RATIO`，
+token 数按**当前窗口**现算）。渲染出来是：
+「压缩按『上下文窗口 × 16%』自选保留范围，当前窗口下**近端约 160k token 原样保留**，
+更早的内容才转成摘要……若整段对话还没超出这个预算，则**什么都不会压**。」
+⚠️ **模块未加载完 / 窗口取不到时返回 `null`，教学退化为「按窗口固定比例」的说法——绝不编数字**
+（写死 16%/160k 会在常量或窗口变化后与真实行为自相矛盾，本项目已因此踩过坑）。
+
+**为什么不给压缩加「每轮后缀」**：不必。**工具 description 本身就每轮随请求下发**，
+把要求放那里 = **零额外 token 的每轮提醒**；再往用量行里塞一遍是重复付费。
+
+**验证**：contract **284** + static 42 + report 57 = **383 断言**全过。
+R6 新增断言**实例化两个模块并真跑 `renderBrief`/`renderCard`**（不是只正则匹配源码），
+核对活值渲染（16% / 160k）、退化措辞（无活值时不出现任何数字）、以及 host 活值接线。
+**变异验证 11/11 被捕获**，其中两次逃逸极有教育意义：
+1. 「先说再调用」最初用**「或」关系的单个正则**（`先说，再调用|先在回复正文里用一句话说明`），
+   于是**只删掉显著标注**时，同段的具体做法仍能匹配 ⇒ 断言照样通过。现改为
+   **「显著标注」与「具体做法」分两半分别钉死**——它们职责不同（醒目 vs 可执行），必须分开断言。
+2. 变异**脚本**的锚点打在了同文件的**注释**上（注释里也写了「**先说，再调用**」），
+   于是**代码根本没被改**，看起来像"逃逸"。⇒ **变异脚本自身的正确性也要核对**：
+   「没抓到」先怀疑锚点，再怀疑断言。
+
+**真机确认**：toggle 后 `m3.compactTool = {ok:true, installed:true}`、`rangeProbe` 重置为 null（新代码生效）；
+模型侧可见 `compact_context` 的 description 已换为新文本 ⇒ **这条要求现在每轮都在模型的工具清单里**。
+
+### R7 两大功能全面审查 + 强制性优化与解耦 —— ✅ 已实施（2026-10-08）
+
+用户要求：「对这两个功能进行全面审查。review，simplify，强制性优化，解耦。」
+完整报告见 [`docs/r7-review-and-hardening.md`](r7-review-and-hardening.md)，此处只留结论与教训。
+
+**方法**：先派**三路并行只读审计**（host / client / 工具域三模块）。审计同时暴露了一个流程事实：
+审计窗口内 host.impl.mjs 被我自己改了 ≥9 次（1880→1781 行）⇒ 审计的**行号失效**。
+审计员处理得很好（每条附引文片段、并主动发中期提示报出 3 个已过期的测试锚点）。
+⇒ **教训：审计期间不要并发改被审计的文件**（或至少先冻结）。
+
+#### 一、六个真缺陷（全部是「看起来成功了，其实什么都没发生」）
+
+| # | 缺陷 | 后果 |
+| --- | --- | --- |
+| D1 | `effort.mjs` 把**空数组**当「可选集为空」 | 一刀否决全部档位，错误文案退化成「可选 」 |
+| F5 | 意图**先消费**再判断服务是否可用 | 服务不可用 ⇒ 意图丢失，而工具已回 `scheduled` ⇒ 模型以为压过了、实际没压且不重试 |
+| F1 | idle 冷却**在发车前**记账 | 一次失败即消耗 10 分钟安全网 |
+| F2 | `sweepInFlight.add` 与 `.finally` 之间**有可抛语句** | 同步异常 ⇒ sid 永久驻留 ⇒ 该会话**永久失去 idle 安全网**（无日志） |
+| C1/C2 | 意图表**没有全表清扫** | 别的会话的过期意图永久驻留；叠加 sid 轮转会**静默不发生压缩** |
+| E1/B1 | `hudRemote` 漏搬 `occupancyRatio/occupancyWindow` | 弹窗「距智能压缩线」永不显示（host 算了 / wire 声明了 / client 不用） |
+
+#### 二、marker 通道整体清零（最大简化）
+
+R4 只删了「伪造用户消息拉起」，marker 本体留在 host/client/schema/wire 四层，
+而 R6 之后**没有任何地方再教模型写标记** ⇒ 通道永不命中却成对存在。
+本批五层成对删除（host 约 −120 行代码 + client 两个徽章/两个字段 + schema 4 字段 + wire 2 字段 + 测试锚点）。
+**保留 `markerMinRatio`**（名字带 marker 但与标记无关，是决策卡门槛）并加绊线防误删。
+
+#### 三、实施中自己引入的一个运行时错误（`node --check` 的第二次证明）
+
+把 idleSweep 的 `decideCompaction` 换成 `measureRatio` 后，日志里漏改一处 `d.ratio`：
+**语法检查全绿、单测全绿，运行时会 ReferenceError**，而它的位置恰好在
+`sweepInFlight.add` 与 `.finally` 之间 ⇒ 正好触发 F2 的永久锁。
+审计员在中期提示里当场点出。⇒ 新增「被删局部变量不得残留」绊线（限定 host 范围防误伤）。
+
+#### 四、验证
+
+contract **298** + static 42 + report 56 = **396 断言**全绿；**变异验证 13/13 被捕获**。
+两次逃逸都是**断言本身**的缺陷：
+① `alive` 守卫块内有**两处**，断言只写「存在一处」⇒ 删一处照样通过（改为计数 + 位置）；
+② 同一断言的正则窗口 `{0,120}` 小于实际间隔 146 字符 ⇒ 断言恒假。
+**⇒ 正则窗口也是断言的一部分。**
+
+#### 五、本批没做的（与理由）
+
+解耦的瓶颈不是「文件太长」，而是三处共享：**单例 `state`**、
+`schedule`/`publishHud`/`clearBriefed` 三个跨域回调、`criticalCapOf` 被四处复用。
+⇒ 正确顺序是**先抽「阈值核心」只读服务**，再拆 M3，最后 M1/M5；
+本批只做了域内死代码清理（`probeService` / `state.m3.probe` / `decideCompaction`）。
+其余挂起项（报告全量读放大、DOM 注入脆弱性、注入时钟缺失等）见报告 §7。
+
+### R8 解耦第一刀（阈值核心）+ 审查引出的取证静默丢失 —— ✅ 已实施（2026-10-08）
+
+**① 抽「阈值核心」为叶子模块**（R7 报告 §7 表里的第 1 步，也是拆 M3 的前置）：
+新增 `plugin/threshold.mjs`（DI 注入，对宿主内部件零 import），搬出
+`engineThreshold` / `criticalCapOf` / `resolveCompactionFor` 及两个常量；host 只留懒加载 + 三个转发。
+
+⚠️ **搬迁撞到的结构性事实**：宿主 `apply` **不是 async**，而这些函数被 `getHud`（RPC 面）、
+报告快照、两条压缩路径**同步**调用 ⇒ 不能在 apply 里 await 模块。最终用与
+`effortApi`/`compactToolApi` 相同的「懒加载 + 空值降级」，且**降级路径不引入任何重复常量**
+（未就绪时 `criticalCapOf` 返回 1 = 不做钳制 + 留痕），否则等于把「两套真相」请回来。
+
+**② 报告里 FULL 条目被挤光（取证静默丢失）**：核对报告时发现 **120 条全是 slim、full 0 条**——
+高频 slim 事件（heartbeat/agent-status/m5-publish/m2-inject）把 `activation+2s`/`m3-act`/`m4-probe`
+**挤出环形缓冲**，而 FULL 恰是「压缩成没成」的唯一留档位。
+**测试为何没发现**：`mustFull` 断言只查那些 reason「不在 SLIM 名单里」，从不查它们**真的还在历史里**。
+⇒ 满环时**优先淘汰最旧的 slim**（无 slim 才退化为砍最旧）+ 新增代码级绊线；数据侧只打印诊断
+（拿修复前的旧数据跑断言会假红）。**真机**：修复前 `{slim:120}` → 修复后 `{slim:116, full:4}`。
+
+**③ 顺带修掉测试设计缺陷**：`report.mjs` 有两条**条件断言** ⇒ 断言总数在 55/56/57 之间漂移
+（= 护栏会静默少跑）。已改为无条件并打印档位分布。
+
+**④ 弹窗折行（用户截图）**：「…· 已过智能压缩线（距强制线 305K）」被逐字断开成
+「…· 已过智」/「能压缩线（…）」。根因：状态提示拼进**同一文本节点**，而弹窗宽仅 ~230px
+（40+ 汉字在 11px 下不可能一行放下，字号还是用户要求放大过的）
+⇒ 改为**状态提示独立成行**，断点落在自然边界。
+
+**验证**：contract **303** + static 45 + report 57 = **405 断言**全绿；**变异 5/5 被捕获**。
+
+### R9 解耦第二刀：M3 执行核心抽出 + 首次真机观测到边界回退 —— ✅ 已实施（2026-10-08）
+
+**抽了什么**：新增 `plugin/m3.compact.mjs`（第六个叶子模块），搬出 M3 里最大、最自包含的一块——
+`measureRatio` + `compactWithOwnRange`（自选范围执行 + `prevEnd` 回退 + 官方兜底 + 留痕）。
+宿主只留懒加载 + 两个同名转发；range 模块生命周期仍由宿主拥有，经 `awaitRange()` 注入。
+
+**为什么只搬这两个**：编排层（`preStepCompaction` / `idleSweep`）同时触碰 M2 注入、M5 HUD 三个回调、
+M2 的 `clearBriefed`、报告 `schedule` ⇒ 必须先做成显式注入才有意义。先搬执行核心 = 宿主少 ~180 行
+且**调用点几乎不动**，风险最低。⇒ 解耦第 2 步**完成一半**。
+
+**真机 E2E（意外拿到最强证据）**：抽取部署后模型恰好发起一次压缩（工具触发路径），全程走新模块。
+`rangeSource=own`、`retainBudget=160000`、`shadowedTokens=175827`、`ms=28403`、
+`ownRange={18990,19501}`；会话存储（权威源）逐字吻合 `compaction/summary range={"start":18990,"end":19501}`；
+`preStepErrors={}`、`lastPreStepError=null`；`m2.skips={}` 旁证 `measureRatio` 正常。
+
+🔥 **`walkBacks = 1`：本项目第一次在真机观测到 `prevEnd` 边界回退**（首次末端 19504 切在 step 配对中间
+⇒ 回退到 19501 ⇒ 成功）。这补上了 `docs/r5-retention-range-design.md` §6.4 第 1 条诚实缺口
+（原文：「不可控，只能等自然出现」）⇒ 该分支现在**真机 + 单测 + 变异**三层齐备。
+
+**变异验证 5/5**。一次逃逸是我自己的变异脚本写错变量名（`ratioKept2` vs 断言里的 `ratioKept`）——
+**逃逸的是脚本、不是断言**。已把变异改成忠实复现「宿主导回范围执行」，并把断言加强为
+「宿主不得再出现 `api.RETAIN_RATIO` / `api.selectRange(`」。教训：**变异必须忠实于断言的语义**。
+
+**验证**：contract **306** + static 48 + report 59 = **413 断言**全绿。
+
+### R10 解耦第二刀（续）：M3 编排层搬出宿主 —— 第二个障碍显式化 —— ✅ 已实施（2026-10-08）
+
+`preStepCompaction` + `sweepInFlight`/`idleSweep` **整体搬进 plugin/m3.compact.mjs**；
+宿主只剩四个薄转发。`host.impl.mjs` **1765 → 1551 行**；M3 域的「执行核心 + 编排层」现同处一个模块。
+
+**第二个解耦障碍（闭包穿透别人的域）被显式化**：五个跨域依赖改成 deps 注入——
+`publishHud`/`recordHudAct`/`formatAct`（M5）、`clearBriefed`（M2）、`schedule`（报告）、
+`criticalCapOf`/`resolveCompactionFor`（R8 阈值叶子）、`getCompactTool`/`awaitRange`（另两个模块的取用口）。
+
+**搬出来才发现的顺序问题**：M3 的依赖清单里出现了 M5 与 M2 的四个回调 ⇒ 说明
+**必须先把 M5 HUD 独立、再 M2 注入**，否则 M3 始终要反向依赖它们。⇒ 第三刀顺序确定为
+**M5 → M2 → M1 → core 收尾**。
+
+⚠️ **接线位置有个 TDZ 陷阱**：R9 时接线块在文件前部；R10 起必须下移到 `preStepCompaction` 原位置——
+deps 对象是**立即构造**的，而 `schedule` 在文件更后面才定义，放前面直接 TDZ 崩激活。
+（`measureRatio` 虽在更早的 `renderUsageText` 里被引用，但那只受**调用时刻**的 TDZ 约束，两者易混。）
+
+**验证**：contract **308** + static 48 + report 59 = **415 断言**全绿；**变异 6/6 被捕获**。
+新绊线刻意**不查函数名**（改名即可躲过），改查「编排层独有产物是否回流宿主」：
+`state.m3.lastPreStep = {` / `sweepInFlight` / `M3.sweepMinIntervalMs` / `state.m3.actErrors[code]`。
+
+### R11 解耦第三刀（M5 HUD 域）+ **新增宿主启动冒烟测试**（本项目最大验证盲区）—— ✅ 已实施（2026-10-08）
+
+**抽出 `plugin/m5.hud.mjs`**：存储（`hud-acts.json` 读写 + 去重记录）、发布（`publishHud`）、
+文案（`hudReasonLabel`/`formatAct`）、聚合响应（`buildHudResponse`，原 `onGetHud` 主体）、
+启动回填（`republishFromReport`，原 `bfOnce` 主体）。宿主只留接线 + 重试节奏 + face 注册。
+`host.impl.mjs` **1550 → 1387 行**。
+
+**顺序依据（R10 的发现）**：R10 之后 M3 的 deps 里出现 `publishHud`/`recordHudAct`/`formatAct`
+⇒ **被依赖者必须先独立** ⇒ M5 → M2 → M1 → core。M5 是「跨域聚合视图」（getHud 要同时回答
+压缩历史/占用/生效上限/思考档位），故四条跨域依赖**全部注入**；它是依赖图叶子，只是依赖面宽。
+
+#### ⚠️ 本次踩到一个**结构性真 bug**，并因此补上了缺失的验证层
+
+抽取时接线块的插入点算错一位，把 `let m5Ctl … const m5Ready = import(...)` 一整块
+**插进了 `schedule()` 的函数体内部**（残留的 `};` 落到接线块之后——语法完全合法）。
+后果是**连锁静默失效**：M5 模块从未加载；`publishHud`/`recordHudAct`/`formatAct`
+对 M3 接线**不在作用域** ⇒ M3 模块加载失败 ⇒ **压缩全链路静默失效**。
+而 `node --check` 通过、**423 条源断言全部通过**——因为它们只查文本模式、不执行代码。
+真机证据：激活后 `m5.lastPublish` 恒 `null`、`hudLastAct` 恒空串（对照切换前正常）。
+
+⇒ **新增 `test/boot.mjs`：宿主启动冒烟测试**（第四套）。用桩 ctx 真跑
+`apply(ctx, {}, {pluginDir, reportPath})`，然后：真注册 HUD 面 → **真调 `getHud(null)` 必须
+`ok:true`** → 校验 `criticalCap`/occupancy/effortEnabled 三线 → **真调 pre-step handler 不抛** →
+有历史时**启动回填必须真的发布过**（`m5.lastPublish.step === 'ok'`）。
+**变异验证：把 `};` 移回去复现原缺陷 ⇒ boot.mjs 报 6 条失败，而 `node --check` 依然通过**
+——两层验证的差距被当场量化。报告写临时目录、`hud-acts.json` 只读不写（无副作用）。
+
+**验证**：contract **313** + static 51 + report 59 + boot **14** = **437 断言**全绿；
+M5 域变异 **6/6 被捕获**；真机复核：`m5.lastPublish ok` + 主行由 `hud-acts.json` 回填成功。
+
+### R12 解耦第四刀（M2 注入域）—— ✅ 已实施（2026-10-08）
+
+**抽出 `plugin/m2.inject.mjs`**：`renderUsageText`（用量三元组）、`retentionTeach` /
+`renderPolicyCard` / `renderBrief`（三个教学出口，教学文本本体仍在 compact-tool/effort）、
+`briefedBySid` / `effBriefedBySid` / `measuredFailedOnce`（三张集合，已**有界化**）、
+`clearBriefed`（**被 M3 调用**的跨域回调）、以及 `buildInjection(payload)`（原 pre-step 回调里的
+M2 半段）。宿主只剩：决定放行 → `await m2Ctl.buildInjection(payload)` → 把消息并进决策。
+`host.impl.mjs` **1387 → 1262 行**。
+
+**接线顺序 M5 → M2 → M3**：M2 提供 `clearBriefed` 给 M3（压缩后重讲），M3 提供 `measureRatio`
+给 M2/M5 ⇒ 两侧跨域依赖一律注入，**同一个声明顺序环**继续用箭头包装打破（谁在前都 TDZ）。
+
+**关键设计**：`buildInjection` 用 `{skip:'aborted'|'not-step-1'|'noFactory'|'noSession'|'measureFail'|'error'}`
+表达「为何不注入」，宿主只做「有消息就并进决策、否则放行」——**注入失败绝不影响原决策**。
+`createUserMessage` 由宿主异步解析（官方包候选链）⇒ 经 getter 现取，未解析时按 `noFactory` 记账
+且**不注入**（绝不伪造消息结构）。
+
+**新增运行时判据（boot.mjs 扩展）**：boot 里加了一次**非 abort、step=1** 的 pre-step 真调用，
+并用「记账痕迹」判定接线可达——模块未加载时宿主在 `if (!m2Ctl) return decision;` 直接放行、
+**不会留下任何 `m2.skips`**；模块加载了则 `buildInjection` 必然走到某个分支并记账。
+⇒ 这条断言把「接线可达」变成了**可直接观测的运行时事实**（17 条 boot 断言）。
+
+**验证**：contract **317** + static 54 + report 59 + boot 17 = **447 断言**全绿；
+M2 域变异 **6/6 被捕获**（宿主抄回实现 / 去掉空值降级 / 模块丢 `?ts=` /
+`clearBriefed` 转发改 no-op / 模块不再记账 / step 门控写反）。
+真机复核：`m2.registered=true`、`via=resourcesPath/app.asar|import`、`injections=6`、
+`briefings=2`、`skips={}`、`lastText` 为真实用量行。
+
+**一处自纠**：新绊线首版把 `const clearBriefed = (sid) => {` 一律判为「重复实现」，
+而宿主**合法**保留一个薄转发（M3 需要它）⇒ 断言自失败。改为查「宿主持有的『已讲』表是否还在」。**当前进度**：`host.impl.mjs` **1262 行**（起点 1836 ⇒ 已减 31%）；剩余 **M1 快照域** 与 **core 收尾**。
+
+### R13 解耦第五刀（M1 快照域）—— ✅ 已实施（2026-10-08）
+
+抽 `plugin/m1.snapshot.mjs`：`buildSnapshot`（服务可达性 + Session/Agent 枚举与测量 + m2/m3/m5 三域镜像）、
+`slimSnapshot` + `SLIM_REASONS`（C3② 瘦身）、`eventProbe` + `recordEvent`（`session/event` 只读形状探针）。
+它是「跨域聚合视图」⇒ 跨域依赖全部注入；落盘管线留在宿主。`host.impl.mjs` **1262 → 1115 行**。
+
+⚠️ **又是 boot 冒烟抓住的真故障**：搬迁把 `SLIM_REASONS` 一起搬走，而宿主 `refresh` 仍直接引用它
+（`writeReport(SLIM_REASONS.has(reason) ? ...)`）⇒ ReferenceError → 被 refresh 的 try/catch 吞
+→ **报告永不落盘**。源断言只报一条形式问题（「解析出 SLIM_REASONS」），boot 直接报「报告已落盘…」失败。
+修法不是把常量抄回来，而是**把判定口径也交给模块**（M1 暴露 `isSlim(reason)`），未就绪时按 FULL 处理。
+
+**验证**：contract 321 + static 57 + report 59 + boot 17 = **454 断言**全绿；M1 域变异 **6/6 被捕获**。
+一次 SKIP 记教训：变异脚本锚点缩进写死 8 空格而实际是 6 ⇒ 变异没注入却被计成「逃逸」
+——**变异脚本必须自检锚点是否命中**。
+
+### R14 解耦第六刀（core 收尾）+ **审计出两个真回归** —— ✅ 已实施（2026-10-08）
+
+**抽 `plugin/core.mjs`**：纯函数（`msg`/`pick`/`kfmt`/`nfmt`/`errCodeOf`/`remember`/`compactMeasure`/
+`summarizeBreakdown`/`messageText`/`extractEventText`）、候选链加载器（`loadCreateUserMessage`/`loadDefineTool`）、
+常量（`M3_DEFAULTS`/`HISTORY_CAP`/`SESSION_CAP`/`HEARTBEAT_MS`/`COMPACT_TIMEOUT_MS`）、`state`、
+`mergeConfig`/`M3`/`effEnabled`、**报告管线**（`loadReportBase`/`writeReport`/`refresh`/`schedule`）、
+`addListener`、createUserMessage 解析。`host.impl.mjs` **1115 → 518 行**（再减 54%）。
+
+**关键设计：entry 预加载 core**。`state`/`log`/`svc`/`schedule`/`addListener` 都在 apply 期**同步**使用，
+而 `?ts=` 动态 import 是异步的 ⇒ 只能让**调用方先加载**（entry 用同一个 ts 加载 core，作为第 4 个参数传给
+`apply`），才能同时满足「热换」（P16）与「同步可用」。
+⚠️ **entry.mjs 是「改它必须重启 DSH」的薄壳** ⇒ 未重启时旧 entry 不传 core：宿主**降级但不崩**
+（留一条可诊断的痕并空转），boot 有专门断言钉住这个形态。
+
+#### 🔴 审计出的两个真回归（都在此前「全绿」状态下存活）
+
+| # | 回归 | 影响 | 怎么发现的 |
+| --- | --- | --- | --- |
+| 1 | `COMPACT_TIMEOUT_MS` 的**定义在 R11（M5 HUD 域搬迁）中被静默丢掉**（切块范围比预期宽，代码被丢在地上），而 `m3.compact.mjs` 从 R10 起就在用它 | **M3 域从 R11 起加载失败 ⇒ 压缩全链路静默失效**：工具调用仍回 `ok/scheduled` 并登记意图，但 pre-step 里 `m3Ctl === null` ⇒ `preStepCompaction` 是 no-op ⇒ **意图永不消费、压缩永不发生**；同一原因让 `measureRatio` 失败 ⇒ **M2 用量行/决策卡也一起消失**（各域都有空值降级，所以只是悄悄不工作） | 真机症状（用户截图：中途一次 `compact_context` 没压成）→ 会话存储确认 04:22 后再无 `compaction/summary` → 报告显示此后所有激活 `preStepActs=0` + 04:54 `m2.skips.measureFail=1` → `git log -S'const COMPACT_TIMEOUT_MS'` 定位到 `6bbc751`（R11 的删除行）；随后让 boot **把宿主吞掉的 warn 打出来**，一次列出全部缺失标识符 |
+| 2 | 宿主漏解构 `loadReportBase`（M5 接线里的 `getReportBase: () => loadReportBase()`） | 调用即 ReferenceError，被 `republishFromReport` 的 try/catch 吞掉 ⇒ **启动回填静默失败**（弹窗空态） | boot 的「有历史时 `m5.lastPublish` 必须 ok」断言 |
+
+> ⚠️ **一次自我纠错**：R14 首次定位时我写的是「R12 丢的」，依据是一张逐提交核对表——而那张表**漏了 R11 这一行**
+> （`6bbc751` 不在我列的 sha 里），于是把「定义在 R10 还在、到 R12 已不在」误判成 R12 删除。
+> 改用 `git log -S` 后立刻暴露：**R11 才是删除点**。⇒ **列证据表时必须逐项核对是否覆盖全部候选**，
+> 漏一行就会把因果链指错一个提交（影响的是「谁引入的」，而这类结论正是后续排查的起点）。
+
+⇒ **补上三件验证**：① boot 收集宿主吞掉的 warn，并断言「**没有任何域模块加载失败 / 未定义标识符**」；
+② contract 新增「宿主从 core 解构的每个名字都在 core 出口里」的**静态对账**；
+③ 把这两个真缺陷原样注入做变异验证（5/5 被捕获）。
+
+#### D1 判据的诚实修订（不删注释凑数字）
+
+原判据 `host.impl.mjs ≤ 250 行` 是在「9 个域模块与注释占比都未知」时定的。实测 host **518 行
+= 代码 294 + 注释 199**，而那些注释承载 30+ 条实证结论（P16 热换、F1/F2 顺序陷阱、TDZ 环……）。
+⇒ 判据改为**代码行（剥注释与空行）≤ 320**（当前 294，留 ~9% 余量），测量口径与理由写进 static.mjs，
+注释行数一并打印。**这是判据的公开修订，不是静默移动球门。**
+
+**验证**：contract 325 + static 61 + report 59 + boot 19 = **464 断言**全绿；R14 变异 **5/5 被捕获**。
+
+**部署**：entry.mjs 改动需**重启 DSH 一次**才生效。R14 提交时**故意没有 toggle**（避免出现
+「已加载新 host、entry 仍是旧的」这段降级窗口）。⚠️ 更正：重启前运行中的是 R13 版本，而 R13
+**带着下面 R15 里查明的那个回归**（M3 域缺失 ⇒ 压缩与用量行/决策卡都失效）⇒ **必须重启**才能恢复；
+若在重启前 toggle，插件会降级（打一条 warn、不接线）而**不是崩掉**。
+
+### R15 工具后自检回执 + 思考强度「时刻可切」 —— ✅ 已实施（2026-10-08）
+
+**用户要求（原话）**：①「调用工具执行压缩或切换思考强度时，工具完成后进行检查，避免刚才的情况出现，
+起码 agent 自己过一遍」；②「每次我发起任务…都时刻可以进行思考强度切换，虽然建议 1-2 次，
+如果是长任务，有必要可以增加次数，以实际需求为准」。
+
+#### 一、工具后自检（把「回了 ok 但没发生」变成模型可见）
+
+| 层 | 做了什么 |
+| --- | --- |
+| `compact-tool.mjs` | 结果新增 `verify`：**自检契约**（下一步会有「压缩自检」回执；显示「未执行」就再调一次或告知用户） |
+| `m3.compact.mjs` | 三条路径都写 `state.m3.lastCompactVerify`：`executed`（省了多少 token / 保留策略 / 耗时）、`no-need`（判定无需压 + 原因）、`not-executed`（服务不可用 / 异常码） |
+| `host.impl.mjs` | 压缩域模块缺失时（= R11–R13 真机失效的形态）**仅当确有意图**才补一条 `why:'m3-module-missing'` 回执，避免健康路径噪声 |
+| `m2.inject.mjs` | 回执**一次性**注入（读过即标记）；并且**量测失败时只注入回执**——量测本身依赖 M3 域，M3 挂掉时「压缩没执行」这条最要紧的信息会跟着一起消失（真机就是这么静默了两版） |
+| `compact-tool.renderBrief` | 教会模型**去看**那条回执（未执行 → 再调用一次或告知用户） |
+
+#### 二、思考强度「时刻可切」——先诊断为什么一路没切过
+
+用户问「是你自己判断不需要，还是暴露信息不够？」**两者都有，且后者可证**：
+
+- **暴露不足（可证）**：档位与可选项原本只出现在**会话最早的一次性教学**里，每轮后缀只报当前档；
+  更糟的是——**从 R11 起连这条后缀也没了**（M3 域回归把用量行/决策卡整块拖垮）
+  ⇒ 长会话里模型每轮既看不到当前档、也看不到有哪些选择。
+- **教学措辞偏抑制**：原文「换档可能使前缀缓存失效，**一次任务 1-2 次为宜**」。
+- **我自己的判断**：设计定稿后的批量文件搬迁我判断 `high` 够用，确实一次没切——而长任务里难度是
+  **分段跳变**的（疑难排查该升、机械改动可降），这是我漏了。
+
+**改动**：① 每轮后缀带**可选项**（`思考强度 high（可选 off/low/high/max，需要时先说再调用 set_reasoning_effort）`，
+约 +8 token/轮）；② 教学删掉「1-2 次为宜」，改为**任务开始时 + 每个阶段变化时各判断一次，长任务按实际需求可多次**，
+唯一硬约束是冷却（默认 30s）；③ `set_reasoning_effort` 结果补**回读与自检指引**
+（`applied:'next-request'` + 「下一步后缀会显示新档位，若仍是旧档说明未生效」）——
+原先只回 `{ok:true, effort}`（本次实测就是 `{"ok":true,"effort":"max"}`：没有回读、没有生效时机、没有自检提示）。
+
+#### 三、验证
+
+- contract **340** + static 61 + report 59 + boot 19 = **479 断言**全绿；**变异 8/8 被捕获**。
+- 首轮有 **2 条逃逸**（「M3 域不再产出回执」「宿主不再为消费者缺失留回执」）⇒ 补两条源断言后全捕获。
+  **逃逸暴露的正是「只在渲染侧写了测试、断言侧漏了产出侧」**。
+- 行为级测试（真跑模块）：三种回执状态各自的文案、**一次性**语义、以及「量测失败仍只注入回执」这条路。
+
+**部署**：与 R14 同批，**需重启 DSH 一次**才生效（live 仍是 R13）。
+
+### R15.1 chip 冷却不显示（用户实测反馈）—— ✅ 已实施（2026-10-08）
+
+**用户反馈**：「刚才你切换到 Max 时，这个（输入框右侧 chip）没有进入冷却状态显示。」
+
+**取证**（先证明换档本身是好的，再定位显示问题）：
+
+| 事实 | 证据 |
+| --- | --- |
+| 换档**确实生效** | 报告 `lastEffortApply = {want:'max', from:'high', applied:true, at:05:02:08.719Z}`；`effortSwitches=1`、`effortReasserts=47`、`effortHooks=5`、`effortDiag.failed=0` |
+| getHud 最后一次轮询 **05:02:08**（与 apply **同一秒**），**之后再无任何轮询** | 报告 `m5.hudPollReq.at` 全时间线（共 13 次，最后一次 = `05:02:08`，sid 正是本会话） |
+| chip 的判定逻辑本身没问题 | `cooling = cooldownUntil > now`；冷却 = `switchedAt + effortCooldownMs` |
+
+⇒ **根因是时序**：`switchedAt` 原先只在 **apply 时刻**写入，而客户端 chip 只在**投影变化**时轮询
+（投影变化由「选择变更」触发，发生在 apply **之前**那一瞬），于是那次轮询拿到的还是
+「尚未起算冷却」的一帧，之后投影不再变 ⇒ **再没有机会刷新**，界面就停在「智能思考就绪」。
+
+**修法（两处，缺一不可）**：
+1. **冷却锚点落在工具「接受」时刻**（`st.switchedAt = Date.now()`），apply 处改为
+   `if (!s.switchedAt) s.switchedAt = Date.now()`（保留「只在真变化时更新」的原护栏，避免每轮自增把后续换档全挡住）。
+   事件顺序上「接受」早于客户端那次轮询 ⇒ chip 当场就能看到冷却。
+   语义也更对：冷却约束的是「两次换档**请求**的最小间隔」。
+2. **客户端在投影变化后补拉一次**（一次性 `setTimeout(pullOnce, 2500)`，清理时 clearTimeout）——
+   插件的状态本来就比投影晚落定；只拉一次必然永久陈旧（这是本次真机 bug 的另一半）。
+
+**验证**：contract **344** + static 61 + report 59 + boot 19 = **483 断言**全绿；**变异 3/3 被捕获**
+（回到 apply 锚点 / apply 处无条件重锚 / 去掉客户端补拉）。其中第一条由**行为级**测试抓住：
+真跑 effort 模块 → 调工具接受 → **在 apply 之前** `hudPayload` 就必须返回冷却窗口；
+另有反向断言「未换档时不得报冷却（不能常亮）」。
+
+### R15.2 🔴 entry 传错 core（重启后插件整天不激活）+ 旧会话 INVALID_REQUEST 归因 —— ✅ 已修（2026-10-08）
+
+**用户报告**：「重启过了…其他旧会话可能报错，是否是这个插件引起的？有的会话又正常。」
+
+#### 一、先查出：重启后插件**根本没激活**（我 R14 引入的接线错误）
+
+报告里 05:12:30Z 之后**一条记录都没有**（无 `activation+2s`、无 `m2-factory`、无心跳）⇒ 插件没跑起来。
+在进程内直接跑真实 `entry.mjs` 复现出根因：
+
+```
+[dsh-context-pilot] impl 加载失败：loadDefineTool is not a function
+```
+
+**R14 我在 entry 里传了 core 的模块命名空间（`{createCore}`），而不是 `createCore(...)` 的返回值** ⇒
+宿主解构出的 `state` / `log` / `loadDefineTool` … 全是 `undefined` ⇒ `apply` 当场抛 TypeError ⇒
+**监听器、HUD 面、报告全部没有**（所以报告停更、界面只显示一句「处理失败」）。
+
+**为什么 486 条断言没抓到**：`test/boot.mjs` 当时**绕过了 entry**（自己 `createCore` 再调 `apply`）⇒
+entry→apply 这段接线是测试盲区。**已补 ⑦ entry 级冒烟**：走真实 `entry.apply`，断言
+「激活出监听器 + HUD 面 + 报告」以及「无 `impl 加载失败 / is not a function`」；
+变异验证把 `core: coreMod.createCore(...)` 换回 `core: coreMod` ⇒ **2 条断言失败**（真机事故原形）。
+entry 另加 `overrides.reportPath`（**仅供测试**，把报告写临时目录；DSH 仍按 `apply(ctx, config)` 调用）。
+
+#### 二、旧会话 `INVALID_REQUEST` 的归因：**与插件无关**（有决定性证据）
+
+报错会话在 **zcode-dispatch 工作区**（会话 id 从略），错误在 turn 25/26/28/29 **反复出现**：
+
+```
+messages.251.1: 'tool_use' ids were found without 'tool_result' blocks immediately after:
+call_cd9b9731859a4daa87916b1e … (INVALID_REQUEST, status 400)
+```
+
+| 事实 | 证据 |
+| --- | --- |
+| **最后一次失败（turn 29，13:13:34）发生在插件「零监听器」状态下** | 该实例入场即抛错（见上），而 turn 29 的请求**照旧失败** ⇒ 插件不可能参与 |
+| 该会话里插件只在 **12:23–12:25** 注入过（对应 turn 25/26/28 那三次） | 4 条 `user/message kind=context-pilot`（seq 4051/4065/4077/4091） |
+| 但注入位置在**尾部**：`system → user → 我们 → time-context → model-selection` | 注入紧跟**用户消息**之后；而报错的 tool_use 在历史深处、**索引固定不变**（四次都是 `messages.251.1`、同一个 call id）⇒ 不是注入点造成 |
+| 该会话唯一一次插件压缩（10-07 12:40，`兜底`，省 494.4K）**边界平衡** | `shadowedRange={9,2495}`，其中 2495 = `tool/result` ⇒ 该 tool 对完整落在影子里 |
+| 那个 tool 对在**会话存储里完整**（3203 assistant → 3204 tool/call → 3205 tool/result，相邻） | 逐条转写核对；且全库 27 个会话**没有任何孤儿 tool/call**（唯一一个是我自己会话里正在执行的那次调用） |
+
+⇒ 丢失发生在 **DSH 组装请求**（surface / 窗口）这一侧，而不是存储的转写、也不是本插件。
+插件在窗口内**既没压缩**（M3 域自 R11 起加载失败）**也没能力删 tool_result**。
+**结论：不是这个插件引起的**；具体机制要看 DSH 侧请求组装代码，本次未继续深挖
+（避免在没有证据的情况下编故事）。
+
+**验证**：contract 345 + static 61 + report 59 + boot 21 = **486 断言**全绿；entry 级变异 2/2 被捕获。
+**部署**：entry.mjs 改动**需再重启一次 DSH**（当时实例的插件处于「零监听器」状态）。
+
+### R15.3 🔴 工具返回字段未在 output.schema 声明 ⇒ 两个工具在真机上全失败（我 R15 引入）—— ✅ 已修
+
+**用户实测反馈**（重启后插件已活，但两个工具都报）：
+
+```
+Error: tool "set_reasoning_effort" returned invalid output:
+       "value.applied" is not a declared property (additionalProperties: false); "value.verify" i…
+Error: tool "compact_context" returned invalid output:
+       "value.verify" is not a declared property (additionalProperties: false)
+```
+
+**根因**：宿主会**按 `output.schema` 校验工具返回值**，而两个工具都声明了 `additionalProperties: false`；
+R15 给返回值加了 `applied` / `verify` 却**没同步改 schema** ⇒ 整条工具调用被判为无效输出。
+（顺带证明 R15 的自检回执管线是通的：那一轮注入里真的出现了
+`【压缩自检】你上次请求的压缩**未执行**（ABORTED）`。）
+
+**修**：`compact-tool` 声明 `verify`；`effort` 声明 `applied` + `verify`。
+
+**新绊线（行为级，6 条）**：真跑两个工具的各条分支（压缩成功/失败；换档接受/幂等/非法档位/冷却），
+把返回值的 key 与该 spec 声明的 properties 求差集 ⇒ 必须为空。
+变异：撤掉 `verify` 声明 / 撤掉 `applied` 声明 / 工具层返回未声明的 `reason` ⇒ **3/3 被捕获**。
+
+> ⚠️ **一次由变异抓出的我自己的错**：我一度把 `checkEffort` 的内部字段 `reason` 也「顺手统一」成 `error`，
+> 而工具层是 `error: chk.reason` 映射的 ⇒ 工具会返回 **`error: undefined`**（错误信息静默丢失），
+> 而 schema 校验**照样通过**（键存在且已声明）⇒ 绊线当时抓不到它（变异逃逸）。
+> 已回退，并补一条「非法档位的错误信息**非空**」断言专门钉这个映射。
+> 教训：**内部字段名 ≠ 声明字段名**，别顺手统一。
+>
+> 另修一处**假失败**：`工具有 output schema + render` 的正则窗口是 `{0,700}`，被我新加的声明撑爆
+> ⇒ 以「缺 render」的形式误报。窗口放宽到 1600 并注明——**正则窗口宽度是断言的一部分**（R7 已记过同类坑）。
+
+**验证**：contract 352 + static 61 + report 59 + boot 21 = **493 断言**全绿。
+**部署**：两个文件都是 toggle 热换（entry 已修好，本次 toggle 安全，无需重启）。
+
+### R15.4 压缩自检回执不再等到「下一轮」（回路当轮闭合）—— ✅ 已实施（2026-10-08）
+
+真机 E2E 时发现的**回路延迟**：M2 注入门控是 `step === 1`（每轮只注一次），而回执也走这条通道
+⇒ 中途（非首步）调用压缩后，**Agent 当轮根本看不到回执**，要等用户再发一条消息（下一轮）才行。
+而「工具回 ok 但没执行」正是这样长期不被察觉的——等于把自检的时效性打了折。
+
+**改**：注入仍只在轮首（每轮一次），但**待读的压缩自检回执例外**——任何一步都注入（一次性）。
+安全性：非首步插入 user 消息时，上一步的 `tool/result` 已落在 surface 里 ⇒ 不会把 `tool_use` 与它的
+`tool_result` 分开（那正是 `INVALID_REQUEST` 的成因）。
+
+**绊线（行为级）**：`step=3` + 有回执 ⇒ 必须注入（`midStep: true` 且文案含「已执行」）；
+`step=3` + 无回执 ⇒ 仍然 `skip: 'not-step-1'`（保证「每轮只注一次」不被破坏）。
+
+**验证**：contract 354 + static 61 + report 59 + boot 21 = **495 断言**全绿。真机 E2E 见下。
+
+### R16 压缩档位（Agent 三选一，两线同源）—— ✅ 已实施（2026-10-08）
+
+**用户要求（原话）**：①「可以在工具内部设计几种参数档位，暴露给 Agent，让 Agent 根据需求选择不同档位」；
+②「智能压缩线和强制压缩线时，都要有 Agent 参与选档进行压缩，如果未选则都是 16% 兜底」；
+③「要明确教学和相关提示词的修改，确保 Agent 能明白 3 档可选、3 档的压缩情况」。
+
+#### 一、设计（折中：把「不可靠的自由度」换成「有界的选择」）
+
+范围计算仍是 `compact-range.mjs` 的**确定性代码**（边界、tool 配对保护、walk-backs 一行不动）；
+Agent 只在 3 个**语义档位**里选，选错的代价被夹取逻辑兜住：
+
+| 档位 | 保留比例 | 1M 窗口 | 语义（教学原话） |
+| --- | --- | --- | --- |
+| `light` | 窗口 × **8%** | ~80k | 深压：接下来是全新子任务、近端细节不再需要，或要预留大量空间 |
+| `standard` | × **16%** | ~160k | 默认；**未选/非法值都落这里**（用户要求的 16% 兜底） |
+| `heavy` | × **24%** | ~240k | 浅压：接下来仍要频繁引用近端一大段（多文件联调/长推理链） |
+
+**夹取**：`budget = clamp(窗口 × 档位比例, 40k, 窗口 × 50%)` —— 下限 40k 防小窗口保留过少；
+上限 50% 防保留过半失去压缩意义。`resolveTier` 返回 `clamped/fallback` 两个取证标记。
+
+#### 二、「Agent 参与」的实现方式：**会话级持久偏好**
+
+- `compact_context` 新增可选入参 `tier`（**不进 required**，R7 教训）；调用即登记，
+  登记后对本会话**之后的所有压缩（含强制线）持续生效**，直到再次改选 ⇒
+  「强制线时 Agent 参与」由此满足：它在越线前的任意时刻选过档，强制线就按它选的压；没选过 ⇒ standard。
+- **实现**：`tierBySid`（会话级 Map，**无 TTL**——它是长期选择不是一次性意图），与意图表分开；
+  工具通过宿主注入的 `getRangeApi` 拿 `TIER_NAMES`（叶子模块不 import 内部模块）。
+- **强制线/idle 同源**：pre-step 的 `tierName = tool.getTier(sid) ?? 'standard'`（L201）；
+  `compactWithOwnRange` 用 `resolveTier(tierName, window)` 折算预算喂给 `selectRange`（其余算法不动）。
+- **收口泛化**：「自算压完仍越强制线 ⇒ 追加官方 overflow」从 `forced` 扩到**任何档位**——
+  Agent 选了 heavy 浅压也不能停在线上（旧承诺不因选档而丢失）。
+- ⚠️ **idle 安全网（`compactNow`）未接档位**：它是引擎内部维护路径（要求 idle），机制不同、
+  且极少触发（pre-step 强制线先行，通常轮不到它）——**刻意不动**，在报告里如实说明。
+
+#### 三、教学（三处 + 回执，全部同步）
+
+| 出口 | 教了什么 |
+| --- | --- |
+| 工具 `description`（每轮随请求下发） | 3 档名称/比例/近似 token/适用场景 + 「档位会话级持续生效」+ heavy 也可用于「仍需引用近端」的折中 |
+| 一次性说明（renderBrief） | 同上 + 「选档理由和压缩理由写在同一句正文里（例：…我用 light 深压腾空间）」+ 「三档下范围计算/边界保护/摘要策略完全一致，差别只有保留多少」 |
+| 决策卡（renderCard，占用达标时每轮出现） | 按**当前窗口**折算三档的近似 token 数（活值）+ 「不传参 = 维持现状（初始 standard）」+ 「现行生效：xxx」 |
+| 压缩自检回执 | `（heavy 档，保留 ~240k）` —— Agent 当场确认选的档位真的生效 |
+
+#### 四、验证
+
+- contract **364** + static 61 + report 59 + boot 21 = **505 断言**全绿；
+- **变异 5/5 被捕获**：档位不接进预算 / 强制线写死 standard / 非法档位不回落 / 去掉下限夹取 / 工具不持久化档位；
+- 断言侧同步：`rangeProbe` 断言改为档位取证（tier/tierClamped/tierFallback）；
+  「拿不到活值不编数字」的护栏收窄为「当前窗口 token 数」（档位比例是模块常量，允许写死在教学里）。
+- 部署：`compact-range/compact-tool/m3/m2/host` 全部 toggle 热换；`plugin/package.json` 的
+  description 变更随下次重启生效。
+
+### R16.1 压缩自检回执按 sid 存（多会话并发压缩互不覆盖）—— ✅ 已实施（2026-10-08）
+
+**用户问题**：「如果不同会话同时调用工具，是否正常工作？」——核对代码后确认：**意图/档位/idle 防重入
+都按 sid 隔离 ✓**，唯一例外是压缩自检回执（`lastCompactVerify` 全局单槽）：两会话几乎同时完成压缩时，
+后完成者**覆盖**先完成者的回执 ⇒ 前者的 Agent 看不到自己的回执（压缩本身不受影响，仅自检提示丢失）。
+用户指示补上（R16.1）。
+
+**实现**：
+- `m3.compact.mjs`：`verifyBySid`（sid → 回执，**有界化**：超出 `SET_CAP` 淘汰最旧）+
+  `setCompactVerify(sid, v)`（写入 + 全局镜像 `lastCompactVerify` 同步更新）+
+  `takeCompactVerify(sid)`（取本会话未读回执并置 read）；三处回执产出点全部改走 `setCompactVerify`；
+  M3 出口新增 `setCompactVerify`/`takeCompactVerify`。
+- `host.impl.mjs`：给 M2 注入 `takeCompactVerify: (sid) => m3Ctl?.takeCompactVerify(sid)`（箭头包装打破 TDZ）。
+- `m2.inject.mjs`：`takeCompactReceipt(sid)` 改走注入的 `takeCompactVerify`；三处消费点传 sid。
+- ⚠️ **TDZ 修复**：`sid` 原先在用量行分支里才解析，而非首步回执路径（R15.4）引用它会踩
+  ReferenceError ⇒ 外层 catch ⇒ `{skip:'error'}` **整条注入静默丢失**。`sidEarly` 提前解析
+  （buildInjection 入口处），三个消费点统一用它。
+
+**验证**：contract **369** + static 61 + report 59 + boot 21 = **510 断言**全绿；
+**变异 2/2 被捕获**（回执退回全局单槽 / 消费不置 read）——第一轮变异逃逸暴露出
+「桩测不到 M3 写入侧」的盲区，已补**行为级**测试（真跑 M3 域的 set/take，断言 A 111 / B 222 互不覆盖、
+读到即置 read、全局镜像保留）后全部捕获。
+**部署**：`m3/m2/host` toggle 热换。
+
+### R16.5 窄态 chip 收图标 + 插件图标 —— ✅ 已实施并验收（2026-10-08，6 个迭代）
+
+**用户要求**：① 窗口缩小时 chip 收成合适图标（旁边模型选择器会收，chip 也要）；② 该图兼作插件列表图标。
+
+**六轮迭代记录（每轮都是真机反馈驱动）**：
+| 版本 | 用户反馈 | 修正 |
+| --- | --- | --- |
+| 16.5a | 「细节不行」 | 初版图标 |
+| 16.5b | 「窗口缩小智能思考就绪还显示」 | v1 量 chip 自身是死路（flex:none 永不收缩）⇒ 改观察父容器 |
+| 16.5c | 「还是不行」 | v2 观察器因 chip 首帧 return null 根本没装上 ⇒ **改 CSS 容器查询**（与 DSH 模型选择器同机制：`.RlGAzG_row{container-type:inline-size}` + `@container (width<=560px)`，asar 取证） |
+| 16.5d | 「变成空蓝框」 | img 内联 display:none 压过 @container 规则 ⇒ 显隐只交样式表 |
+| 16.5e/f/g/h/i/j | 「看不清」「语义应是思考」「大一些」「去掉外框」「下移」 | 定稿：**24px 无外框 ✦ 四角星火花**（思考语义，区别于插件图标的压缩层叠），冷却时**灰色起步、彩色从下往上显色**（双层同形 SVG + 底部对齐裁剪窗，进度条式），视觉重心下移 2px |
+| 16.5g 关键发现 | 「外层的框」真身 = chip 自身 background/inset 边框/扫色 overlay 在窄态的残影 ⇒ 容器查询里全部关闭 |
+
+**插件图标**：官方约定取证（`package.json "icon": "./icon.svg"`）+ 盾形渐变三层压缩线。
+
+**验收（用户 2026-10-08 22:1x）**：
+- 窄态收图标（与模型选择器同断点同步收）✓
+- 冷却动画：切换档位后火花灰色起步、**橙色从下往上显色 30s**、涨满变蓝（就绪）✓
+- 冷却中再调工具：**被拒并返回剩余秒数**（「还需 21 秒」，数字与真实冷却吻合）✓
+  —— 两轮间隔缩短后用户亲眼确认
+- 换档后用量行后缀同步更新（`思考强度 high`）✓
+- 用户验收结论：「图标设计可以验收」
+
+**教训沉淀**：三次窄屏失败共用一个根因——**显隐判断依赖 JS 时序就会挂在挂载竞态上**；
+CSS 容器查询（DSH 自身的机制）才是正解。内联样式会压过 @container 规则（16.5d）；
+活数据断言不得对运行期分布过敏（report slim 被满环挤出是 R8 的正确行为，16.5d 顺带修）。
+
+**验证**：contract 375 + static 61 + report 54 + boot 21 = **511 断言**全绿。
+**部署**：client.js / icon.svg —— chip 部分 toggle+刷新页面；插件列表图标需重启 DSH。
+
+### R16.9 归因「另一会话 sid is not defined + 压缩失败」—— 与本插件无关（2026-10-09）
+
+用户报告另一会话每轮失败于「sid is not defined」且压缩失败，ZCode 协查指向本插件。
+取证（会话 38fe6ea4 / **dsh-browser-kit 工作区** / turn138 完整记录还原）：
+
+- turn138/s1 一切正常：插件注入在案（`kind=context-pilot`）→ assistant → pwsh 工具
+  → tool/result → step/end ✓；
+- **引擎自动压缩**（`compaction/start` 无 `sourceCommandId=context-pilot` 标记 ⇒ 非插件触发）
+  → `compaction/end` **error 400**：「workbuddy upstream client (http 400): 模型不支持该思考强度」；
+- **1ms 后** turn/end 报 `sid is not defined`——这是引擎收尾路径上的错误；
+- 同会话 idle 安全网失败（报告 `lastActError code=summary`）同源：也是那个 400
+  （「Compaction could not produce a useful summary」即摘要 400 的包装）。
+
+**本插件零嫌疑**：
+- 11 个源文件 `node --check` 全过；自由变量扫描（剥注释/字符串后找裸 `sid` 标识符）
+  **0 处真裸引用**（唯一近似命中 m3 L365，`sid` 在同函数 L358 已定义，系扫描误报）；
+- 插件在 `compaction/end` 之后**没有任何同步钩子**（pre-step 在 turn 开始、idle 在
+  turn 完全结束后）⇒ 压缩失败 1ms 内的 turn 收尾时段，插件没有代码在跑；
+- 全库会话存储与 120 条报告记录中，均无插件产生的「sid is not defined」。
+
+**根因归属**：workbuddy 上游对摘要请求报 400（该 provider×model 不支持对应思考强度——
+与 [`docs/compaction-failure-diagnosis.md`](compaction-failure-diagnosis.md) 的结论同族），
+DSH 引擎在该压缩失败路径的 turn 收尾处抛出 `sid` ReferenceError（**引擎侧问题**，
+与本插件及 R16.7 的换档统计改动无关——那部分只读写 `effort-stats.json`，不参与请求路径）。
+
+**绕行**：该会话切到 `workbuddy/glm-5.3-flash` 等支持该思考强度的组合即可正常。
+引擎侧的 sid 收尾错误建议向 DSH 反馈。
+
+### R16.10 chip 统计「按会话过滤」修复 —— ✅ 已修（2026-10-10）
+
+**用户报告**：「最近切换 / 会话切换次数」跨会话显示一样的值，没有按会话过滤；
+参考智能压缩信息的按会话过滤显示（「可能是一样的问题」——**判断正确**）。
+
+**真机取证**（报告里的 `hudPollReq`，60 条轮询记录）：
+```
+36×  sid=session-16616c07…  matched=9   ← client 传的 sid 一直是对的
+ 3×  sid=session-70a55b1a…  matched=0
+ 2×  sid=null               matched=14
+```
+⇒ **client 侧无问题、压缩记录过滤也正常**（`list.filter(a => a.sid === sid)`）；泄漏全在宿主侧两处：
+
+1. `m5.hud.mjs`：`sid && agents.find(...) || agents[0]` —— **sid 匹配不到 agent 时回退「第一个会话」**，
+   于是那个会话的 chip 借用了另一个会话的 agent；
+2. `effort.mjs` 的 `hudPayload`：`sidOf(agent) || sidHint` —— **agent 优先**，配合上面那条
+   就取到了「另一个会话」的 `lastSwitch/switchCount`（跨会话串数据）。
+
+**修**：
+- m5：只认请求的 sid（匹配不到给 `null`，不再回退 `agents[0]`；sid 为空也不回退）；
+- effort：`sidHint` **优先**（调用方问哪个会话就答哪个），agent 兜底；且**无 agent / 读档失败时
+  仍返回该会话的统计**（键在 sid 上，与 agent 查找解耦 ⇒ 没有 agent 也答得对）。
+
+**护栏**（1 静态 + 3 行为级 + 变异验证）：
+- 静态：m5 不得出现 `|| agents[0]` 回退；
+- 行为级：真 m5 + 真 effort 域，两个 agent（A 在前 B 在后）⇒ 问 B 得 B 的数（2 次/to=low）、
+  问 A 得 A 的数（1 次/to=high）、**问不存在的会话得 0/null（不得借 A 的）**；
+- 变异：单点变异**逃逸**（两处修复互为冗余 ⇒ 单独还原任一处都被另一处兜住），
+  **组合变异（同时还原两处 = 复现原始 bug）⇒ CAUGHT（6 条失败）**。
+
+**顺带修测试脆弱性**：`report.mjs` 的 getHud 切片用**字段名** `state.m5.hudPollReq` 当结束标记，
+而注释里也会出现该字段名 ⇒ R16.10 的长注释让切片提前截断、3 条断言误报失败。
+改用**赋值语句** `state.m5.hudPollReq = {` 作标记（唯一、且正是断言要的东西）。
+
+**验证**：contract 385 + static 61 + report 54 + boot 21 = **521 断言**全绿。
+**部署**：m5.hud.mjs / effort.mjs —— toggle 热换（client 无需改动）。
+
+### R16.11 压缩记录同样串会话 —— 三层堵漏（2026-10-10）
+
+**用户报告**：R16.10 修好换档统计后，「压缩记录」**仍然串**——描述极准：
+「新开的会话窗口，就刚才才压缩一次，但看记录却显示了很多条。」
+
+**取证**（报告的 `hudPollReq` 轮询记录 + hud-acts.json）：
+- client 传的 sid 在**记录到的那些轮询里**一直是对的（如本会话 `matched=10`）；
+- 但 hud-acts.json 里是 **5 个会话的 16 条**记录 ⇒ 只要 sid 有一刻为「空」或「别人的」，
+  面板就会列出**全量**（`sid ? filter : list` 的全局兜底）或**别的会话**的记录。
+
+**三层根因与堵漏**：
+
+| # | 位置 | 原行为（泄漏点） | 修 |
+| --- | --- | --- | --- |
+| ① | `m5.hud.mjs` | `sid ? filter : list` —— **空 sid 返回全量**（UI 里这份列表永远是会话内的，全局视图没有消费者） | 空 sid ⇒ 返回空列表（宁缺勿错）；全量只在 `actsTotal` 计数留痕 |
+| ② | `client.js` fetch 钩子 | 从**任意** URL 抓 `sessionId=` 且 **last-wins** ⇒ 任意带 sessionId 的后台请求都能把 `NS.sid` 抢成**别的会话** | **first-wins**（本窗口第一个会话请求必是自己的）+ 统一解析口 `resolveSid()`（**窗口 URL 优先**，每次轮询现读 ⇒ 切换会话即变）+ 冲突计数 `NS.sidConflicts` 留痕 |
+| ③ | `client.js` 轮询 | `hudRemote` 缓存**不绑定 sid** ⇒ 会话切换后仍渲染上一个会话的记录 | 轮询时 `NS.hudSid !== sidNow` ⇒ **先清缓存再渲染**，并立即重问；另挂 `popstate`/`hashchange` 事件触发重问 |
+
+**护栏**（4 静态 + 3 变异验证，全部 CAUGHT）：
+- 静态：m5 空 sid 不得回退全量（含 `actsTotal` 存在）；client 必须有 `resolveSid` 且两处查询都走它；
+  fetch 必须 first-wins（且**不得**再有 last-wins 写法）；轮询必须有「换代弃缓存」；
+- 变异：① 空 sid 回退全量、② fetch 改回 last-wins、③ 去掉换代弃缓存 —— 逐个还原**都被抓住**（各 2 条失败）。
+
+**验证**：contract 388 + static 61 + report 54 + boot 21 = **524 断言**全绿。
+**部署**：`m5.hud.mjs` + `client.js` —— toggle 热换 + **刷新页面**。
+**验证手段**：弹窗底部指纹带上 `sid=<13 位> n=<条数>`，截图即可核对「这个窗口查的是哪个会话、拿到几条」。
+
+### R16.12 换档意愿低：教学与「每轮提醒」的优化（2026-10-10）
+
+**用户观察**：Agent 切换档位的意愿不高。问题：是 Agent 觉得无需切换，还是教学/决策卡不够好？
+
+**先量化**（报告计数）：部署以来 `effortToolCalls` / `effortSwitches` **长期为 0**，
+历史峰值 4/4 全部是开发期自测切出来的 ⇒ 用户观察属实。
+
+**归因（不是「Agent 觉得不需要」，而是决策时刻没有信号）**：
+| 结构性问题 | 具体表现 |
+| --- | --- |
+| 判据**自指** | 旧教学只说「需要更深推理（复杂设计、疑难排查…）时升档」——「需不需要」交给模型自己判 = 没有触发条件；而压缩那条教学有**外部可观测**触发（占用 % + 强制线），所以压缩被调用得多 |
+| **不切无代价** | 不换档没有任何可见后果（压缩有 75% 硬线兜底）⇒ 两种动作的激励完全不对称 |
+| **时机错位** | 一次性教学出现在会话开头（那时还不知道要做什么）；每轮后缀只有「需要时先说再调用」，每轮同文 ⇒ 习惯化 |
+| **只讲成本** | 旧文本强调「唯一硬约束是换档冷却」，读起来像劝退；收益（省额度/质量）只有一句无量化的话 |
+| 缺**反馈** | Agent 不知道「本会话 0 次换档 / 一直在 max 做机械编辑」 |
+
+**改动（R16.12）**：
+1. **触发表代替自指判据**（一次性教学）：升档 = 跨文件因果排查 / 反复试错 / 设计取舍 / 用户要求「彻底、根因、严谨、评估」；
+   降档 = 连续机械改动 / 简单查询 / 用户要求「快点、只要、简单」；并**显式声明「不变」也是合法结论**
+   （不写这句，「没切」会被当成失职，模型索性不提这件事）。
+2. **成本澄清**：只打断一次前缀缓存（与压缩同轮切更省）、**被冷却拒绝不影响任务**。
+3. **新增每轮提醒 `renderNudge`**（有信号才出现，无信号零 token）：
+   - ① 用户本轮要求深入（关键词命中）→ 提示可升档；
+   - ② 用户本轮要求快速/仅机械改动 → 提示可降档；
+   - ③ 本会话 ≥8 轮且**从未换过档** → 把「没切过」摆到眼前（间隔 ≥10 轮）；
+   - 严格限量（两次间隔 ≥4 轮）、**冷却期间一律不提示**（避免「让你切但工具必然拒绝」）。
+4. **外部触发来源**：`core.lastUserText(session)` 只读 surface 尾部并**跳过插件自己注入的 user/message**
+   （否则会读到自己的用量行），经 `getLastUserText` 注入 m2；取不到就静默不提示。
+
+**验证（534 断言全绿 = contract 398 / static 61 / report 54 / boot 21）**：
+- 新增 2 条静态（触发表 / 成本澄清）+ 5 条行为级（升档提示 / 限量 / 降档提示 / 从未换档提醒 / 无信号零注入 / 换过档后不再提）
+  + 2 条接线与冷却契约；
+- **变异 4/4 CAUGHT**：去掉限量、意图正则失效、去掉冷却守卫、m2 不追加提醒（接线断）。
+
+**顺带修的真 bug**：`nudgeAtTurn` 初值 0 会被「最小间隔」误判成「刚提醒过」⇒ 会话**前 3 轮**
+即便用户明说「排查根因」也不提示；改用 `null` 区分「从未提醒」与「第 0 轮提醒」（行为级测试抓到的）。
+
+**部署**：effort.mjs / m2.inject.mjs / core.mjs / host.impl.mjs —— toggle 热换。
+
+### R16.13 引擎/命令发起的压缩「零记录」—— 事件补记（2026-10-10）
+
+**用户报告**：另一会话（正在运行）中途**触发两次强制压缩，但看不到任何记录落盘**。
+
+**取证（三份数据对照）**：
+- 会话日志：`session-70a55b1a` 在 19:47 有 `compaction/start {turn:29, src:engine}` → OK；
+- 插件报告：该会话的 `lastPreStep` 停在 16:04（插件自己的压缩有记录）；
+- `hud-acts.json`：该 sid 只有 1 条旧记录 ⇒ **19:47 那次完全没进插件**。
+
+**根因**：插件只在**自己**的两条路径写记录——pre-step（工具意图 / 越强制线）与 idle 安全网。
+而 **引擎自动压缩**（context-overflow 恢复 / 引擎阈值）与 **`/compact` 命令**全程绕过插件 ⇒
+「压了但零记录」。更深一层：插件的 pre-step 走 `compactRegion(start, end, agent, signal)`，
+而引擎签名**没有** sourceCommandId ⇒ 自家压缩与引擎压缩在事件流里**无法靠字段区分**（这也是
+之前没敢用事件补记的原因）。
+
+**修（R16.13）**：
+1. **m3 加「在飞标记」**：三处自家压缩调用（own-range / official 兜底 / idle compactNow）都
+   `markOwnCompaction(sid)`、结束即 `clearOwnCompaction()`，另有 90s TTL 兜底防漏清；
+   导出 `isCompactionInFlight()` 供事件侧判定「这是我自己的压缩」。
+2. **m3 新增 `noteEngineCompaction(event, session)`**：在 `compaction/end` 上补记，
+   跳过 ① `sourceCommandId === 'context-pilot'`（idle 路径自带标记）② 在飞窗口（pre-step 路径）；
+   文案分 **引擎自动压缩** / **手动压缩（/compact）**，**失败也记**（「压了但失败」同样是无痕盲区）；
+   落 `recordHudAct` + `publishHud`（与插件自己的记录同表、同样按 sid 过滤），
+   并留 `state.m3.engineCompacts` / `lastEngineCompact` 取证。
+3. **host**：`session/event` 监听器把 `compaction/end` 转发给 m3（一行）。
+   该监听器的边界由「纯只读探针」明确放宽为「**允许记录，仍禁止触发**任何压缩」——
+   R7 删掉的是「标记→自动压缩」那条**触发**链，补记不改变压缩行为。
+4. **m5**：`hudReasonLabel` 增加两个来源标签，避免与他人/插件自己的「强制压缩」混淆。
+
+**为什么这次一定能生效（预检）**：报告里的 `m3.eventProbe` 累计到 `compaction/start` **40 次**、
+`compaction/end` **38 次**、`compaction/summary` —— 监听器确实收得到这些事件（不是空修）。
+
+**验证**：contract 406 + static 61 + report 54 + boot 21 = **542 断言**全绿；
+新增 2 静态 + 6 行为级（引擎/命令/失败/两种跳过/计数留痕）；**变异 4/4 CAUGHT**
+（host 不转发、不跳过 context-pilot、不打在飞标记、文案退化为枚举名）。
+
+**顺带修**：`fix-esc` 全局替换曾误伤文件头注释里**特意转义**的反引号
+（那处转义正是为了躲开依赖扫描，去掉后触发「自循环依赖」误报）——已按 HEAD 逐行恢复。
+
+**遗留说明**：修复**不追溯**——19:47 那两次压缩在 hud-acts 里没有数据（插件当时没收到），
+只能从会话日志看到；此后所有来源（插件 / 引擎 / 命令）的压缩都会出现在面板里。
+
+**部署**：m3.compact.mjs / host.impl.mjs / m5.hud.mjs —— toggle 热换（client 无需改动，
+面板每 5s 轮询自动出现新记录）。
+
+### R16.14 采纳「另一会话的评审」：7 条建议 → 逐条处置（2026-10-10）
+
+**来源**：另一会话（session-70a55b1a）在真实使用后写了两份总结，正好对应本工具两大功能
+（压缩决策 / 思考强度档位）。评审质量很高，且**两次独立复现同一缺陷** ⇒ 判为机制问题。
+两条最锋利的原文：
+
+> ① 「**『提前登记档位』被耦合进了『立即压缩』**：`compact_context` 一调用就当场压，而档位只是它的参数。
+>    想『先登记 heavy、暂不压』在工具面上做不到 ⇒ 于是理性选择就是别碰它。」
+> ② 「**只有例外路径（调用）才需要理由**。『不压』零成本、零证据 ⇒ 沉默稳定胜出。」
+
+| # | 评审建议 | 处置 |
+| --- | --- | --- |
+| 1 | 档位登记与压缩**解耦**（最大杠杆） | ✅ 工具加 `action`：`'set-tier'` = **只登记档位、本次不压缩**（不产生意图、零压缩成本）；缺省 `'compact'` 向后兼容。行为级测试断言 `scheduled:false` 且 `peekIntent()===null`（真不压） |
+| 2 | 给**可预测的量**（Δtoken / 几轮触线） | ✅ m2 记录每会话上一轮上下文总量，按**实测增量**算 `turnsToLine`，注入卡片：「本轮 +50k，按此速度约 **5 轮**触 75%」——把预测题变算术题 |
+| 3 | 强制**决策行**（含「不压」） | ✅ 卡片教学 `压缩决策：压｜N%｜理由…` / `不压｜N%｜理由…｜tier 保持 X`；换档侧同款 `档位决策：保持 high｜理由…`（含「不变也要写出来」） |
+| 4 | 把**不作为代价**显式化 | ✅ 删掉「届时无需操作」（评审点名：那句在替模型的不作为背书），改为：系统代压「时机由系统选、按**那一刻**档位执行、摘要会把**已过期的事实**写进概要」 |
+| 5 | 阶段边界发卡，别每轮复读 | ⚠️ **部分**：仍按占用阈值发卡（未改频率）；用「决策行」与趋势数字降低复读的边际信息损失。**完整版（阶段边界检测）留待后续**——需要可靠的阶段信号，贸然改会漏掉决策点 |
+| 6 | 报告**保留预算与损失** | ✅ 卡片给数字：`当前 ≈500k > 预算 160k ⇒ 现在压会摘要掉 ~340k 近端`；未超预算时明确「**近端一点都不丢**」（把零损失机会说清） |
+| 7 | 自动压缩显性化为「代你决策」 | ✅ 补记文案带 **「系统代压（本会话未申报档位 ⇒ 按兜底 standard）」**（依据 `hasTier`，从未申报才标）+ 卡片写明「未声明档位就是 standard=16%」 |
+
+**验证**：contract 417 + static 61 + report 54 + boot 21 = **553 断言**全绿；
+新增 10 条（含 `set-tier` 真不压、缺省兼容、决策行、损失数字、趋势算术化、代压标注、换档决策行）；
+**变异 5/5 CAUGHT**（set-tier 退化成也压、写回「无需操作」、去掉趋势注入、去掉代压标注、去掉档位决策行）。
+
+**部署**：compact-tool.mjs / m2.inject.mjs / m3.compact.mjs / effort.mjs —— toggle 热换。
+
+### R16.15 采纳第二轮评审：教学**分工去重** + 决策行对齐 + 档位名可查（2026-10-10）
+
+**来源**：仍是 session-70a55b1a（它随后做了源码级复核，并诚实纠正了自己上一轮的一个误判）。
+它的结论：「方向对、7 条里 6 条落地，第 5 条标注为部分落地是诚实的」；
+同时指出**它那个会话当时还没生效**（brief 会话级一次性注入 ⇒ 旧会话看不到新 brief，只有卡片每轮重渲染）
+——这正是需要 toggle 的点（本轮已 toggle）。
+
+核心新抱怨（也是本轮最大改动）：**三重重复**
+> 「tool description + brief + card **各写一遍**档位表、『先说再调用』、代压代价 ⇒ 每请求白烧 ≈1.5–2k token，
+>  且『哪份是权威』不明。」
+
+| # | 新评审建议 | 处置 |
+| --- | --- | --- |
+| 1 | 三处**分工去重**（description=怎么调 / brief=固定事实 / card=本轮动作） | ✅ 重写三处；**新增预算护栏**：description ≤500 字符、三处合计 ≤3000 字符（去重前 ≈3900 ⇒ 实测 2486，description 每请求 1100→382） |
+| 2 | 「每轮留一行决策」与提醒通道**错位**（卡不出现的轮次被要求写行却无提醒） | ✅ 改为「**本卡出现时**，先落一行决策」 |
+| 3 | 决策行里的档位名**无处可查** | ✅ 卡渲染 `当前档位：heavy（已登记）` / `standard（兜底，从未登记）`（经 `getTier`/`hasTier` 注入），并澄清「现行生效」说的是**保留 token 数**不是档位名 |
+| 4 | 「不传参 = 维持现状」易读成「重置为 standard」 | ✅ 改为「**不传 tier = 沿用已登记档位（不是重置）**」（description + card） |
+| 5 | 越线后那句是**死信息** | ✅ 换成可执行补救：「**已越强制线 ⇒ 立刻用 `action:'set-tier'` 声明档位**，避免下一次仍按兜底压」 |
+| 6 | description 仍是「预测题」措辞，与卡片算术化不一致 | ✅ description 删掉策略段，改为「**按卡上的数字判断，不要凭空预测占用**」 |
+| 7 | 趋势外推未标**不确定度** | ✅ 标为「**趋势（按最近一轮增量粗估）**」 |
+| 8 | 「现行生效」与「当前档位」应分工写明 | ✅ 见 #3 |
+
+**同时保留用户硬要求**（去重不能把要求一起去掉）：description/brief/card 三处的
+「**先说，再调用**」原文、「**不要为了压缩而停下**」、「**没有**任何自动拉起动作」、
+「越线前选定档位的**介入时机**」与「已越线/尚在强制线之下」的**状态自适应**——均已按原措辞保留，
+相关断言同步更新为「要求仍在、措辞可读」。
+
+**它还确认了我们上轮的一个修复**：`setTier` 位于 action 分支之前 ⇒
+「我登记了 heavy，卡片却仍报 ×16%」这个它实测到的问题被一并修掉 ✓。
+
+**顺带修的真问题**：我一度把卡片里的「尚在/已越强制线」状态短语删掉（去重时误删）⇒
+**状态自适应消失**；由断言当场抓住并恢复。
+
+**验证**：contract 424 + static 61 + report 54 + boot 21 = **560 断言**全绿；
+新增 7 条（含两条**预算硬护栏**）；**变异 4/4 CAUGHT**（description 塞回档位表、决策行改回「每轮」、
+卡不渲染档位名、代压代价重复回 brief）。
+
+**部署**：compact-tool.mjs / m2.inject.mjs —— toggle 热换。
+⚠️ 注意：**brief 是会话级一次性注入** ⇒ 旧会话要等下一次「压缩后重讲」（`clearBriefed`）或新会话
+才看到新 brief；**卡片每轮重渲染，toggle 后立即可验证**。
+
+### R16.16 第三轮评审：`set-tier` 生产事故（schema 类型）+ 档位不持久 —— 两处必修（2026-10-10）
+
+评审来自 session-70a55b1a，两条都是**实测 + 源码双证据**，且第二条直指我们的部署方式。
+
+**① `set-tier` 在生产上不可用（高）** —— 它按卡片指引调用后收到：
+```
+Error: tool "compact_context" returned invalid output: "value.scheduled" must be a string
+```
+根因：`runTool` 的 set-tier 分支返回 `scheduled: false`（**boolean**），而 `output.schema` 声明
+`type:'string'` ⇒ 宿主按 schema 校验**整条调用被拒**。讽刺的是同文件注释里就记着 R15.3 那次
+「多一个字段⇒整条失败」，这次从**类型**一侧再踩一次。
+
+**它对我们测试方式的批评（更值钱）**：
+> 「你们新增的行为级断言写的是 `scheduled:false 且 peekIntent()===null` —— **断言锁住的是实现值（false），
+>  而不是宿主校验用的 schema（string）** ⇒ 测试给了虚假信心。」
+
+⇒ 已按它的建议补：**返回值 ↔ `output.schema` 的结构校验器**（类型 / additionalProperties / required），
+对 `compact_context` 的**三条返回路径**（set-tier / compact / error）与
+`set_reasoning_effort` 的返回**逐条校验**；修复为 set-tier **省略 `scheduled`**（可选字段）。
+变异验证：把 `scheduled:false` 改回去 ⇒ **CAUGHT**（3 条失败）。
+
+**② 档位登记不持久（高）** —— 它上轮用 `tier:'heavy'` 压过（回执确认），热换后卡片却显示
+「standard（兜底，本会话从未登记）」。根因：`tierBySid` 是**纯内存 Map，无落盘**
+（而 effort 侧早已做了每 sid 落盘）⇒ **toggle 热换 = 新实例 = Map 清空 ⇒ 已声明档位静默消失**，
+之后强制压缩回落 standard —— 正是教学警告的那个失败；文案却称「会话级**持久**选择」。
+
+⇒ 修：`tierBySid` 复用 effort 同款落盘（`plugin/.data/compact-tier.json`，键=sid，值 `{tier,at}`），
+创建时恢复并标记 `restored`；新增 `tierState(sid)`（`set`/`restored`/`none`）；
+**卡片三态可辨**：`当前档位：heavy（已登记；本次由落盘恢复——跨 toggle/重启仍有效）` /
+`（已登记）` / `（兜底，本会话从未登记）`。变异：去掉 `saveTiers()` ⇒ **CAUGHT**。
+
+**③ 它上轮列的三个剩余项（本轮一并修）**：
+1. **brief 保留数字与档位脱钩** ⇒ 标注「**按默认档位 standard 计**；已登记其它档位以卡上活值为准」；
+2. **「预测题」措辞只改了一半**（趋势行与「若预计…」并存、口径不一）⇒ 趋势行存在时改为
+   「**按上方趋势行判断**」（无趋势行时保留原措辞）；
+3. **损失数字只按当前档位** ⇒ 并列「**若先声明 heavy（保留 240k）：只丢 ~X（比当前档位少丢 ~Y）**」——
+   把「先 `set-tier` 再压」的收益变成数字。变异 2/2 CAUGHT。
+
+它同时认可了 R16.15 的两处「比它建议更好」的落地（收敛权威「以卡为准」、决策行与本卡对齐），
+并说明：**它不会用「调一次压缩带 tier」绕过**（那会白压掉 ~119k 近端）——判断正确。
+
+**验证**：contract 431 + static 61 + report 54 + boot 21 = **567 断言**全绿；
+新增 7 条（含**结构校验器**与**跨实例持久化**）；**变异 4/4 CAUGHT**。
+
+**部署**：compact-tool.mjs（落盘 + schema 修复）/ m2.inject.mjs（tierState）/ host.impl.mjs（注入 pluginDir）
+—— toggle 热换。**修复后那个会话即可补登记 heavy。**
+
+### R16.17 第三轮评审的「剩余轻量项」：只有 1 条要动，其中 2 条评审主动确认「设计正确」（2026-10-10）
+
+评审末尾给了三条轻量项，本轮逐条处置：
+
+| # | 评审意见 | 处置 |
+| --- | --- | --- |
+| 1 | `compact-tier.json` **无 TTL/无清理** ⇒ 长期累积（每个见过的会话一条）；建议复用 `lastUsedBySid` 的「保留最近 64 条」先例 | ✅ 新增 `TIER_SID_CAP = 64` + `pruneTiers`（**写入前**裁剪，**载入时**对老文件收敛）；采用「按最新保留」而**不是按时间老化**——档位是会话级长期偏好，久未压缩的老会话不该因为「几天没动」丢掉已声明档位 |
+| 2 | 它**撤回**上轮的 R3：趋势行没出现（压缩后增量为负 ⇒ 按设计不显示）时，「若预计任务会推高…」是唯一指引 ⇒ 两者互补、不是矛盾 | ✅ **无需改动**（我们的实现正是「趋势存在时替换、缺失时保留」——与它的结论一致） |
+| 3 | brief 与卡片各一份档位表——它**改主意**：建议**保持现状**（brief 会话初注入、卡片要达标才出现 ⇒ 低占用期只能从 brief 学到档位定义；「以卡为准」已消解权威歧义） | ✅ **无需改动**（R16.15 正是这么保留的） |
+
+**本轮顺带抓到一个真实的不确定性缺陷**（由行为级测试的**间歇性失败**暴露）：
+`pruneTiers` 初版用「**当前 Map 里的位置**」当同毫秒登记的断链 ⇒ 而每次裁剪都会重排 Map，
+位置语义随即失效 ⇒ **同一份数据有时丢新、有时丢旧**（三次连跑两种结果）。
+修：引入**显式单调序号 `seq`**（`setTier` 递增、落盘携带、载入续号），
+排序改为 `at 降序 → seq 降序` ⇒ 确定性且符合「保留最新」语义。
+补**静态契约**断言（单调序号 + 断链必须在）——因为「仅按 at」的回归在正常路径下**行为级测不出来**
+（本次变异第一轮就逃逸，补静态断言后 CAUGHT）。
+
+**验证**：contract 437 + static 61 + report 54 + boot 21 = **573 断言**全绿；
+新增 5 条（3 行为级 + 2 静态）；**变异 3/3 CAUGHT**（去掉有界化 / 退回仅按 at / 去掉序号计数）。
+
+**部署**：compact-tool.mjs —— toggle 热换。
+
+### R16.18 「上一轮 67% 说不压，新一轮却自动压了」—— 引擎在 step 边界抢先（2026-10-10）
+
+**用户报告两件事**：① 那个会话刚触发一次压缩，但「记录里没看到」；② 上一轮 67% 决定不压，
+可是发起新一轮任务时就自动压缩了。
+
+**取证一：记录其实落了**（R16.13 的补记生效）——
+`hud-acts.json` 首条：`2026-10-10T05:15:39Z 70a55b1a | 13:15 · 引擎自动压缩 · 压后占用 29.6%`
+（用户未在当时看到，属面板 5s 轮询/刷新时机问题；记录本身在）。
+
+**取证二：压缩原因 = 引擎在 **step 边界** 抢先**（会话日志 + 引擎源码双证据）：
+```
+05:13:34 turn/start turn=47（用户发起新一轮）→ s1..s14 连续执行
+05:15:14.234 step/end s14
+05:15:14.282 compaction/start turn=47 src=engine   ← 48ms 后引擎触发
+05:15:39.911 compaction/end（压后 29.6%）
+05:15:39.935 step/start s15 → 这之后才轮到插件 pre-step
+```
+引擎源码 `resolveCompactSpec`：`thresholdTokens = min(窗口 × thresholdRatio(80%), 预算)`，
+判定发生在**每个 step 边界**且该 seam **排在插件 pre-step 之前** ⇒
+只要**单个 step 的增量**把占用从「低于我方线（引擎阈值 −5pp = 75%）」推到 ≥80%，我们必然输掉这场比赛
+（实测该会话单步可加 6pp+）。这正是用户看到的「67% 说不压、新一轮自动压」。
+
+**修（R16.18）**：
+1. **动态余量**：pre-step 每次测量都采一条比例样本（每会话 ≤12 条、会话数 ≤64，有界化），
+   用**实测单步最大增量**算余量 `margin = clamp(5pp, 20pp, maxStep)`，
+   我们的线重算为 `min(M3.criticalRatio, criticalCapOf, engineThreshold − margin)`
+   ⇒ 总在「引擎可能到线的那一步之前」触发，档位/范围由我们说了算（而非引擎兜底 standard）。
+   `engineThreshold` 由宿主注入（**阈值核心同源**，不抄常量）。
+2. **记录里标注「引擎抢先」**：补记文案追加
+   `· 引擎抢先：我方上次估计 67.2% ＜ 我方线 75%（引擎在 step 边界判定，排在插件之前）`，
+   并在 `lastEngineCompact` 留 `preempted/ourLastRatio/ourLine` 三个取证字段
+   ⇒ 这类问题下次**一眼可见**，不必再翻会话日志。
+
+**验证**：contract 442 + static 61 + report 54 + boot 21 = **578 断言**全绿；
+新增 5 条（3 静态 + 2 行为级）；**变异 4/4 CAUGHT**
+（余量写死 5pp / 不采比例样本 / 去掉抢先取证 / host 不注入 engineThreshold）。
+
+**部署**：m3.compact.mjs / host.impl.mjs —— toggle 热换。
+
+### R16.19 压缩记录仍跨会话（第三次）—— 权威会话 id = 槽位 props（2026-10-10）
+
+**用户截图取证（关键）**：新开的 keysion-dac-vue 会话面板里，
+指纹行显示 `—— dcp: gen=… sid=session-16616 n=8` —— **它查的是 16616c07（另一个会话）**，
+所以列出的全是别人的记录，而它自己刚压的那次当然看不到。
+
+**根因**：R16.11 的解析优先级是「**URL 优先**」——而**同一窗口内切换会话时 URL 不会更新**
+（会话切换是 SPA 内部状态，不是导航）⇒ 拿到过期 id；first-wins 的 fetch 捕获同样过期。
+两次修复各修了一半（last-wins 被别的会话抢 / URL 优先在切换后过期），**都没拿到权威来源**。
+
+**权威来源（本次找到）**：插件的 chip 挂在 `conversation.input.right`，
+该槽位 **scope=session**，其 `standardProps` **明确包含 `sessionId: SessionId`**
+（`cordis_inspect_query` Slots → `listSubTree` 实测输出）。它与 URL / 请求都无关，
+**就是当前这个对话的会话 id**。
+
+**修（R16.19）**：
+1. **chip 渲染期从 `props.sessionId` 写入 `NS.sidActive`**（权威值；变化时顺带触发一次重问）；
+2. `resolveSid()` 优先级改为 **① `NS.sidActive`（权威）→ ② URL（仅 chip 未挂载前的兜底）→ ③ fetch 捕获**；
+3. 指纹增加**来源标注**：`src=slot|url|fetch`——本次正是靠指纹里的 `sid=` 一眼定位，
+   以后还能直接看出「用哪一路解析的」。
+
+**验证**：contract 445 + static 61 + report 54 + boot 21 = **581 断言**全绿；
+新增 3 条静态（props 取值 / 优先级顺序 / 指纹来源）；**变异 3/3 CAUGHT**
+（chip 不读 props / 去掉 sidActive 优先 / 指纹丢来源）。
+
+**部署**：`client.js` —— toggle 热换 **+ 必须刷新页面**（client 半）。
+
+**教训**：连续三次同类问题（last-wins 抢 / URL 过期 / 权威值缺失）说明——
+**「猜当前会话」这个方向本身就是错的**；应该在**会话作用域的槽位**里取现成的权威 id。
+另：指纹行要从第一版就带 `sid + 来源`，本次排查几乎全靠它。
+
+### R17 「我手动改成 Max，新一轮模型读到的还是 high」—— 轮首读档错在「只读上一次请求的 header」（2026-10-12）
+
+**用户报告（原话）**：「上一轮结束时的思考强度是 high，然后我手动改成 Max，发起新的一轮，
+模型开始读取到的思考强度好像还是 high，注入的时机不够前。应该能让模型知道用户调整了思考强度。」
+
+**取证（源码 + 时序，两处写入点全库可数）**：
+
+| 事实 | 证据 |
+| --- | --- |
+| 用户改档**只**产生一个会话事件 + 一个投影 pending | UI `selectModel` / `/model` 命令 → `selectForNextRequest`：`agent.session.append('model/selection', …)` + 置 `selection.current`（`api-session-controller` L319-322 / L735）；全库 `selectForNextRequest` 只有这两个调用者 |
+| 官方把选择落到**请求**上要到**本步骤**的 assemble/request | `installModelSelection`：`system-prompt/assemble` 快照 `selection.current` → `agent/request` 写进配置（`dsh-agent/lib/types/model-selection.js` L45-75） |
+| 插件的注入排在它们**之前** | 注入在 `agent/pre-step` step 1 ⇒ 那一刻 `requestHeader()` 仍是**上一次请求**的档位（旧值），用户的新选择只在 **modelSelection 投影的 `pending`**（投影 `apply` 见 L2072-2088；`stateOf(session,'modelSelection') = {lastUsed,pending}` 的语义经 `cordis_inspect_query` 的 `sessionProjections` 契约复核） |
+| 旁证：client chip 早就是同款口径 | `sel.pending \|\| sel.lastUsed`（`client.js` EffortChip）⇒ 只有**宿主侧读档**这一处漏了 pending |
+
+⇒ 旧实现轮首报「思考强度 high」，而本轮请求实际跑 max：模型既不知道用户调过档（错过「这轮要更用力」的意图），
+还据错误读数做决策（例如顺手切回去）。
+
+**修（R17，全在 `plugin/effort.mjs`）**：
+
+1. `read()` **pending 优先**：`agent.session` 的 modelSelection 投影有 `pending` 时，provider/model/current 全取它
+   （本步骤的请求就会用它）；投影缺失 / 形状异常 / 服务缺失一律退回 header 值（降级不炸）。
+2. `pending` 未指定档（只换模型 / 选了「默认」）⇒ 用**新模型的 adapter 默认**兜底；默认取不到则退回旧值
+   ——**宁可少报「用户改了」，也不能让后缀整个消失**。
+3. `renderSuffix()` 在 `pendingChanged` 时**紧跟档位值**写明「**用户刚把档位从 high 调到 max**，本步骤的请求即用它」；
+   无 pending 时文案与旧版**逐字一致**（零 token 增长、零回归）。
+
+**验证**：contract 445→**456** + static 72 + report 54 + boot 21 = **603 断言**全绿；
+新增 11 条（3 静态 + 8 行为级：改档 / 无 pending 逐字一致 / 投影缺失降级 / 只换模型兜底 / 重复同档不打扰 /
+「无 adapter 默认」与「llm 不可用」两条兜底路径）；**变异 4/4 CAUGHT**
+（只读 header / 完全不理 pending / 去掉 current 兜底 / 去掉「刚改档」标注），还原后文件哈希一致。
+
+**部署**：`plugin/effort.mjs` —— **toggle 热换**（entry 未改，无需重启、无需刷新页面）。
+
+**如实记录的覆盖边界**：用户在**一轮进行中**改档时，该变化当步就被官方消费（header 立刻更新、pending 清空），
+⇒ 下一轮只报新档位值、不标「用户刚改」。要连这种情形也标注，得按会话记住「上次报过的档」，
+本轮**刻意不做**：那是低频场景，而新的有状态机制会带来 toggle 重置后的误报面（本项目在 chip 统计那轮已踩过同类）。
+
+**教训**：
+
+- 「用户刚改的设置」在 DSH 里是**投影 `pending`**，不是 `requestHeader`。凡「在请求之前注入」的读取都要自问：
+  **此刻 header 是不是还是上一次请求的值**。（同类第二次：R16.19 错在「猜当前会话」，这次错在「读上一请求的档位」。）
+- 该功能本已有正确的一半：`applyTo` 的「他人显式指定 ⇒ 让位」护栏（用户手动改档后不会被插件覆盖）。
+  但**轮首注入的读数**来自另一个源 ⇒ 护栏对了、读数错了，用户看到的就是「你明明知道，却报旧档」。
+  **行为正确 ≠ 知情正确**：与用户动作相关的读数必须与护栏同源。
+
+### R18 单档模型「零注入 + 工具静默」+ 两个开关的缺口（2026-10-13）
+
+**用户要求（原话）**：「如果所选模式没有多个档位可行，并排除 Default 这个项目，比如只有一档 High，
+就不往提示词内注入切换档位的相关内容，尽量少 token，并随时切换到有多个档位的模型时，又能第一时间注入。」
+随后追加：「开工前，先检查下这个面板中，2 个本插件的开关是否有效，逻辑是否正确。」
+
+#### 一、成本结构（实测字符数，决定优先级）
+
+| 层 | 成本 | 时机 |
+| --- | --- | --- |
+| **工具 schema** | description **366** + 参数说明 **51** 字符 | **每请求**（无 adapter 声明 `toolUpdate` ⇒ 全量重发） |
+| 每轮后缀 | 60 字符 | 每轮 step 1 |
+| 一次性教学 | 754 字符 | 会话首次 |
+| 换档提醒 | 99 字符 | 有信号时 |
+
+⇒ 只压文本收益有限，**必须连工具一起收**。
+
+#### 二、调查（两个探针，均已按纪律清理，取证留在 `plugin/.data/r18-*.json`）
+
+| 事实 | 证据 |
+| --- | --- |
+| `agent.ctx.get('tools')` 可取到工具服务；与 apply 上下文的 tools **不是同一实例**（`sameInstance:false`） | 只读探针 `r18-probe.json` |
+| 全局视图仍含我们的工具 ⇒ 对 agent 而言属**继承面**（restrict 的命中目标） | 同上（`viewGlobal.hasOurTool:true`） |
+| `restrict({deny})` 生效：`wireSchemas` **70→69**、`visible:false`、`resolveExecution→undefined`（调用被判 `UNKNOWN_TOOL`） | 写探针 `r18-restrict.json` |
+| **只影响该 agent**；`disposer()` 后 **69→70** 完全恢复；限制不动 `restrictableNames`（重复 restrict 不抛错） | 同上 |
+| 模型可见工具清单 = `wireSchemas(scope).schemas`（`systemPrompt.tools(ctx => wireSchemas(ctx.scope))`） | `dsh-tools` L2707 |
+| `register()` **返回精确 disposer**（旧代码把返回值丢了） | `dsh-tools` L2876-2887 |
+
+#### 三、设计（详见 [`docs/r18-single-tier-suppression-design.md`](r18-single-tier-suppression-design.md)）
+
+判据 **`canSwitch(eff)`** 是唯一真相（文本四处 + 工具可见性共用）：
+去掉 `default`/`默认` 后 distinct ≥ 2 才叫「可切」；**未知一律不抑制**（R7 结论：取不到 ≠ 没有）。
+
+- 文本四处静默：`renderSuffix` / `renderBrief` / `renderNudge` / **`m2.renderCompactReceipt` 的换档提示**
+  （最后一处最容易漏——它在 m2 不在 effort 域，漏了就是「工具已隐藏、文本仍劝你调用」）。
+- 工具可见性：`agent.ctx.get('tools').restrict({deny})` 隐藏、`disposer()` 恢复；
+  快路径按「开关态 + 路由」键同步返回，**只有换模型才走异步判定**。
+- **热换残留陷阱**（本方案最关键）：restrict 的 effect 挂在 **agent fiber**，插件 toggle 不会清它
+  ⇒ 新实例若拿不到旧 disposer，工具**永久隐藏**（静默能力丢失）。对策三层：
+  ① disposer 存**进程级注册表**（`globalThis[Symbol.for(...)]`，跨 toggle 存活、随 agent GC）；
+  ② 激活期/开关翻转时**清扫**；③ **失败极性铁律**——拿不到可回滚句柄就**不隐藏**。
+- **当轮恢复**（目标③）：判据读投影 `pending`（R17 同源）+ 宿主 pre-step `await reconcile`
+  （早于 `system-prompt/assemble`）；教学因「只有真注入才标记已讲」而自动重讲一次。
+
+#### 四、查开关时发现的**两个真实缺口**（用户要求「开工前先检查」，当场修掉）
+
+| # | 缺口 | 证据 | 修法 |
+| --- | --- | --- | --- |
+| 1 | **开关关闭后工具仍在下发**：`registerTool()` 丢弃了 `tools.register()` 的 disposer，全插件无任何撤回路径 ⇒ 关掉智能压缩/智能思考后，`compact_context` / `set_reasoning_effort` 仍留在模型清单里（每请求白付 schema，调用只拿到「未开启」错误） | 代码路径 + `grep dispose\|unregister` 只命中 host 的 timer | 捕获 disposer；关闭时 `retractTool`；**宿主不再按开关早退**（否则进不到模块、撤不掉） |
+| 2 | **开关翻转晚一步生效**：`mergeConfig()` 由 `effEnabled()`/`preStepCompaction` 间接调用，而 `ensureEffort()` 排在它们之前 ⇒ 第一步读到旧值 | 宿主 pre-step 调用顺序 | pre-step **最前面**显式 `mergeConfig()` |
+
+#### 五、验证
+
+- **625 断言全绿**（contract 478 / static 72 / report 54 / boot 21）；R18 新增 22 条
+  （8 静态 + 14 行为级：判据表含「排除 Default」与「未知不抑制」、四处文本、工具隐藏幂等、
+  **跨实例自愈**、开关撤回、restrict 抛错不锁死）。
+- **变异 7/7 CAUGHT**：判据边界 `>=2`→`>=1`（8 条红）／未知也抑制（3）／回执提示不门控（4）／
+  注册表退回模块内（2，其中一条正是「跨实例自愈」）／关闭不撤回工具（4）／去掉快路径（1）／宿主不 await 收敛（2）。
+  还原后三文件哈希一致（逐文件比对 `True`）。
+- 两条**既有静态断言被更新**（不是绕过）：`if (!d.enabled) return false;`（effort 与 compact 各一条）——
+  旧文本钉的是旧实现，R18 的语义已变成「关闭 ⇒ 撤回 + 清扫」，断言随之改为钉新语义（保留「不注册」原意）。
+
+#### 六、部署与边界
+
+- 改动：`effort.mjs`、`m2.inject.mjs`、`host.impl.mjs`、`compact-tool.mjs`、`client.js`（弹窗提示行）、`wire.host.mjs`（签名文档）。
+- 生效：**toggle 热换**；`client.js` 改动需**刷新页面**。
+- 判据不可用（provider 不暴露 `efforts`）时**保守不抑制**；`restrict` 不可用时**不隐藏**但留痕。
+- 真机 E2E 待做：四档模型应**零变化**；切单档模型应「后缀消失 + 工具退出清单」；切回应**当轮恢复**；单档下 toggle 应自愈。
+
+#### 七、真机 E2E（2026-10-13，用户配合切换模型）
+
+| 检查点 | 单档 `workbuddy/hy4-preview-f` | 切回四档 `deepseek-account/deepseek-flash` |
+| --- | --- | --- |
+| `set_reasoning_effort` 在该 agent 的可见清单里 | **无**（Inspect Tool 面实证） | **有**（另一次 Inspect 取证） |
+| `compact_context` | 有（不受影响：不同开关） | 有 |
+| 可见工具总数 | **73** | **74**（差 1 = 正好那个工具） |
+| 用量行后缀 `｜ 思考强度 …` | **没有** | 恢复 |
+| 「智能思考」一次性教学 | **没有** | 恢复（重讲一次） |
+
+报告侧旁证：`effortTool.revocable:true`（R18 新代码）、`m2.effortSuffixes/Briefings` 在单档轮次**不增长**（文本零注入的数值证据）。
+恢复发生在 pre-step（早于 `system-prompt/assemble`）⇒ **当步生效**，不是下一轮。
+
+**自愈（单档下 toggle，最后一项）**——决定性序列：
+
+```
+12:55:32  上一实例：单档 ⇒ gate NO-SWITCH/single、effortRestricts=1（工具已隐藏）
+12:58:06  用户 toggle ⇒ 新实例激活期清扫：effortLastSweep{why:'activate', released:1, agents:2}
+          effortRestores=1                       ← 释放了上个实例留在 agent fiber 上的限制
+12:58:30  reconcile 重新判定（仍单档）⇒ 再次隐藏：restricts=1、gate NO-SWITCH/single
+```
+
+⇒ **跨热换不留残**，且「切到多档后工具永远不见」这条最怕的静默失效被正面排除。
+
+**R18.1 落报告（真机）**：`12:55:32 reason:"effort"` 条目里出现 `effortRestricts:1` 与完整 `effortGate`
+（该写入**不是**换档工具触发的——工具当时正是隐藏态，是 `hideToolFor` 自己的 `schedule`）⇒ 缺口闭环。
+
+### R18.1 取证缺口：工具隐藏/恢复在报告里无痕（2026-10-13，用户截图反馈「小缺口修下」）
+
+**缺口**：`hideToolFor` / `liftToolFor` 只加内存计数（`state.m3.effortRestricts/Restores`），
+**没有任何 `schedule`** ⇒ 报告只在特定 reason（activation/boot/effort…）才写，
+真机上 `restricts/restores` 长时间不可见——R18 那轮真机验证只能靠 Inspect 侧面取证。
+这与本项目「任何静默降级都必须留痕」的纪律不符（R16/R17 的同类机制都带 `schedule('effort', 400)`）。
+
+**修**：两条路径各加一次 `schedule('effort', 400)`（隐藏/恢复都落报告）。
+
+**验证**：contract **480** + static 72 + report 54 + boot 21 = **627 断言**全绿；新增 2 条
+（静态 + 行为级：真跑 reconcile/sweep 并计数 `schedule` 调用次数）。
+
+⚠️ **两条弯路如实记录**（都是本项目的老坑换了个壳）：
+1. **变异锚点打偏**：首版变异脚本用「首次出现的 `schedule('effort', 400);`」当锚点，
+   而文件里**更早**（`applyTo` / `runTool`）本来就有同名调用 ⇒ 实际删的是无关那一处，
+   于是「M1 逃逸」是**假逃逸**（脚本的错，不是断言的错）——与 R9「逃逸的是脚本、不是断言」同型。
+2. **静态断言窗口过宽**：首版写 `function hideToolFor…[\s\S]{0,900}schedule('effort'`，
+   而两个函数相邻 ⇒ 删掉 hide 那处后正则**跨进 `liftToolFor`** 照样匹配（真逃逸）。
+   改为**按函数体取文本**（边界 = 下一个 2 空格缩进的 `}`）。修正锚点后 **M1/M2 双双 CAUGHT**（各 2 条红）。
+   ⇒ 再次印证 R7：**正则窗口宽度是断言的一部分**；R9：**先怀疑脚本，再怀疑断言**。
+
+### R18.2 「关开关」也留痕：撤回路径缺 schedule（2026-10-13，真机验证时发现）
+
+**发现路径**：R18 真机 E2E 收尾时把「智能思考」关掉做最后一项验证——
+Inspect 的 Tool 面**确认工具已从模型清单消失**（0 命中，`compact_context` 仍在），
+profile 落盘也确认 `effortEnabled:false`（21:01:24 写入）；
+**但报告里找不到任何「工具已撤回」的痕**（`effortTool.retracted` 始终不出现）。
+
+**根因**：R18.1 只给 `hideToolFor` / `liftToolFor` 加了 `schedule`，**漏了 `retractTool`**——
+而它正是「关开关」这条路径的执行者。于是「关掉开关 ⇒ 工具退出清单」这件事在报告里不可见；
+更糟的是它的**降级分支**（`register()` 没返回 disposer ⇒ 撤不掉，只能靠 per-agent 限制兜底）同样无痕，
+而那属于「静默降级」，恰是本项目要求**必须可诊断**的一类。
+
+**修**：`retractTool` 的**成功支与降级支**各加一次 schedule；effort（`schedule('effort', 400)`）与
+compact（`schedule('compact-tool', 400)`）两侧对称。
+
+**验证**：contract **482** + static 72 + report 54 + boot 21 = **629 断言**全绿；新增 2 条；**变异 M1/M2 双双 CAUGHT**。
+
+⚠️ **又一次「虚假信心」被变异抓住**（第三次同型，记下来）：
+行为断言首版写成「关开关**前后**计数增长」——而它的**上一步** `reconcile(off)` 释放限制时**也会** schedule，
+基准取早了 ⇒ 断言恒真，删掉 `retractTool` 的 schedule 照样通过（M1 首次运行只红 1 条）。
+改为**在撤回这一步前后**夹住计数（`schedBeforeRetract`）后，M1 变红 2 条。
+⇒ 与 R16.16 评审的批评同型：**断言的「基准点」与「观测点」之间不能夹带其他等价动作**。
+
+**真机闭环（2026-10-13 21:09，用户配合走完「开开关→发消息→关开关→发消息」）**：
+
+| 步骤 | 实测证据 |
+| --- | --- |
+| 开开关 + 一条消息 | 工具**注册**：harness 向模型下发 `set_reasoning_effort` 的 schema（"Updated Tool Schemas"）；用量行后缀 `｜ 思考强度 high（可选 off/low/high/max…）` 回归 |
+| 关开关 + 一条消息 | 报告出现 **`effortTool.retracted:"switch-off"`**（13:09:32.612Z，由 `retractTool` 自己的 schedule 写入，reason=`effort`）；后缀与教学消失；Inspect 清单 `set_reasoning_effort` **0 命中**、`compact_context` **1 命中**、总数 **73** |
+
+⇒ R18.2 修复在真机上确认有效；此前「开关关闭 ⇒ 工具退出清单」只能靠 Inspect 侧面取证、报告无痕。
+
+**两条操作纪律（本轮踩出来的）**：
+
+1. 开关**翻转本身不触发 pre-step** —— 注册/撤回只发生在 pre-step（需有消息经过）或激活期。
+   所以「开关翻来翻去但不发消息」不会产生任何注册/撤回痕迹。
+2. **关插件 ≠ 关开关**：插件被禁用时，工具注册由 DSH 卸载作用域自行回收（不经过我们的 `retractTool`），
+   因此也不会有 `retracted` 痕；两种「关闭」的痕口径不同，排查时先分清关的是哪一个。
+
+### R19 档位说法改中文：深压8% / 标准16% / 浅压24%（2026-10-15 用户要求）
+
+**用户要求（原话两轮）**：先提「把 3 个档位的英文换成中文，低保留，中保留，高保留，对应 8%/16%/24%」，
+随后修正为「**改成『深压8%/标准16%/浅压24%』的说法**」。
+
+**口径（关键设计决定）**：**展示一律中文，英文 id 退为内部/兼容值**。
+
+| 层 | 值 | 为什么 |
+| --- | --- | --- |
+| 展示 | `深压8%` / `标准16%` / `浅压24%` | 用户要的说法；百分比由 `TIERS` **推导**，不写死 |
+| 内部 id / 落盘 / 工具返回值 | `light` / `standard` / `heavy` | `compact-tier.json` 与老会话里存的是 id ⇒ **零迁移**；对外契约不变 |
+| 工具入参 | **中英都能传**（`浅压` → `light`） | 用户在正文/参数里可能写中文；别名解析在 `canonicalTier` |
+
+**实现**：`compact-range.mjs` 新增单一真相 `TIER_LABELS` / `tierLabel` / `tierPct` / `tierText` / `canonicalTier`；
+`compact-tool.mjs`（教学/卡片/工具 schema/回执文案）、`m2.inject.mjs`（压缩自检回执）、
+`m3.compact.mjs`（弹窗 act 文案与日志）全部改走共享格式化器；顺带把卡片里 `0.5×`/`1.5×` 的**倍数魔法**
+换成「按真实窗口折算」（那只是 8/16/24 恰好成倍数的巧合，常量一改就错）。
+
+**验证**：**638 断言全绿**（contract **491** / static 72 / report 54 / boot 21）；R19 新增 9 条
+（4 静态 + 5 行为级：三档说法、教学中英分工、卡片当前档位、中英入参等价、对外仍回 id）；
+**变异 5/5 CAUGHT**（标签退回英文 / tierText 丢百分比 / 别名解析失效 / 卡片退回英文 id / 回执退回英文 id），
+还原后三文件哈希一致。
+
+⚠️ **测试桩的一处隐患（本轮顺手修）**：4 个 compact-tool 测试桩原先注入
+`getRangeApi: () => ({ TIER_NAMES: [...] })` 这种**最小桩**；展示面改走 `tierText` 后会掉进兜底路径
+（退化成英文 id + 百分比拼接）⇒ 断言测的是**兜底**而不是生产口径（又一次「虚假信心」形态）。
+现统一注入**真实模块**（`rangeStub = () => rangeMod19`，与宿主接线同款）。
+
+**教训**：改「说法」不是改字符串，而是**先找唯一真相、再让所有展示点共享它**；否则百分比会在 5 处漂移。
+
+### R20 决策卡「对称化」+ 越线反向建议（2026-10-15，用户同意后实现）
+
+**缘起（用户提出的问题）**：「实践过程，Agent 都喜欢使用 heavy，保留大量的上下文，但是上下文越长模型降智越严重……
+保留更多上下文有助于后续任务开发，而保留更多模型能力本身会降智，这 2 个之间会有平衡点。」
+
+**读代码得到的答案：这不是模型偏好，是卡片把它**劝**过去的（可实证）**：
+
+| # | 结构性成因 | 证据 |
+| --- | --- | --- |
+| 1 | **只量化多留的好处**：卡在 `当前上下文 > 本档位预算` 时只给一句「若先声明浅压24%（保留 240k）：只丢 ~204k（比当前档位少丢 ~80k）——这就是 set-tier 的量化收益」 | 旧 `gainLine` 唯一分支；**从未**量化深压8% 的收益 |
+| 2 | **越线不给方向**：只说「立刻用 `set-tier` 声明档位」，不说选哪档 | 旧 `overLine` 文案 |
+| 3 | 与 R16.12 同型：**缺反馈**（那次是「不切档没有可见代价」⇒ 意愿低；这次是「多留没有可见代价」⇒ 意愿高） | R16.12 台账 |
+
+**修（两条，用户点头后做）**：
+
+1. **两个方向都变数字**（`dirLine`）：`浅压24%（留 240k）⇒ 丢 ~X、压后占用 ≈P%（距 75% ≈N 轮）`；
+   `深压8%（留 80k）⇒ 丢 ~Y、压后占用 ≈Q%（≈M 轮），腾出的空间最多，但近端只剩 80k（后续可能要重读文件）`；
+   并补一句 **「代价对称」**（多留 ⇒ 压后占用高、下次压缩更早；少留 ⇒ 余量大、但摘要更早）。
+   压后占用与轮数由 `afterOf(budget)` 现算（`b/win` 与 `(crit−b/win)·win/delta`）。
+2. **越线反向建议**（`overLine`）：越线时明确给 `声明「深压8%」或「标准16%」`，并解释
+   **「越线时选浅压往往压了等于没压」**——压完仍在线之上会走 `m3` 的「追加官方 overflow 收口」再压一次 = **白多压一轮**。
+
+顺带清掉一处 R19 漏网：卡片里「不要调用（或改用 heavy）」仍是英文 id（我的 R19 静态断言只扫了 `**light**`/`light=深压` 形态）。
+现新增断言：**决策卡内不得出现任何英文档位 id**。
+
+**验证**：**643 断言全绿**（contract **496** / static 72 / report 54 / boot 21）；R20 新增 5 条；
+**变异 3/3 CAUGHT**（双方向退回单方向 / 越线不指明档位 / 删「代价对称」句），还原后文件哈希一致。
+
+**如实记录**：卡片因此变长（双方向 + 代价句 ≈ +150 字符，仅在本卡出现时注入）；
+「三处教学合计 ≤ 3000 字符」的既有预算断言仍通过。
+
+### R21 语义锚点保留 `keepFrom`：模型指位置、插件算预算（2026-10-15 用户提出并拍板 A+B 一起做）
+
+**用户的两轮提问（本轮的起点）**：
+1. 「Agent 能知道自己**需要的**上下文占比么？由此决定哪一档？还是只能大概估算？」
+2. 澄清：「比如现在上下文 600k，里面包含**新旧 2 个需求**，如果最新的需求只在 6% 里面，
+   那么选择压缩 8%，收益是最大的：新需求上下文在 6% 内基本完全保留、又腾出足够多的上下文空间、
+   还避免上一个需求的上下文带来的降智问题。**Agent 能知道新旧 2 个需求的节点在哪么？**」
+
+**结论（本项目的设计判断）**：
+
+| | 供给侧（有多少 / 留下多少 / 压后剩多少） | 需求侧（**新旧需求的语义边界**在哪） |
+| --- | --- | --- |
+| 谁能知道 | **插件**（`surface.nodes` seq 数组、`measure().nodes` 的 `{seq,tokens}`、`eventAt(seq).type`） | **模型**（它刚读过那些消息） |
+| 是否可算 | ✅ 确定性算术（含 `[40k, 窗口×50%]` 夹取） | ❌ 不可算，但**可以指认** |
+| ⇒ 分工 | 插件把锚点换算成 token 预算 | 模型只需"指位置"（`recentUser:N` 或文本片段） |
+
+**实现（A+B 一起，降级链 `text → recentUser → 三档 → 标准16%`）**：
+
+- `compact-range.mjs`：纯函数 `recentUserSeq`（**跳过插件注入的 user/message**，`kind!=='user'` 一律不算）、
+  `findUserSeqByText`（**前缀优先、包含退化**，取最近一条）、`tokensFromSeq`、`resolveAnchorBudget`
+  （预算 = 锚点→末尾 token + 余量 `max(8k, 10%)`，夹取后回 `via/clamped/tried`）；
+  `selectRange` 新增 **`keepFromSeq` 护栏**——范围**绝不越过锚点**（宁可多留，绝不丢新需求），
+  并在护栏生效时**重算 `retainedTokens`**（否则回执会报一个偏小的"保留 ~X"）。
+- `compact-tool.mjs`：`keepFrom` 参数（对象：`{recentUser?:1..3, text?:≤60字}`）、`normAnchor`（越界即非法）、
+  **锚点随档位一起落盘**（跨 toggle/重启有效）、`getAnchor(sid)`；
+  **缺省即清除**旧锚点（"忘记重申"退化为按档位 = 安全方向）。
+- `m3.compact.mjs`：在**压缩那一刻**解析（锚点会随新消息移动）⇒ `retainOverride/anchorSeq/anchorFailReason`
+  三个字段进 `compactWithOwnRange`，`retainSource`（`anchor:text-prefix` / `anchor:recent-user` / `tier`）
+  与 `anchorFailReason` 进 `anchorProbe`、`setCompactVerify`、`rangeInfo`。
+- `m2.inject.mjs`：**「压缩自检」回执必须说清实际用了哪条路**——生效写「保留来源：语义锚点（…）」，
+  未命中写「锚点未命中（原因）⇒ 已按档位兜底」。否则模型以为锚点生效了，而实际退回了三档（静默降级）。
+
+**验证**：**654 断言全绿**（contract **507** / static 72 / report 54 / boot 21）；R21 新增 10 条
+（纯函数 4 + 护栏 2 + 工具 3 + 接线/回执 1）；**变异 6/6 CAUGHT**
+（护栏失效 / 降级链断 / 包含匹配丢失 / 跳过注入失效 / 锚点不落盘 / 缺省不清理旧锚点），还原后哈希一致。
+
+**如实记录两处工程细节**：
+1. 新增教学文字把「三处教学合计」推到 **3036 > 3000**（既有预算断言当场抓红）⇒ 压缩措辞到 2993 通过。
+2. 给 m3 注入 `extractEventText` 时，host 的「代码行 ≤ 320」断言从 320 → **321 抓红** ⇒ 合并到既有注入行（回 320）。
+   ⇒ 两处都是**既有断言在正确工作**，不是回归。
+3. 锚点只在**pre-step 压缩路径**生效（强制线/工具触发同源）；`idleSweep` 走的是另一条路，**本轮未接**（待评估）。
+
+### R21.1 生产事故：`keepFrom` schema 缺 `additionalProperties` ⇒ **工具整条不注册**（2026-10-15，真机测试当场发现）
+
+**怎么发现的（这就是本次"真机多轮测试"的第一个产出）**：用户要求在长上下文会话里实测主路径与两级兜底，
+我按计划先调 `compact_context` 登记锚点 —— **返回 `unknown tool "compact_context"`**：
+工具根本不在我的工具清单里。
+
+**取证（只读，报告字段一次命中）**：
+
+```
+m3.compactTool     = { ok:false,
+  error: "unsupported JSON schema: parameters.keepFrom.additionalProperties must be explicitly true or false" }
+m3.compactToolDiag = { calls:100, enabled:true, installed:false, intents:0 }
+```
+
+**根因**：R21 新增的 `keepFrom` 参数写成 `{ type:'object', description }` —— **没有显式声明
+`additionalProperties`**（true/false 都必须写）。`defineTool` 的校验直接拒收整个 spec ⇒
+`tools.register` 抛错被我们吞下 ⇒ **工具静默不注册**。
+
+**影响面（严重，且是"教学与能力脱节"的经典形态）**：
+- 自 **v0.1.8 激活（13:30 CST）** 起到本修复，`compact_context` 全天不可用 ⇒
+  **模型自主压缩 / 选档 / 指锚点全线失效**（模型只会看到"没有这个工具"）；
+- **强制线自动压缩不受影响**（那条路径不经过工具）⇒ 所以症状很隐蔽：占用照样能被压，只是"模型主动"这条路没了；
+- 更糟的是**教学与卡片仍在喊「调用 compact_context」** ⇒ 模型被教去调一个不存在的工具。
+
+**为什么 654 条断言全绿却没抓住（两层原因，都很典型）**：
+1. 所有 compact-tool 测试用桩 `getDefineTool: (sp) => sp` ⇒ **绕过了 defineTool 的 schema 校验**；
+2. 我随即补的「工具 spec 结构化自检」**首版遍历器写错**：从 `spec.parameters` 取 `.properties`
+   （而 `parameters` 本身就是"参数名 → schema"的映射）⇒ **一个参数都没遍历到** ⇒ 断言恒真。
+   变异 M1 只红了一条窄断言、结构化那条静默通过 —— 又一次「虚假信心」。
+   ⇒ 修正遍历器后，M1（删掉 `additionalProperties`）**红 2 条**、M2（参数写 `required:false`）被既有断言红 1 条。
+
+**修**：
+- `keepFrom` 补 `additionalProperties: false` + `properties: { recentUser:{type:'number'}, text:{type:'string'} }`；
+- 新增 **6.27 结构性自检**：对**两个工具**的真实 spec 全量遍历，规则 = ① `type:'object'` 必须显式
+  `additionalProperties` 且必须有 `properties`；② 可选参数不得写 `required:false`；③ `output.schema` 必须
+  `additionalProperties:false`。**不依赖真 defineTool 可用**（桩绕不过这一层）。
+
+**验证**：**656 断言全绿**（contract **509** / static 72 / report 54 / boot 21）；变异 M1 红 2 条 / M2 红 1 条。
+
+**教训（第三次同类，值得单独记一行）**：
+- 「**静默不注册**」这类事故**无法靠行为测试发现**（工具不在清单里，行为测试只会看到"没人调用它"）——
+  只能靠**对真实 spec 做结构化校验**。这与 R16.16（`required:false` 被拒）**完全同型**，说明"该补的是校验层，
+  不是再写一条断言"。
+- 桩越像真货越好，但**校验层必须有独立断言**；且**断言本身必须变异验证**，否则很容易写出恒真的遍历器。
+
+### R21.2 真机多轮测试（2026-10-15，本会话 614k 上下文）+ 又抓出两处行为级缺陷
+
+用户要求：「现在本会话窗口上下文也比较长了，你来测试下，可以多轮测试，覆盖主路径，一级兜底，二级兜底。」
+—— 用**真实会话**（614k / 1M，61%）跑，结果：**主路径与两级兜底全部符合预期，同时抓出 2 个真实缺陷**。
+
+#### 测试矩阵与实际结果（全部来自 m1-report 取证字段，非推测）
+
+| # | 调用 | 实际结果 | 判定 |
+| --- | --- | --- | --- |
+| ① | `keepFrom:{text:'<不存在>', recentUser:1}` | `anchorProbe = {ok:true, via:'recent-user', seq:3360, tokens:3346, margin:8000, budget:40000, clamped:true, tried:['text:not-found']}`；`retainSource='anchor:recent-user'`，`rangeSource='own'`，`retainedTokens=40632`，`shadowedTokens=365356`；回执「保留来源：语义锚点（recent-user）」 | ✅ 主路径 + **一级兜底**（text→recentUser）全对；**锚点预算压过档位**（240k 档位被 40k 锚点预算替代）也符合设计 |
+| ② | `keepFrom:{text:'<也不存在>'}`（无 recentUser） | `anchorProbe={ok:false, tried:['text:not-found'], reason:'text:not-found'}`；`rangeProbe.retainSource='tier'`、`anchorFailReason='text:not-found'`、`why:'nothing-to-compact'` | ⚠️ 解析链正确，但**回执丢了降级句**（见缺陷②） |
+| ③ | `keepFrom:{recentUser:9}`（越界） | 回执：「⚠️ `keepFrom` 形状非法，已忽略（本次按档位）」；档位显式传入未被误伤 | ✅ 工具侧边界正确 |
+
+#### 缺陷①（v0.1.9 及以前）：**不传 `tier` 会重置会话档位**
+
+- **现象**：测试② 只传 `keepFrom`（卡片正是这么教的）⇒ 回执显示「标准16% 档」，而本会话登记的是**浅压24%**；
+  落盘文件 `compact-tier.json` 里本会话的 `tier` 从 `heavy` **被改写成 `standard`**。
+- **根因**：`compact-tool.runTool` 把 `args.tier == null` 也交给 `normTier` ⇒ 返回 `standard` ⇒ `setTier` 覆盖 + 落盘。
+  与卡片/README/工具 description 三处明文承诺的「**不传 = 沿用已登记档位（不是重置）**」直接矛盾。
+- **影响**：任何"只给锚点"的调用都会**静默降级**用户/模型此前选定的档位，而且**落盘**（跨 toggle 仍错）。
+- **修**：`tierGiven = args?.tier != null && String(args.tier).trim() !== ''`；缺省时取 `getTier(sid)`（沿用），
+  且回执改写为「档位沿用「浅压24%」」；显式传入仍照常改档；从未登记 ⇒ 标准16%（兜底语义不变）。
+
+#### 缺陷②（v0.1.9 及以前）：**锚点失败痕在两条 return 路径上丢失**
+
+- **现象**：测试② 的回执只有「已执行但判定无需压缩（标准16% 档，保留 ~160k）」，**没有**「锚点未命中（text:not-found）⇒ 已按档位兜底」。
+- **根因**：`compactWithOwnRange` 里 `nothing-to-compact` 的**提前 return** 与 `official()` 兜底 return 都没带
+  `retainSource`/`anchorFailReason` ⇒ `setCompactVerify` 只能靠 `?? 'tier'` **猜**保留来源，锚点失败原因直接变 `null`
+  ⇒ m2 的回执渲染（`else if (v.anchorFailReason)`）拿不到东西。
+- **影响**：**降级链在模型可见面上断了一环**——模型以为锚点生效、实际已退档位（正是本项目列为大忌的静默降级）。
+- **修**：两条 return 都补 `retainSource` / `anchorFailReason` / `tier`（行为级断言直接调 `compactWithOwnRange` 验返回对象）。
+
+#### 一处虚惊（记录以免后人重查）：`rangeProbe` 的 `startIdx/endIdx` 是**被摘要区间**的边界
+
+测试① 的现场是 `anchorIdx:927` 而 `endIdx:815` —— 看起来"锚点在被压区间里"，我一度怀疑护栏失效。
+**实际正确**：`startIdx/endIdx` 记的是**被摘要（压掉）区间**在 surface 上的位置，保留区在其后
+⇒ `endIdx=815` 表示"815 之前被摘要、816 起原样保留"，锚点 927 落在保留区 ✓（`retainedTokens 40632 + shadowTokens 365356 = 405,988` 与量测总量吻合）。
+字段语义在 m3 源码注释中有写，但**字段名极易误读** ⇒ 本行留档。
+
+#### 验证
+
+- **663 断言全绿**（contract **516** / static 72 / report 54 / boot 21）；
+- 新增 6.28 段 **7 条**行为级断言（无一条是正则/源码级）：档位沿用（含落盘往返、显式改档、从未登记兜底）、
+  两条 return 路径的留痕、m3→m2 回执端到端；
+- **变异验证 3/3 CAUGHT**：M1 回退档位沿用 ⇒ 红 2 条；M2 回退"无需压缩"留痕 ⇒ 红 2 条；M3 回退 official 留痕 ⇒ 红 1 条。
+
+#### 教训
+
+- **"文档承诺"必须与"代码缺省语义"逐字对账**：卡片、README、工具 description 三处都写了「不传 = 沿用」，
+  而实现是「不传 = standard」。**同类缺陷的通用形态**：缺省值语义（carry vs reset）没有任何断言覆盖，
+  因为所有既有测试都显式传了 `tier`。
+- **提前 return 是留痕的高危区**：函数有多个出口时，新增字段很容易只加到主路径（本例 1 个字段漏在 2 条路径上）。
+  对策：让返回对象**形状统一**，并用行为级断言逐条出口验证。
+- **真机测试的价值再次被证明**：这两处在 656 条断言下全绿，只有真跑一次（还带真实落盘）才暴露。
+
+#### 真机复现确认（v0.1.10 toggle 后，同一会话）
+
+| 检查 | 期望 | 实际（m1-report / compact-tier.json） | 判定 |
+| --- | --- | --- | --- |
+| 缺陷① 沿用 | 只传 `keepFrom` ⇒ 档位不重置 | `lastCompactTool = {action:'compact', tier:'heavy', **tierVia:'carry'}`, 工具回执「已登记，**档位沿用「浅压24%」**」；落盘本会话仍为 `tier:'heavy'` | ✅ |
+| 缺陷② 留痕 | 回执必须出现降级句 | `lastCompactVerify = {state:'no-need', tier:'heavy', retainBudget:240000, **retainSource:'tier'**, **anchorFailReason:'text:not-found'**, rangeSource:'none', skipWhy:'nothing-to-compact'}`；回执「已执行但判定无需压缩（浅压24% 档，保留 ~240k，**锚点未命中（text:not-found）⇒ 已按档位兜底**）」 | ✅ |
+| 收尾 | 不传 `keepFrom` ⇒ 清除锚点 | `set-tier`（不传 tier、不传 keepFrom）⇒ 回执「档位沿用「浅压24%」」，落盘 `anchor: null` | ✅ |
+
+（三级链条至此在真机上全通：主路径 `anchor` → 一级兜底 `text→recent-user` → 二级兜底 `→tier`，每一跳都有痕。）
+
+### R22 档位说法全中文：把「英文 id 清零」变成可执行断言（2026-10-15）
+
+用户要求：「模式行动前，不会再说 heavy 或 standard 等英文吧？而且前面修改的中文 深压8% 或 标准16% 等」。
+
+R19 那次只把**教学 / 卡片 / 回执正文**换成了中文；本次审计**运行期产物**，抓到 4 条问题：
+
+| # | 泄漏点 | 形态 | 性质 |
+| --- | --- | --- | --- |
+| ① | 工具返回值 | `{"ok":true,"tier":"heavy",…}` —— 模型直接读到的 JSON 里是英文 id；`output.schema` 的说明还写着「内部 id 为 light/standard/heavy」 | 真泄漏（模型会照抄进正文） |
+| ② | m2 回执兜底 | `${tApi?.tierText?.(v.tier) ?? v.tier} 档` ⇒ 工具域未加载时回退 `heavy` | 异常路径泄漏 |
+| ③ | m3 HUD 行 | `?? 'standard'` ⇒ 同上（这条还进弹窗 tooltip，属用户可见面） | 异常路径泄漏 |
+| ④ | `labelOf` 兜底 | `rangeApi()?.tierLabel?.(t) ?? String(t)` ⇒ 范围域未加载时吐出 **`standard16%`**（英文 id + 的中文百分比混合） | 异常路径泄漏（真机审计实测抓到） |
+| ⑤ | **隐患（最危险）** | `canonicalTier` 只认 `深压/标准/浅压` 与英文 id，**不认卡片上的「浅压24%」** ⇒ 模型照卡片回填 `tier:'浅压24%'` 会被判 unknown ⇒ **静默退回标准16%** | 静默降级 |
+
+**修**：
+- 工具返回值 `tier` 改**中文标签**（`textOf(tier)`），`output.schema` 说明同步改为「中文标签（如「浅压24%」）」；
+- m2 回执兜底链：`getCompactToolApi().tierText` → `getRangeApi().tierText` → **不显示档位段**（**任何路径都不回退英文 id**）；
+- m3 HUD 兜底改中文中性说法（`'默认档'`）；
+- `labelOf`/`pctOf` 增加**静态中文兜底** `TIER_FALLBACK`（并导出为 `TIER_DISPLAY_FALLBACK` 供"单源守卫"断言比对）；
+- `canonicalTier` 增加**前缀匹配**：以中文档位词开头即视为该档（「浅压24%」「深压8%」「标准16%」都能回填）；
+- 教学文案去掉英文枚举（brief 的「或英文 light/standard/heavy 均可」→「**用中文档位名**，「浅压24%」这种完整写法也认」），description/参数说明/card 均明示「正文一律写中文名」。
+
+**验证**：**669 断言全绿**（contract **522** / static 72 / report 54 / boot 21）。
+新增 6.29 段（R22）共 **6 条**，核心是一条**逐段文本扫描**：把 description、两个参数说明、brief、三种卡片、五种回执形态全部生成出来，
+断言**没有一段**含英文档位 id（正则 `(^|[^A-Za-z])(light|standard|heavy)([^A-Za-z]|$)`）；另加"范围域未加载"的降级路径扫描。
+**变异 4/4 CAUGHT**：M1 工具返回值改回 id ⇒ 红 5 条；M2 去掉前缀匹配 ⇒ 红 1 条；M3 兜底改回 `String(t)` ⇒ 红 2 条；M4 回执兜底改回 `v.tier` ⇒ 红 2 条。
+
+**教训**：
+- 「改成中文」不是一次性文案替换：**异常路径的兜底字符串**（`?? id`、`?? 'standard'`）和**工具返回值**同样在模型可见面上，
+  且它们只在模块加载失败时出现 ⇒ 常规测试与真机都难碰到，只有"把模型可见文本整体扫描一遍"才抓得到。
+- **对外的说法与内部的键必须分层**：内部/落盘继续用 `light/standard/heavy`（老会话零迁移），对外一律中文标签；
+  断言要**同时钉住两侧**（`out.tier === '浅压24%'` 且 `getTier() === 'heavy'`），否则改一侧就会静默破坏另一侧。
+- 教学里**列举英文 id 去禁止它**是反效果（提高其显著度）⇒ 改为正面表述「正文一律写中文名」。
+
+### R23 锚点来源中文描述 + 思考强度「低(low)」（2026-10-15）
+
+用户要求：「如果是 `keepFrom:{text:'…'}` 或 `keepFrom:{recentUser:N}`，应该怎么显示的？思考强度的改成
+中英文，比如低(low)」。
+
+审计出两处显示不符合"全中文"：
+
+| # | 位置 | 旧显示 | 性质 |
+| --- | --- | --- | --- |
+| ① | 压缩回执的锚点来源 | 「保留来源：语义锚点（**recent-user**）」/「（**text**）」——直接 slice `anchor:` 后的**内部 token** | 模型可见英文 token |
+| ② | 思考强度（用量行后缀 / 一次性教学 / 错误文案 / 换档提醒 / HUD tooltip） | 「思考强度 **high**（可选 **off/low/high/max**）」「档位 "**high**" 不在…」 | 模型与用户可见裸英文 |
+
+**① 锚点显示（改后）**：
+- `keepFrom:{recentUser:N}` ⇒ 回执「保留来源：语义锚点（**从最近第 1 条你的消息起**）」；
+- `keepFrom:{text:'…'}` ⇒ 回执「保留来源：语义锚点（**按文本「上下文600k 新旧两需求」定位**）」（片段截 12 字）；
+- 缺 `anchorLabel`（旧回执/降级路径）⇒ 退**中文**兜底「你指定的位置」，**任何路径都不出现 `recent-user`/`text`**。
+- 实现：m3 在解析锚点处新增 `anchorLabelOf(want)`（含 N 与文本片段）写进 verify；m2 回执只渲染 `anchorLabel`。
+  工具侧回执（登记时）本来就是中文（「从最近第 1 条你的消息起全部保留」/「按文本「…」定位那条消息」）✓。
+
+**② 思考强度显示（改后）**：统一 `中文(id)` 形式 —— **低(low) / 高(high) / 最高(max) / 关闭(off) / 中(medium) / 最低(minimal)**。
+- 单一真相：`effort.mjs` 导出 `EFFORT_LABELS` + `effortLabel(id)` + `effortLabels(list)`；
+- 应用点：用量行后缀（含「用户刚把档位从 低(low) 调到 最高(max)」）、一次性教学（当前档 + 可选集）、
+  校验错误文案与 `options` 返回、换档提醒、工具回执（`effort: '最高(max)'`）、HUD `currentLabel` 与 `lastSwitch.from/to`；
+- **客户端不维护第二份映射**：host 在 `hudPayload` 里给 `currentLabel`，client 只用它（`hostInfo.currentLabel || effort`）；
+- **未知档位 ⇒ 原样显示 id**（档位集合由模型/适配器决定，插件不猜中文）；
+- **入参兼容回填**：`parseEffortInput()` 接受 原始 id / `中文(id)` / 纯中文 ⇒ 一律回到原始 id
+  （内部与 API 参数**始终用 id**）。显示改成中英后模型极可能照抄 `高(high)`，不兼容就是白跑一趟。
+
+**验证**：**677 断言全绿**（contract **530** / static 72 / report 54 / boot 21）。新增 6.30 段（R23）**6 条**：
+锚点回执三态（recentUser / text / 缺 label 兜底）端到端 + m3 接线 + 思考强度三处文本扫描（剥掉「中文(id)」后不得再有裸 id）+ 工具回执接线。
+**变异 4/4 CAUGHT**：M1 回执改回内部 token ⇒ 红 3 条；M2 后缀改回裸 id ⇒ 红 5 条；M3 入参归一恒等 ⇒ 红 1 条；M4 m3 不产出中文描述 ⇒ 红 1 条。
+
+**附带**：本次改了 `client.js`（tooltip 用 `currentLabel`）⇒ 部署除了 plugin toggle **还需刷新页面**。
+
+**教训**：
+- 「内部 token 泄漏」与「异常兜底回退英文」是同一类病：**凡是把内部键直接拼进给模型看的字符串**，早晚会露出来；
+  正确做法是**在产出侧（m3/effort）就给出面向人的描述**，显示侧只做渲染。
+- 显示改中英并排后，**入参必须同时兼容回填**，否则"看得懂却传不进去"——这是显示层改动的连带契约，
+  必须与显示改动同批发布并断言（本节 `parseEffortInput`）。
+
+### R24 占用口径对齐 DSH 表盘 + 回执报「压缩后占用」（2026-10-15）
+
+用户真机反馈：「当时压缩时，DSH 确实是显示 75% 的，压缩完成后显示 40%」，而**模型在正文里写出「回到 ~24%」**——
+三个数互不相同，看起来像"压缩逻辑不对"。
+
+**根因：同一个物理量在 DSH 里有三套口径，我们用的是第三套。**
+
+| 口径 | 来源（DSH 源码/文档原文） | 那个会话的值 |
+| --- | --- | --- |
+| **表盘头条** | `ContextMeter.js#contextOccupancy`：`usedTokens = pressure?.projectedTokens ?? pressure?.pressureTokens` —— 依次是「**下一请求的 prompt 预计大小**」「**最新一次 provider 实报的 prompt 大小**」 | 压缩前 **75%**(748K) → 压缩后 **40%**(408K) |
+| **弹窗三行** | `contextBreakdown`：**启发式**组成（`systemTokens/toolsTokens/messageTokens`），文档明说「the context's **composition, not its provider-billed size**」，`messageTokens` **includes superseded prompts**，三个数都**不含** route image pricing / file-handle projection | 2.2K + 14.7K + 255K = **272K** |
+| **插件旧用** | `measure().totalTokens`（= `nodes[].heuristicTokens` 之和，同一份启发式） | **510K(51%)** |
+
+⇒ 弹窗三行与头条差 136K **按设计就是不同量**（组成估值 vs provider 路由感知预估），不是"上下文丢了"。
+**真正的缺陷是我们自己的**：`measureRatio` 用 `totalTokens` 判定压缩线与显示 ⇒ 与用户看到的表盘不是同一口径，
+真机后果是**按 75.1% 提前触发压缩、白压掉 243K**（DSH 口径当时只有 40%）；而且回执不含压缩后占用，
+模型只能从「浅压24% 档，保留 ~240k」里瞎推 ⇒ 写出「回到 ~24%」。
+
+**修法（R24）**：
+1. `measureRatio`：`used = projectedTokens ?? pressureTokens ?? totalTokens`（**与 DSH 表盘同口径**），
+   并新增 `total / surface / projected / reported / basis` 取证字段（`basis` ∈ 下一请求预估｜provider 实报｜本地启发式(退化)）；
+2. **用量行**：`used <DSH 口径> (40.8%, 下一请求预估) ｜ surface 248K`，启发式 total 相对差异 ≥5% 时才附上
+   （<5% 不附 ⇒ 每轮注入零噪声增长）——两个数都可解释，不再自相矛盾；
+3. **回执**：`ratioAfter / usedAfter` **每条路径都取**（executed 实测；official 收口后**再测一次**；no-need 用当前值），
+   回执念出「**压缩后占用 ≈41%（408k）**」⇒ 模型不再从档位名猜百分比；
+4. 决策卡与审计行同源（`usedTokens: used`）⇒ 插件显示、触发判定、DSH 表盘三者一致。
+
+**验证**：**684 断言全绿**（contract **537** / static 72 / report 54 / boot 21）。新增 6.31 段（R24）**7 条**：
+三档口径优先级（projected → pressure → 启发式退化）+ 用量行两例（含 <5% 不附 total）+ 回执端到端 + 接线。
+**变异 4/4 CAUGHT**：M1 `used` 退回 `totalTokens` ⇒ 红 3；M2 回执不念占用 ⇒ 红 1；M3 verify 丢 `usedAfter` ⇒ 红 1；
+M4 启发式 total 无条件附上 ⇒ 红 1。
+
+**教训**：
+- **同一个物理量在不同口径下有三个值**（provider 实报 / 下一请求预估 / 启发式组成）。凡是要报给用户或模型的数，
+  先确认"宿主表盘用的是哪个"，**沿用它的口径并标明来源**；各报各口径的结果就是用户看到「插件说 24%、DSH 说 41%」这种
+  自相矛盾，进而怀疑整个压缩逻辑。
+- **官方投影字段的语义必须读源码，不能按名字猜**：`measure().totalTokens` 听起来是"当前占用"，
+  实际是**日志节点的启发式总和（含被取代的提示）**；`contextBreakdown` 听起来是"计费组成"，
+  实际是**不含路由感知定价的组成估值**。这类"名字很合理但语义不同"的字段，是本项目第四次踩到的同类坑。
+- 压缩的**触发口径与显示口径必须同源**：否则会出现"按 A 口径触发、按 B 口径解释"的错位，
+  表现为提前压缩（白花钱）或该压不压。
+
+#### R24.1 自查出的真缺陷：`projectedTokens` 只在 wire.view 里，读 state 拿到 undefined
+
+R24 上线（v0.1.13）后当晚自查发现：DSH 的 `projectedTokens` **只存在于 token-meter 的 `wire.view`**
+（发给客户端的形状），而 `sessionProjections.stateOf(..., 'contextPressure')` 拿到的是 **state**
+（只有 `surfaceTokens / pressureTokens / sampledSurfaceTokens`）⇒ R24 的 `pressureRec?.projectedTokens ?? ...`
+恒为 `undefined`，于是退回 `pressureTokens` —— **那是上一次 provider 上报的值，压缩后是过期的**：
+真机 `session-54597a24` 压缩后 `state.pressureTokens` 仍是 **748,806（74.9%）**，而表盘当时是 51% → 40%
+（**比改用 totalTokens 之前更糟**：会报 75%）。
+
+修法：**照抄 DSH 的 view 公式自算**（token-meter 源码原文）：
+```js
+projectedTokens: Math.max(0, pressureTokens + surfaceTokens - sampledSurfaceTokens)
+```
+语义 =「provider 实报的 prompt 大小 **+** 从那以后 surface 的增量」= 下一请求的预计大小。
+真机配对验证（同一帧三数）：`748,806 + 247,859 − 487,049 = 509,616`（51%）✓ 与表盘当时一致；
+等下一次 provider 上报（408K）后表盘变 41% ✓ —— 用户看到的两个数都能复现。
+
+#### R24 附：用户问「表盘 408K，但三行只有 2.2+14.7+255=272K，缺的 ~136K 是什么？」
+
+**不是丢了内容，是表盘头条与三行来自两个不同的计数器**（DSH 源码/文档原文）：
+
+| 面板元素 | 来源 | 口径 |
+| --- | --- | --- |
+| 头条 `~408K / 1M` | `contextOccupancy`：`pressure.projectedTokens ?? pressure.pressureTokens`（`projectedTokens` 的公式见上），图例脚注 `~${formatTokens(context.usedTokens)}` | **provider 锚定**：provider 实报的 prompt + surface 增量；`route-pricing.js`「replaces attachment-block heuristics with **the image and file representations sent to the routed model**」 |
+| 三行（系统/工具/对话） | `contextBreakdown`，图例是**原始值** `~${formatTokens(breakdown[row.key])}`（**不按头条缩放**，只有进度条按比例切分） | **固定启发式组成**：文档明说「the context's composition, **not its provider-billed size**」「`messageTokens` … **including superseded prompts**」「**not route image pricing or file-handle projection**」 |
+
+⇒ 缺的 ~136K = **启发式不计入而 provider 计入的那部分**：图片/附件的真实路由定价、文件句柄投影、
+以及固定估算与真实分词的差。实测配对（`session-54597a24` 08:16:56 同一时刻）：
+provider 实报 **527,042** vs 启发式 surface **343,387**（+系统 2,161）⇒ **+184K** 都是这类内容，
+与面板上的 136K 同一量级 ✓（那是网页样式任务，截图/读文件很多）。
+第三个数 `measure().totalTokens`（510K）又是"启发式**日志**节点总和（含被取代的提示）"——三套口径各自自洽。
+
+**结论**：面板**不会、也不该**把这三套口径的数字相加；回答"占用多少"要认准**表盘口径**（provider 锚定）。
+插件 R24/R24.1 起用同一个口径（含自算投影），因此插件报的数与表盘一致。
+
+### R25 占用账本（报告四件套）+ 口径公式单源（2026-10-15）
+
+用户要求：「加」——把「provider 实报 / 计算投影 / 启发式 surface / 三行组成」记进报告，
+以后"表盘 408K 而三行只有 272K，缺的 136K 是什么"**直接从报告读**，不必再挖 asar。
+
+**实现**：
+1. `core.mjs` 新增两个**纯函数**（**唯一一份**实现）：
+   - `projectedFromPressure(rec)` → `{ used, projected, reported, surface, sampled, basis }`：
+     照抄 DSH `wire.view` 公式 `max(0, pressureTokens + surfaceTokens − sampledSurfaceTokens)`；
+     降级链 = view 直给 → **自算** → provider 实报(无增量参照) → 无数据，`basis` 逐档标明来源；
+   - `contextLedgerOf(pressure, measure, breakdown)` → 账本：
+     `providerReported / sampledSurface / projected / providerSurface / displayUsed / basis`
+     ＋ `heuristicTotal / heuristicSurface / breakdown{system,tools,messages,rest} / breakdownSum`
+     ＋ `gapVsBreakdown`（两口径之差，**纯读数、不参与判定**）。
+2. `m1.snapshot.mjs`：每个会话行新增 `contextLedger`（原先只有 `pressureProjection` 与
+   `breakdownSummary`，且**都不含投影值**）；`summarizeBreakdown` 增加 `tools`/`messages` 分项
+   ⇒ 报告与面板三行**逐项**可对。
+3. **单源**：两个函数既作命名导出（测试可直接用），又挂进 `createCore` 出口，由宿主**同 ts** 注入
+   M1（账本）与 M3（触发/显示）；m3 里不再保留公式副本（守卫：m3 源码出现 `Math.max(0, reported` 即红）。
+
+**真机样例（已写成断言）**：`748806 + 247859 − 487049 = 509616`；
+三行 `2161 + 200000 + 58256 = 260417` ⇒ **gapVsBreakdown = 249,199**（图片/文件路由定价 + 分词差）。
+
+**验证**：**689 断言全绿**（contract **542** / static 72 / report 54 / boot 21）。新增 6.31 段内 **4 条**：
+`projectedFromPressure` 降级链、`contextLedgerOf` 账本（含真机 249,199）、**单源守卫**、m1 接线。
+**变异 3/3 CAUGHT**：M1 公式丢掉 `sampled` 项 ⇒ 红 4；M2 m1 不落账本 ⇒ 红 1；M3 m3 里重新长出第二份公式 ⇒ 红 1。
+
+**附带**：`host.impl.mjs` 有 **代码行 ≤320** 的静态预算（D1 已完成的判据），本次新增依赖被**并进既有行**
+（未靠删注释凑数）——预算已接近上限（320/320），下次再动 host 接线前先考虑抽模块。
+
+**教训**：跨模块共享的**口径公式必须单源**（命名导出 + 注入），否则"同一物理量两份实现"必然漂移——
+R22（档位标签）、R23（锚点显示）已各踩过一次，R24.1 又踩一次（state/view 字段语义不同）。
+凡是"读一个字段就算数"的地方，先确认**该字段在哪个形状里存在**。
+
+### R26 压缩回执「显式消歧」：档位名里的百分比 ≠ 占用（2026-10-15）
+
+用户追问：「后续比如 75% 压缩后显示 40%，Agent 能准确知道是 40% 了吧？不会误认为是 24%」。
+
+**残留风险审计**：R24 已在回执里加了「压缩后占用 ≈X%（Yk）」，但**同一句里仍带着「浅压24% 档」与
+「保留 ~240k」两个含 24 的数字**——模型当初正是从这儿挑走"24%"的（先例：真机写出「回到 ~24%」）。
+只报一个数不够，**两个数字同句出现时必须写清谁是谁**。
+
+**修法**：
+1. 回执改成「**压缩后占用 ≈51%（510k）**——档位名里的百分比是**保留预算比例、不是占用**；
+   provider 下次实报后可能略降」；
+2. 「保留 ~240k」→「**保留预算** ~240k」（去掉与占用同形的写法）；
+3. 预说明"可能略降"：该数是**压缩那一刻**的 provider 锚定投影（真机 51%），provider 实报新 prompt 后
+   会落到 40%——每轮用量行的 `used` 会同步更新；不预先说明，模型下一轮看到差值又会去猜。
+
+**模型实际读到的回执**（测试里打印出来的原文）：
+```
+【压缩自检】你上次请求的压缩**已执行**（浅压24% 档，保留预算 ~240k）：省 ~243.3K token，
+**压缩后占用 ≈51%（510k）**——档位名里的百分比是**保留预算比例、不是占用**；
+provider 下次实报后可能略降（保留策略 own，69000ms）。
+```
+配合**每轮**用量行 `used 408000 (40.8%, 下一请求预估)`，模型任何时刻都有一个**与表盘同口径**的活值。
+
+**验证**：**690 断言全绿**（contract **543** / static 72 / report 54 / boot 21），新增 R26 端到端 1 条
+（真机帧：必须写出 51% 且不得把「浅压24%」当占用）+ 强化 R24 回执断言（消歧句、`保留预算` 用词）。
+**变异 2/2 CAUGHT**：M1 去掉消歧句 ⇒ 红 2；M2 改回「保留 ~」⇒ 红 1。
+
+### R27 决策行节奏：每轮开头一次 + 中途变更再一次（2026-10-15）
+
+用户截图（长任务、占用停在 ~57%）：**同一轮里每个步骤**都出现一对
+`档位决策：保持 最高(max)｜理由…` + `压缩决策：不压｜占用 ~57%｜理由…`。
+
+**机制**（读代码定位）：① 决策卡在占用 ≥ 智能压缩线（默认 30%）的**每一轮**都注入，卡里写着
+「本卡出现时，先落一行决策」；② 换档教学写着「阶段变化时留一行档位决策」⇒ 模型在多步轮次里把
+**每一步**都当成一次"阶段变化"，于是每步都贴同一行。
+
+**用户给出的口径（决定性）**：
+> 可以每轮开头的是否落决策，中途如果有变更则再落决策……不然就保持每轮开头根据下达任务落一次决策即可。
+
+**实施**：
+1. **先走的弯路（如实记录）**：我先把**卡片改成稀疏**（本会话首次 / 占用涨 ≥5pp / 隔 ≥20 轮）并已写进断言——
+   用户随即澄清"每轮开头落一次即可" ⇒ **撤销稀疏化**：卡照旧**每轮一张**（它是每轮决策的提醒位），
+   真正要改的是**决策行的作用域**。
+   ⚠️ 教训：用户报"频率"问题时，**先问清期望节奏再改机制**；机制改错方向会让"本该有的提醒"一起消失。
+2. **卡内文案**：`本轮开头先落一行决策：一轮只写一次；中途真的改了决定（压缩/升或降档）再补一行，其余步骤不要重复。`
+3. **换档教学**：`每轮开头评估一次并落一行档位决策（含「不变」）……一轮只写一次；中途真的换档（升/降）时再补一行，其余步骤不要重复贴同一行。`
+4. 一次性说明**不动**（卡仍每轮一张 ⇒ 「以卡为准」的承诺无需改口径），R16.15 的「要求绑定提醒通道」也保持成立。
+
+**验证**：**694 断言全绿**（contract **547** / static 72 / report 54 / boot 21）。R27 段 4 条：
+卡每轮一张的**行为级**（连发 3 轮都在）+ 三处**文本级**作用域。
+**变异 3/3 CAUGHT**：M1 删卡内作用域 ⇒ 红 2；M2 删换档教学作用域 ⇒ 红 1；M3 卡改稀疏 ⇒ 红 5。
+
+**附带（硬约束）**：`R16.15 三处教学合计 ≤ 3000 字符` 被本轮顶到 **3001**，靠去掉斜杠两侧空格压回 2999——
+该预算是硬约束 ⇒ **要加文案必须先减**（这次差点靠"改断言"绕过，选择了改文案）。
+
+### R28 非插件压缩的**失败原因**必须可见（2026-10-15）
+
+真机（`session-899bfaca`）：用户连试 **3 次 `/compact`**，UI 三次红字
+`Compaction could not produce a useful summary.`——查 DSH 源码，这是 `@deepseek-ai/dsh-command-compact`
+把手动压缩的闭集错误码翻成人话，对应 `ManualCompactionErrorCode = summary`
+（闭集：busy / cancelled / changed / **summary** / commit / persistence）。
+
+**我们记到了这三次**（`hud-acts.json`）：
+```
+19:45 · 手动压缩（/compact） · 失败
+19:45 · 手动压缩（/compact） · 失败
+19:46 · 手动压缩（/compact） · 失败
+```
+**但只有「失败」两个字**，两个缺口：
+1. **原因没进用户可见面** —— `error` 只落在内存态 `state.m3.lastEngineCompact.error`，面板行（也是
+   `hud-acts.json` 里唯一留存的东西）不写原因 ⇒ 事后无法回答"为什么压不动"；
+2. **这条路径不触发报告快照** —— `noteEngineCompaction` 里没有 `schedule(...)` ⇒ 真机上 19:45 的失败
+   直到我读报告时（19:41 的 boot 快照）都**没进报告**。
+
+**修法（R28）**：
+1. `COMPACT_FAIL_LABELS` + `failWhy(error)`：把 DSH 失败码翻成中文短语
+   （summary→摘要无法生成 / changed→选中历史已变化 / busy→有压缩在跑或会话非空闲 / cancelled→已取消 /
+   commit→提交未干净完成 / persistence→会话保存失败）；**认不出码 ⇒ 截断原文照抄，绝不编造**；
+2. 面板行改成 `… · 失败（摘要无法生成）`；记录同时留 `error`（原始）与 `reason`（中文短语）；
+3. 记录后**立刻 `schedule('engine-compact', 300)`** 请求一次报告快照（成功/失败都落）。
+
+**另据 DSH 事件 schema**（源码原文）：`compaction/end: { compactionId, sourceCommandId?, turn, error? }`
+—— **失败就是带 `error` 的 `compaction/end`** ⇒ 我们唯一的钩子（host.impl 的 `compaction/end` 分支）
+本来就是对的，缺的只是"把原因显示出来 + 落盘"。
+
+**验证**：**698 断言全绿**（contract **551** / static 72 / report 54 / boot 21）。R28 段 4 条行为级
+（映射 / 记录字段 / 未知码截断 / schedule 落快照）。**变异 3/3 CAUGHT**：M1 不翻译失败码 ⇒ 红 2；
+M2 不落快照 ⇒ 红 1；M3 记录不带 reason ⇒ 红 1。
+
+**诚实边界**：我们自己的压缩**也用同一个官方摘要后端**（自选范围仍由官方生成摘要）⇒
+`summary` 这类失败同样可能打到我们；差别在于 ① 我们**自己选范围**（区间更可控）、② 结果必须回报
+（回执明确「已执行 / 未执行（原因）」）、③ 失败也留痕。**不能承诺"我们压就一定成功"**。
+
+### R29 手动压缩不误报「引擎抢先」+ 压缩后投影偏高要标注（2026-10-15）
+
+用户手动 `/compact` **成功**后（19:54 `session-899bfaca`），插件账本给出四口径前后对比：
+
+| 口径 | 压缩前 | 压缩后 | 变化 |
+| --- | --- | --- | --- |
+| 表盘头条（provider 锚定投影） | 333,858（33.4%） | **131,440（13.1%）** | −202,418（−20.2pp） |
+| 系统提示词 | 2,172 | 2,172 | 0 |
+| 工具定义 | 15,612 | 15,751 | +139 |
+| 对话消息 | 221,980 | **4,062** | **−217,918** |
+| 三行合计 | 239,764 | 21,985 | −217,779 |
+| 日志总量（启发式） | 334,525 | 131,633 | −202,892 |
+| 缺口 `gapVsBreakdown` | 94,094 | 109,455 | +15,361 |
+| 实际 surface | 224,103 | 6,185 | −217,918 |
+
+⇒ 压缩确实生效（消息侧几乎清空）。注意 `/compact` 用的是**引擎自己选的范围**——我们登记的档位
+（浅压24%）对**命令路径无效**，所以它比我们的档位策略激进得多（消息只剩 4k）。
+
+**暴露两个问题（本轮修掉）**：
+1. **「引擎抢先」误报**：记录写成
+   `手动压缩（/compact） · 引擎抢先：我方上次估计 33.4% ＜ 我方线 75%（引擎在 step 边界判定，排在插件之前） · 压后占用 13.1%`
+   ——用户主动压的，没有任何"抢先"。根因：`preempted` 只比比例、没判 `kind` ⇒ 现加 `kind === 'engine'`。
+2. **压缩后投影系统性偏高**：`projected = 131,440（13.1%）`，而当前 surface 只剩 6,185（真实约 **2.4%**）。
+   公式 `provider实报 + (当前 surface − 上报时 surface)` **假设"非 surface 开销"不变**，大压缩后那份旧开销
+   （`350,476 − 225,221 = 125,255`）仍留在分子里 ⇒ 要等 provider 实报新 prompt 才回落。
+   方向**偏高 = 保守**（不会导致"该压没压"）⇒ 只做**标注**：`stale`（surface 比上报时缩水 >50%）时
+   用量行附「**provider 待刷新**」，提醒这不是"现在有多大"。
+
+**验证**：**702 断言全绿**（contract **555** / static 72 / report 54 / boot 21）。R29 段 4 条
+（stale 两例 + 用量行两例 + 手动/自动对比）。**变异 3/3 CAUGHT**：M1 手动也标抢先 ⇒ 红 1；
+M2 不标 stale ⇒ 红 1；M3 用量行不写标注 ⇒ 红 2。
+
+**过程教训（值得记）**：本轮我用 PowerShell `(Get-Content -Raw) -replace … | Set-Content -Encoding UTF8`
+回写 `test/contract.mjs`，结果写入 **BOM**（Node 解析 `#!/usr/bin/env node` 直接失败）并改变全文件行尾
+（diff 1686/1857 行）。恢复 HEAD + 用 `edit` 工具重做即恢复（最终 diff 70 行）。**结论：仓库源码一律用
+edit 工具改，不用 shell 回写**——shell 回写不受版本守卫保护，且会静默改编码/行尾。
+
+### R30 决策行"每步重复"是**模型模式**，不是卡每步注入（2026-10-15）
+
+用户反馈：「决策卡的问题还是存在，toggle 过插件，但是没有重启 DSH」。
+
+先澄清部署口径：**`plugin/*.mjs` 只需 toggle**（只有 `entry.mjs` / config schema 才需要重启）——
+R27 改的三个文件都在 `plugin/` 里，新文案确实已加载；**重启也解决不了**，因为要改的不是加载，是行为。
+
+**取证方法（可复用）**：DSH 会话日志是 **zstd 多帧拼接**的 jsonl
+（`~/.dsh/sessions/<workspace>/<sid>/session.v4.jsonl.zstd`）。按魔数 `28 B5 2F FD` 切帧、
+逐帧 `zlib.zstdDecompressSync` 解码，然后统计：
+- `user/message` 且 `data.source.kind === 'context-pilot'` ⇒ **插件注入次数**；
+- `turn/start` / `step/start` ⇒ 轮/步数；
+- `assistant/message` 文本里 `压缩决策：` / `档位决策：` 的次数 ⇒ **模型写了几条决策行**。
+
+**实测（`session-54597a24`：97 轮 / 3032 步）**：
+
+| 指标 | 值 |
+| --- | --- |
+| 插件注入次数 | **108**（≈1.1 次/轮）⇒ **卡只在轮首注入一次**，不是每步 |
+| 模型写的决策行 | 共 **253** 条（2.61 条/轮）；有决策行的 85 轮里 **55 轮 >1 条** |
+| 趋势（最近） | t86 **2** 条 → t91 5 条 → **t92 25 条** → t95 **27** 条（每轮 49–51 步） |
+
+⇒ **插件侧没有问题**（每轮一次）；重复是**模型把"落一行决策"当成每步任务**，且**随会话自我强化**
+（它看到自己前面几十步都在写，就继续写）。纯文案（R27 的「一轮只写一次」）压不住这种模式。
+
+**修法（R30：在重复发生的位置放结构性反向信号）**：
+- 触发：**本轮发过卡**（没卡就没这要求）+ `step ≥ 2` + `(step−2) % 3 === 0`（step 2/5/8…，不每步刷屏）；
+- 文本：「（系统备注：本轮决策行**只需写一次**——后续步骤不必重复贴；仅在真的改变决定
+  （决定压缩 / 升或降档）时补一行。）」；
+- **回执优先**：同一轮里若还有待读回执，先送回执（备注让位）；
+- 安全性沿用 R15.4（中步插入时上一步 tool/result 已在 surface 里，不拆散 tool_use / tool_result）；
+- `state.m2.repeatNudges` 计数可观测。
+
+**验证**：**706 断言全绿**（contract **559** / static 72 / report 54 / boot 21）。R30 段 4 条行为级
+（发卡后 step2 投 / step3 不投 / step5 再投；新轮无卡不投；低于线不投；计数）。
+**变异 2/2 CAUGHT**：M1 不判"本轮发过卡" ⇒ 红 3；M2 不判频率 ⇒ 红 2。
+
+**诚实边界**：这是**行为干预**，不保证模型 100% 遵守。**验证方式**：用上面的取证脚本重测同一会话的
+「决策行条数/轮」——预期从 2.6 降到接近 1。若仍高，下一档手段是提高备注频率（每步一次）或改成
+"只在真的变更时才要求决策行"（需用户确认口径）。
+
+#### R31 改成**检测驱动**：只在监测到重复时才注入（2026-10-15，用户要求）
+
+用户原话：「能否实现，只有当这种被强化后反复写决策的时候，监测到才注入反信号的决策卡」。
+R30 的固定节拍（step 2/5/8…）有两个问题：① 会打扰**守规矩**的会话（只写一次也收到备注）；
+② 与"重复程度"无关（写 25 条和写 2 条投得一样多）。
+
+**检测源（真机形状，实测 dump 事件）**：
+```json
+{"type":"assistant/message","data":{"turn":1,"step":1,"message":{"content":[
+  {"type":"reasoning","text":"…"},{"type":"text","text":"正文"},{"type":"tool-call","…"}]}}}
+```
+⇒ 每个事件自带 `data.turn` / `data.step`；**只数 `type:'text'` 块**（`reasoning` 里提到"压缩决策："
+不算重复写，否则"想一下"就被当成"写了一条"）。
+
+**判定与频率**：
+- 同一轮累计 **≥2 条** ⇒ 认定"重复"；**只写 1 条 ⇒ 完全不注入**（守规矩不打扰）；
+- 首次重复投一条；此后**再写满 3 条**才再提醒；每轮上限 **4 条**（自己不能变成噪声源）；
+- **新轮重置**计数（上一轮写了 20 条也不会让新轮一开始就被打扰）。
+
+**接线**：宿主在 `session/event` 里转发给 `m2Ctl.noteSessionEvent(session, event)`（与 `compaction/end`
+判定**合并到同一行**，不增加 host 代码行——该文件有 ≤320 行硬预算）；检测**只读**，不触发任何压缩。
+**可观测**：`state.m2.decisionRepeat[sid] = { turn, count, lastStep }` 与 `state.m2.repeatNudges` 都进报告，
+事后可核对"检测到几条、投了几条"。
+
+**验证**：**710 断言全绿**（contract **563** / static 72 / report 54 / boot 21）。R31 段 **8 条**行为级
+（只写一次不打扰 / ≥2 条才投 / 退避 / 再写满 3 条再投 / reasoning 不算 / 新轮重置 / 计数 / 宿主接线）。
+**变异 4/4 CAUGHT**：M1 不判 ≥2 条 ⇒ 红 4；M2 把 reasoning 算正文 ⇒ 红 1；M3 去退避 ⇒ 红 2；
+M4 不按轮重置 ⇒ 红 2。
+
+#### R32 「动作背书的决策行」不算重复（2026-10-15，用户追问暴露的漏洞）
+
+用户追问：「如果那条会话被纠正后，就不会注入了吧？」——顺着这个问题复查判据，发现**误报漏洞**：
+R27 明确允许「**中途真的改了决定（压缩 / 升或降档）再补一行**」，而 R31 的判据是"同轮 ≥2 条 = 重复"
+⇒ **合法补行会被当成重复**，对守规矩的会话反而产生误注入。
+
+**修法**：判据加上"动作背书"豁免——统计前先看这条 `assistant/message` 里有没有指向
+**压缩/换档工具**的 `tool-call`（工具名从 `getCompactToolApi().TOOL_NAME` /
+`getEffortApi().TOOL_NAME` 取，**不硬编码**）；有 ⇒ 该条消息的决策行**不计入**（合法的"变更补行"）。
+- 其它 tool-call（如 `pwsh`）**不豁免** ⇒ 纯文本重复仍会被计入；
+- 工具名集合为空（模块未加载）时**保守计数**（宁可误判重复，也不漏掉真重复）；
+- 事件缺 `data.turn` 时**不重置**计数（保守累计，不静默清零）。
+
+**"被纠正后会不会再注入"的完整语义**（现在）：
+| 情形 | 行为 |
+| --- | --- |
+| 同轮写了 1 条（守规矩） | **不注入** |
+| 同轮写了 2 条，但其中一条**伴随真的调用**（compact_context / set_reasoning_effort） | **不注入**（合法补行） |
+| 同轮纯文本重复 ≥2 条 | 注入 1 条；此后**再写满 3 条**才再提醒；每轮上限 4 条 |
+| 模型停手（不再写） | 计数不再增长 ⇒ **不再注入**（同轮内也不会） |
+| 下一轮守规矩 | 计数**重置** ⇒ **永不注入** |
+| 下一轮又复发 | 重新检测 ⇒ 再注入（这正是"监测到才注入"的本意） |
+
+**验证**：**713 断言全绿**（contract **566** / static 72 / report 54 / boot 21）。R32 段 3 条行为级。
+**变异 2/2 CAUGHT**：M1 去掉豁免 ⇒ 红 3；M2 豁免过宽（任何 tool-call 都豁免）⇒ 红 2。
+
+### R33 观察项（**待评估**，2026-10-15）：检测正常，但模型不理会反重复备注
+
+toggle 到 v0.1.22 后，在问题会话 `session-54597a24` 的 **t99**（19 步）实测：
+
+| 项 | 实测 | 结论 |
+| --- | --- | --- |
+| 模型写的决策行 | **11 条**（每 ~1.7 步一对，**内容各不相同**） | 它把「落一行决策」理解成「**每步汇报一次决策**」 |
+| 我们投的反重复备注 | **4 条**（16:43:12 / 16:43:42 / 16:44:31 / 16:45:17） | 检测 + 节流（每轮上限 4）**完全正常** ✓ |
+| 备注之后 | 继续写（第 4 条备注后仍在 step 17/18/19 写） | **文本干预无效** |
+| 对照：本会话（每轮 1 条） | **0 条备注** | 检测**不误报** ✓ |
+
+**归因**：这是**上下文里长出来的模式**——模型每步都看到自己前面几十条带决策行的消息，于是延续该"格式"；
+备注是**用户消息**，而它最强的模仿对象是**它自己**（4 条对不过 100+ 条先例）。⇒ **问题在"要求"本身，不在检测。**
+
+**两个候选杠杆（用户 2026-10-15 决定：先不动，等自然压缩后再评估）**：
+- **A（改口径）**：卡片不再要求"每轮落一行"，改为**只在真的变更时才写**（不压/不变不写）⇒ 从源头去掉"每步汇报"的依据；
+- **B（清先例）**：触发一次自选范围压缩，把带决策行的历史摘要出 surface ⇒ 模式失去模仿对象（顺带释放上下文）；
+  可在"检测到持续重复"时自动做一次（**真动作**，需用户明确同意）。
+
+**观察计划**：该会话 ~68%、单轮 +3pp ⇒ 很快触 75% 强制线（我们的自选范围压缩，档位 `浅压24%`，
+`clearBriefed` 会把一次性教学**重新注入**）。压缩后用取证脚本重测「决策行/轮」：
+- 脚本：`.data/r33-diag.mjs`（每轮决策行条数 + 插件注入清单）、`.data/r33-diag2.mjs`（按时间序看模型输出与备注的相对位置）；
+- 命令：`node --max-old-space-size=4096 .data/r33-diag.mjs "<session.v4.jsonl.zstd>" "2026-10-15T16:35:50Z"`；
+- 预期（若"清先例"假说成立）：压缩后前几轮的决策行回落到 **≈1 条/轮**，备注不再触发。
+
+#### R33 实测结论（2026-10-16）：**"清先例"假说被否**；用户决定保留"每轮落一行"口径
+
+toggle 之后的 5 轮实测（`session-54597a24`）：
+
+| 轮 | 步数 | 压缩决策行 | 档位决策行 | 我们投的备注 |
+| --- | --- | --- | --- | --- |
+| t99 | 25 | 14 | 14 | 4 条 |
+| t100 | 1 | 1 | 1 | — |
+| t101 | 51 | **22** | **22** | 4 条 |
+| t102 | 53 | **18** | **18** | 4 条 |
+| t103 | 12 | 5 | 5 | 3 条（**在压缩之后**） |
+
+- **压缩确实发生了**（04:04:26 收到「压缩自检 · 已执行（浅压24% 档，保留预算 ~240k）」），
+  但压缩后（t103）**仍在重复** ⇒ **"把先例摘要掉就能纠正"的假说被否**；
+- 备注每轮按上限投 4 条，模型照写 18–22 条/轮 ⇒ **文本干预无效**；
+- 对照：本会话（每轮 1 条）**0 条备注** ⇒ 检测的"不误报"成立 ✓。
+
+**归因**：驱动它的是**"要求"本身**（模型把「本轮开头先落一行决策」理解成"每步汇报一次决策"），
+而不是上下文先例。
+
+**用户决定（2026-10-16）**：**先不改**——保留 R27 口径（**每轮开头落一次 + 中途变更再落一次**）。
+据此 **R34（改口径：只在真的变更时才要求）实施后即回退**（改动未提交，`git checkout` 撤销），
+语义回到 v0.1.22；检测 + 反重复备注（R31/R32）保留为唯一的反向信号（每轮上限 4 条）。
+
+**仍可用的后备（均未采纳，记录备查）**：
+- **A（改口径）**：去掉"每轮落一行"的要求 —— 已实现过又按用户意见回退；
+- **B（自动压缩）**：检测到持续重复时自动压缩一次 —— 真动作，需用户明确同意；
+- **C（更强/更频繁备注）**：证据表明收益有限（4 条/轮都压不住）。
+
+#### R33 后续（2026-10-16）：用户**手动纠正**后继续观察
+
+用户在该会话里**手动纠正**了模型（显式要求不要再每步写决策行），并判断"可能是优化前的状态残留导致的"。
+
+- **为什么手动纠正更可能有效**：它是**新的显式用户指令**，在注意力权重上远高于我们那条 40 字系统备注；
+  同时它既重置了"格式先例"，也直接否掉了"每步汇报"的解读 ⇒ 两个驱动因素同时被消除。
+- **需要修正的推断**：压缩（04:04）**没有**终止重复（t103 仍 5 条/12 步）⇒ 单纯"先例残留"解释不完整，
+  驱动里还包含**要求本身 + 执行惯性**。
+- **待验证**：纠正后若回落，则说明"显式用户指令"是有效杠杆 ⇒ 插件侧应把"检测到持续重复"**上报给用户**
+  （而不是自己反复投备注），由用户一句话纠正；若不回落，则只剩 A/B 两条路。
+- **复测方法**：`.data/r33-diag.mjs "<session.v4.jsonl.zstd>" "<纠正时刻>"`，对比基线
+  t99–t103（14 / 1 / 22 / 18 / 5 条每轮）与纠正后的条数（目标 ≈1 条/轮）。
+
+### R35 持续重复 ⇒ **上报面板**（含可复制纠正文案）+ 备注上限 4→1（2026-10-16，用户要求）
+
+依据 R33 实测：**备注 4 条/轮压不住模型**（它照写 18–22 条/轮），压缩清先例也无效 ⇒
+**不再跟模型较劲**，改为**把异常上报给用户**，由用户一句话纠正（R33 已确认"显式用户指令"是有效杠杆）。
+
+**实现**：
+1. 同轮决策行达到 **≥6 条**（`REPEAT_REPORT_AT`，即"持续重复"）⇒ 往面板 acts 行写一条
+   （复用 m3 已有的 HUD 出口；`recordHudAct` + `publishHud` 注入 m2，**无需改客户端、不用刷新页面**）：
+   ```
+   20:xx · 决策行重复 12 次/轮 · 建议手动纠正；可直接复制：请停止在每个步骤重复写决策行：
+   每轮开头写一次即可（含「保持 / 不压」），中途真的改变决定时再补一行，其余步骤不要再重复。
+   ```
+   —— 后半段就是**可直接粘贴给 Agent 的纠正文案**（`REPEAT_FIX_TEXT`，同时存进 `state.m2.repeatFixText`）；
+   **同一轮只上报一次**（不刷面板）。
+2. **备注上限 4 → 1**（`NUDGE_PER_TURN_CAP = 1`）：备注已证明无效，留一个提示位即可，省下的注入留给真正需要的信息。
+3. 可观测：`state.m2.repeatReports`（上报次数）/ `repeatNudges`（备注次数）/ `repeatFixText`（纠正文案）都进报告。
+
+**验证**：**717 断言全绿**（contract **570** / static 72 / report 54 / boot 21）。R35 段 5 条行为级
+（阈值以下不上报 / ≥6 条上报且含可复制文案 / 同轮只报一次 / 上限 1 / 宿主接线）。
+**变异 4/4 CAUGHT**：M1 上限回 4 ⇒ 红 2；M2 不上报 ⇒ 红 2；M3 每步都报 ⇒ 红 1；M4 门槛降到 2 ⇒ 红 2。
+
+#### R33 收尾（2026-10-16）：**手动纠正有效** —— 复测证实
+
+用户手动纠正后逐轮实测（`session-54597a24`）：
+
+| 轮 | 步数 | 决策行（压缩/档位） | 备注 |
+| --- | --- | --- | --- |
+| t104 / t105 | 6 / 7 | 1 / 2 | 纠正后立刻收敛 |
+| t106 | 45 | **15 / 15** | 一次反复（05:00–05:01 我们投了 4 条备注） |
+| t107 | 6 | 0 / 0 | — |
+| **t108** | 61 | **1 / 1** ✓ | 目标达成 |
+| **t109–t112** | 25 / 22 / 8 / 6 | **各 1 / 1** ✓✓ | **连续 5 轮只有 1 条** |
+
+⇒ **"显式用户指令"是有效杠杆**（对比：备注 4 条/轮无效、压缩清先例无效）⇒ **验证了 R35 的方向**：
+插件应把"持续重复"**上报给用户**、由人一句话纠正，而不是自己反复投备注。
+
+### R36 用户手动切档后，模型写成「保持 X」（措辞失真，2026-10-16）
+
+用户反馈：「手动切档位，他没有感知到新档位」。**日志三条时间线**（`session-54597a24`）：
+
+| 时刻 | 事件 |
+| --- | --- |
+| 06:25:57 | `model/selection`：`{"reasoningEffort":"high"}` ⇒ 用户从 `max` 手动切到 `high` |
+| 06:26:01 | 插件注入：「思考强度 高(high)（**用户刚把档位从 最高(max) 调到 高(high)**，本步骤的请求即用它…）」⇒ **检测+上报正常** ✓ |
+| 06:26:20 | 模型写：「档位决策：**保持** 高(high)｜理由：机械收尾」⇒ 值对、**措辞错** |
+
+**根因**：卡片/教学的格式模板里写的是 `tier 保持 <档位>` / `档位决策：保持 高(high)`，模型**照抄了"保持"**
+⇒ 用户读到「保持 高(high)」，以为模型没感知到自己的切换。**不是检测失效，是措辞失真。**
+
+**修法**：
+1. **切档那一轮的后缀**（`renderSuffix` 的 pendingChanged 分支）显式补一句：
+   「**这是用户改的，不是"保持"**：正文里请写「用户刚调到 X」并按新档位调整推理强度」（只在切档轮出现）；
+2. **换档教学**加一条：**用户手动改过档位的那一轮**写「用户刚调到 X」，**不要写「保持 X」**。
+
+**验证**：**720 断言全绿**（contract **573** / static 72 / report 54 / boot 21）。R36 段 3 条
+（切档轮含提示 / 非切档轮不含 / 教学文本）。**变异 2/2 CAUGHT**：去掉后缀提示 ⇒ 红 1；去掉教学句 ⇒ 红 1。
+
+### R37 压缩后的"过渡值"必须带 provider 待刷新提示（2026-10-16）
+
+用户反馈：「手动用 DSH 原参数压缩，刚压完显示 **13%**，发起新任务等下看变成 **5%**了」。
+
+**用插件账本把算术对上**（`session-54597a24`，14:37 手动 `/compact`，快照 `reason=engine-compact`）：
+
+| 字段 | 值 | 说明 |
+| --- | --- | --- |
+| `providerReported` | **387,168** | provider 最后一次实报 —— **压缩前的旧值**（尚未刷新） |
+| `sampledSurface` | 269,183 | 那次上报时的 surface |
+| `providerSurface` | **8,194** | 压缩后当前 surface（骤降） |
+| **`projected`（表盘口径）** | **126,179 = 12.6%** | `387168 + 8194 − 269183` ← **用户看到的"13%"** |
+| `heuristicTotal` / 三行合计 | 126,435 / 20,752 | 启发式日志总量 / 组成 |
+| 13 分钟后表盘的 **5%**（~53.6K） | — | **下一次请求完成后 provider 实报的真实 prompt** |
+
+⇒ **不是压缩没生效、也不是重复计数**：表盘锚在 provider 实报上 ⇒ **滞后一次请求**；
+刚压完的数是「旧实报 + 新 surface 增量」的过渡值。
+
+**真问题**：面板那行只写「压后占用 12.6%」，**没带过渡提示** ⇒ 用户以为数字在乱跳。
+**修法（R37）**：`noteEngineCompaction` 在 `mr.stale`（surface 比上报时缩水 >50%）时，面板行追加
+「**（provider 待刷新，下次请求后会回落）**」；正常轮次不附（避免每行拖一句）。
+
+**验证**：**722 断言全绿**（contract **575** / static 72 / report 54 / boot 21）。R37 段 2 条行为级
+（刚压完带提示 / 正常轮次不带）。**变异 2/2 CAUGHT**：去掉提示 ⇒ 红 1；无条件附 ⇒ 红 1。
+
+### R38 现场压缩实测：**"缺口"是黏的**（我预测错了一次，如实记录）+ 面板后缀单源（2026-10-16）
+
+用户要求「执行一次压缩，我来观察」。实测（本会话 `session-9a611857`，浅压24% 档、沿用、`rangeSource=own`）：
+
+| 口径 | 压缩前 | 压缩后（provider 刷新前） | 压缩后（**刷新后真值**） |
+| --- | --- | --- | --- |
+| 表盘头条（`projected`） | 599,540（60.0%） | 455,337（45.5%） | **400,672（40.1%）** |
+| surface | 392,500 | 253,004 | 249,317 |
+| 三行合计 | ~408K | 262,273 | ~265K |
+| **缺口 `gapVsBreakdown`** | ~192K | 193,064 | **~136K** |
+
+- 回执写的「压缩后占用 ≈46%（455k）」与账本 `projected=455,337` **逐位吻合** ✓；
+- **用户面板显示 40% ⇔ 插件用量行 `used 400,672 (40.1%)`** ⇒ **两者完全一致** ✓（这是 R24 以来一直追求的目标）；
+- ⚠️ **我上一条预测"会落到 ≈26%"是错的**：正确模型是
+  **压后真值 ≈ 保留量(240k) + 系统/工具(18k) + 缺口(~136K)** ≈ 394K ≈ 40%。
+  即那份"provider 计入而三行不计"的缺口（路由定价的图片/文件等）**不随压缩消失**（本会话收了大量截图）
+  ⇒ 压缩只能把表盘从 60% 降到 40%，不会降到 26%。
+  **教训**：谈"压后占用"时必须把**黏性缺口**算进去，否则会给出过于乐观的预测。
+
+**修法（R38）**：把面板行的「压后占用」后缀抽成**单源函数** `occupancyActSuffix(ratioAfter, stale)`
+（`m3.compact.mjs` 模块级导出），三条路径共用：① 引擎/手动（R37 已带提示）、② **pre-step 自选范围**
+（原来只写「省 XK」，现在也报占用 + `stale` 提示）、③ **idle 扫除**（同）。
+避免"同一物理量三处各写一遍"。
+
+**验证**：**724 断言全绿**（contract **577** / static 72 / report 54 / boot 21）。R38 段 2 条
+（后缀行为 4 例 + 单源守卫）。**变异 3/3 CAUGHT**：后缀返回空串 ⇒ 红 2；无条件附提示 ⇒ 红 2；
+idle 路径绕过单源 ⇒ 红 1。
+
+### R39 保留预算改「真实口径」——让档位名副其实（2026-10-16，用户实测后决定）
+
+用户观察（**正确**）：DSH 原生 `/compact` 能把缺口一起压掉（13%→5%），而我们的压缩后缺口一直 ~190K。
+
+**两个会话对照（插件账本）**：
+
+| | DSH 原生 `/compact`（54597a24） | 我们的浅压24%（9a611857） |
+| --- | --- | --- |
+| 压缩后 **messages 行** | 263,466 → **3,873**（几乎清空） | 380,863 → **244,360**（按档位保留 240k） |
+| 压缩后**缺口**（刷新后真值） | 104,260 → **14,651** | 185,209 → **193,064** |
+| 压缩后头条（刷新后） | 56,134（5%） | 400,672（40.1%） |
+
+**根因（量化）**：把 6 个会话的「表盘真实 / 三行启发式」比值都算了一遍——
+**1.31 / 1.32 / 1.38 / 1.43 / 1.46 / 1.51**（典型 ≈ **1.4**）⇒
+**我们按启发式保留 240K，实际保留的真实量 ≈ 340K** ⇒ 档位名（保留 24%）与表盘（40%）对不上。
+**不是"我们压不掉缺口"，而是"保留预算用了一把小一号的尺子"。**
+
+**修法（R39）**：
+1. 模块级导出 `scaleRetainBudget(budget, factor)` = `budget / factor`，factor **夹在 [1,2]** ⇒
+   **只减不增**（绝不让档位保留得比它承诺的更多）；
+2. 因子 = `表盘真实 / 可见组成（summarizeBreakdown：系统+工具+消息）`，**每会话一份**，
+   **只用非 stale 的实测更新**（stale 是刚压完的过渡值，用它折算会把预算压过头），pre-step **每轮刷新**；
+3. `retainBudget`（回执/报告）仍报**档位承诺**（真实口径），实际交给范围选择的是 `retainBudgetHeur`
+   （折算后）；两者 + 因子都留痕；回执点明「保留预算 ~240k（**真实口径 ×1.4**）」。
+
+**预期效果**：浅压24% 压完表盘 ≈ **24–28%**（原 ~40%）；深压8% ⇒ ≈10%；标准16% ⇒ ≈16–20%。
+**代价**：同档位下保留的**启发式文本量**比以前少 ~30%（这正是"名副其实"的含义）。
+
+**验证**：**730 断言全绿**（contract **583** / static 72 / report 54 / boot 21）。R39 段 5 条行为级
+（折算 7 例 / 因子更新与 stale 守卫 / 拿不到组成则退回 1 / 回执点明 / 两条接线）。
+**变异 4/4 CAUGHT**：不折算 ⇒ 红 1；允许 factor<1（保留更多）⇒ 红 1；stale 也更新因子 ⇒ 红 1；
+pre-step 不刷新因子 ⇒ 红 1。
+
+#### R39.1 首次实测**折算没生效**——我读错了"三行组成"的来源（2026-10-16，如实记录）
+
+用户「现在测试」后我压了一次，回执写「保留预算 ~240k」**没有 ×因子**，只省 51.7K、压后 42% ⇒ 折算没生效。
+**账本证据**（`lastCompactVerify`）：`retainBudgetHeur: 240000` / `retainFactor: 1`
+⇒ 新代码**确实在跑**，但因子恒为 1（`state.m3.retainFactor` 根本没记录）。
+
+**根因**：R39 第一版写的是 `summarizeBreakdown(mr.measure)`——但按契约 `summarizeBreakdown` 要的是
+**breakdown 对象**，它来自**另一个服务调用**：
+`svc('sessionProjections').stateOf(session, 'contextBreakdown')`（m1 账本同款取法）。
+传整个 `measure` ⇒ 返回 null（或只有 system 行的退化形状）⇒ 因子算不出来。
+
+**修法（R39.1）**：
+1. 改从 `stateOf(session, 'contextBreakdown')` 取组成（兜底才退回 `measure`）；
+2. **形状守卫**：组成必须**三行齐全**（`tools`/`messages` 都是数字）才用——否则"只有 system 行"会被当成
+   分母（2,162）⇒ factor 直接顶到上限 2 ⇒ **压过头**；不齐就**不折算**（退回 1，宁可不变也不猜）；
+3. `summarizeBreakdown` 提为**模块级导出**（测试用真函数）；
+4. **测试改造（重要教训）**：R39 的测试把 `summarizeBreakdown` **整体桩成"返回三行"** ⇒ 太配合，
+   把"传错对象"这个真 bug 放过去了。现改为**只在服务边界打桩**（`stateOf`），组成计算用**真函数**
+   ——变异 M2（把代码改回 `summarizeBreakdown(mr.measure)`）现在**能红**。
+
+**验证**：**731 断言全绿**（contract **584** / static 72 / report 54 / boot 21）。R39 段 +2 条
+（三行不齐 ⇒ 不设因子；拿不到组成 ⇒ 不设因子）。**变异 3/3 CAUGHT**：去掉三行守卫 ⇒ 红 1；
+退回原 bug（只读 measure）⇒ 红 1；stale 也更新 ⇒ 红 1。
+
+#### R39.2 复测**通过**（2026-10-16）：档位终于名副其实
+
+toggle 到 v0.1.28 后重跑同一条测试，账本逐项吻合：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| `retainBudget` | **240,000** | 档位承诺（真实口径） |
+| `retainBudgetHeur` | **160,000** | = 240,000 ÷ 1.5 ⇒ **折算生效** ✓ |
+| `retainFactor` | **1.5** | 实测 real 424,665 ÷ visible 283,015 |
+| `shadowedTokens` | **105,091** | 未折算时只有 51,737 ⇒ 多压一倍 |
+| messages 行 | 380,863 → **163,411** | 正好 ≈ 折算后预算 ✓ |
+| 表盘过渡值 | 322,974（32.3%） | `423,683 + 172,055 − 272,764`（stale 锚定） |
+
+**预期真值**（provider 下次实报后）：三行 181,324 × 1.5 ≈ 272K ⇒ **≈27%**
+（对比修复前同档位的 42% ⇒ **−15pp**）。回执同时给出「保留预算 ~240k（**真实口径 ×1.5**）」，
+档位名与表盘从此对得上。
+
+### R40 锚点（keepFrom）与真实口径的关系 + 修一处回归（2026-10-16，用户追问）
+
+用户问：「前面设计的 `keepFrom:{text:…}` / `keepFrom:{recentUser:N}` 也符合本身优化的压缩机制吧？」
+
+**答案：符合（不冲突），但锚点路径有意**不折算**——它是"位置口径"**：
+- 锚点的语义是**位置承诺**：「从这条消息起**之后一律原样保留**」（R21 的护栏是"宁可多留，绝不丢新需求"）；
+- 按真实口径去缩它 ⇒ 保留边界会**越过锚点** ⇒ 直接违背承诺；
+- ⇒ 锚点路径的预算由 `rangeApi.resolveAnchorBudget`（启发式 `measure.nodes` + 余量）给出，
+  **不乘 factor**；后果是**表盘落点 ≈ 1.5 × 锚点之后那段启发式大小**（与修复前同款），
+  且若锚点之后含大量截图，**黏性缺口照旧留下**。
+
+**对照（两种工具、两种口径）**：
+
+| 工具 | 口径 | 表盘落点 | 适合 |
+| --- | --- | --- | --- |
+| 档位 tier | **真实口径**（R39 已折算） | ≈ 档位名 + 固定开销 | 「我要降到 X%」 |
+| 锚点 keepFrom | **位置口径**（不折算） | ≈ 1.5 × 该段启发式量 | 「这段不能丢」 |
+
+**同时修一处我引入的回归**：R39 把回报的预算**无条件**写成 `tierBudget` ⇒ **锚点生效时会误报
+「保留预算 ~240k」**（实际只保留了锚点那一段）。修法（R40）：
+- m3 回报随来源切换：`useAnchor ? anchorBudget : tierBudget`（`retainBudgetHeur` 同）；
+- m2 回执按来源标口径：档位 ⇒ 「保留预算 ~240k（**真实口径 ×1.5**）」；
+  锚点 ⇒ 「**锚点之后原样保留 ~95k（启发式口径；表盘 ≈ ×1.5）**」（不与档位数字混用话术）。
+
+**验证**：**733 断言全绿**（contract **586** / static 72 / report 54 / boot 21）。R40 段 2 条
+（锚点回执 e2e + 单源守卫）。**变异 2/2 CAUGHT**：回归（无条件报档位预算）⇒ 红 1；
+锚点不标口径 ⇒ 红 1。
+
+### R41 锚点能不能也"折算"？（2026-10-16 用户追问的核心）
+
+用户原话：「之前档位压缩 24%，实际会在 40%，优化后现在是 26%，就比较符合。如果使用锚点压缩，
+应该用类似的优化——比如之前锚点刚好锚中 24% 的位置，按之前的压缩也会在 40%，按现在优化后的，
+能否也是 26% 左右？」
+
+**答案：不能，而且不该——但"可预期"这个目标可以达成，只是方式不同。**
+
+| | 承诺性质 | 能否折算 |
+| --- | --- | --- |
+| 档位 24% | **预算承诺**（"保留窗口 × 24%"） | ✅ 能：预算 ÷ 1.5 ⇒ 表盘 ≈26%（R39） |
+| 锚点 keepFrom | **位置承诺**（"从这条消息起之后**一律原样保留**"） | ❌ 不能：折算 = 把锚点**之后的内容丢掉** ⇒ 违背承诺 |
+
+用户举的"锚中 24% 的位置"恰好点出真正的毛病：**锚点的位置是用同一把旧尺子量的**——
+「锚中 24%（启发式）」实际保留了 **36% 真实内容** ⇒ 表盘 40%。
+
+**修法（R41，只读、不改行为）**：锚点回执把**真实口径落点**直接算出来：
+
+```
+锚点之后原样保留 ~95k（启发式口径；**表盘 ≈ 143k**（×1.5））
+```
+
+⇒ 用户从此可以**按表盘挑锚点**。**等价规则**（写给用户/模型都成立）：
+
+> 想让表盘落在 ≈24%：锚点要选在**启发式 ≈16%** 的位置（240K ÷ 1.5 = 160K）。
+> 即：**同样的"位置感"下，锚点要比过去选得更靠后一点**。若目的只是"降占用"，用**档位**更省心。
+
+**验证**：**733 断言全绿**（R40 段断言改写为 R40/R41，同时钉住"真实口径落点"与"不误报档位预算"）。
+**变异 2/2 CAUGHT**：锚点不报落点 ⇒ 红 1；锚点混用档位话术 ⇒ 红 1。
+
+### R42 锚点语义**定案**：绝不折算（2026-10-16，用户明确）
+
+用户原话：「`keepFrom:{text:…}` 和 `keepFrom:{recentUser:N}`，就应该**不用强制符合这个计算逻辑**，
+应该**准确保留之前的逻辑**。」
+
+**确认：这正是现有实现**——`scaleRetainBudget` **只作用于档位预算**：
+
+```js
+const tierBudgetHeur = scaleRetainBudget(tierBudget, retainFactor);
+const budget = useAnchor ? anchorBudget : tierBudgetHeur;   // ← 锚点原样（不折算）
+```
+
+锚点侧的一切**未改动**：`resolveAnchorBudget`（锚点→末尾 token + 余量，启发式口径）+ R21 护栏
+（`selectRange` 的范围**绝不越过锚点**：`keepAtIdx` 被拉到锚点）。
+
+**唯一变化的是回执文案**（R40 报正确来源、R41 附"真实口径落点"预估）——**只读、不改行为**。
+
+**新增契约守卫（R42）**：`scaleRetainBudget(anchorBudget` **不得出现**在源码里；锚点分支必须原样传
+`anchorBudget`。**变异 2/2 CAUGHT**：把折算套到锚点上（直接折 / 挪到公共出口）⇒ 各红 2 条
+（R42 守卫 + R16/R21 老断言）。
+
+| 路径 | 是否折算 | 口径 |
+| --- | --- | --- |
+| 档位 tier | ✅ 折算（÷ 实测 factor，夹 [1,2]） | 真实口径 ⇒ 表盘 ≈ 档位名 + ~3pp |
+| 锚点 keepFrom | ❌ **绝不折算**（保持 R21 位置语义） | 位置口径 ⇒ 表盘由锚点位置决定（回执给落点预估） |
+
+**验证**：**734 断言全绿**（contract **587** / static 72 / report 54 / boot 21）。
+
+### R43 决策卡写清「两种模式」与优先级（2026-10-16，用户要求，全中文）
+
+用户：「决策卡中，是优先使用 `keepFrom` 还是档位？使用时应该说清哪种模式。**要求都是中文**」。
+
+**原状**：卡片只在档位那一行的**句尾**顺带提了一句「想精确到"从最近需求起保留" ⇒ 传
+`keepFrom:{recentUser:1}`」——**既没说优先级，也没说两种口径不同**。
+
+**改后（新增一行，独立成条）**：
+
+```
+• **两种模式（二选一，锚点优先）**：①**按比例**（默认）`tier 浅压24%` ⇒ 表盘 ≈ 档位名 + 约 3%；
+②**按位置** `keepFrom:{recentUser:1}`（或 `{text:'开头十来字'}`）⇒ 该处起**原样保留、不折算**
+（表盘由位置定，回执给落点）。锚点未命中自动退回档位。
+```
+
+**同时删掉原句尾的锚点提示**（信息重复）+ 压缩若干冗词（「（零压缩成本）」「（不是重置）」保留、
+「代价对称」段并入一句），**教学预算 2999 → 2998 / 3000**（硬上限，测试持续守着）。
+
+**R43 断言**：① 卡里必须出现「两种模式（二选一，**锚点优先**）」「①按比例」「②按位置」「原样保留、不折算」
+「锚点未命中自动退回档位」「表盘 ≈ 档位名 + 约 3%」；② **全中文守卫**：剥掉反引号里的代码标识符后，
+模式说明里**不得残留任何拉丁字母**（真机抓出过漏网的英文「3pp」⇒ 已改「约 3%」）。
+
+**验证**：**736 断言全绿**（contract **589** / static 72 / report 54 / boot 21）。
+**变异 3/3 CAUGHT**：去掉「锚点优先」⇒ 红 1；去掉「不折算」⇒ 红 1；混入英文「default」⇒ 红 2
+（中文守卫 + 预算）。
+
+### R44 真机走查一次锚点压缩（2026-10-16，用户要求「走一遍真实的锚点压缩」）
+
+**执行**：`compact_context({ keepFrom: { recentUser: 1 } })`（**不传 tier**，锚点优先）。
+
+**回执（原文）**：
+
+> 【压缩自检】你上次请求的压缩**已执行**（浅压24% 档，**锚点之后原样保留 ~40k（启发式口径；表盘 ≈ 62k（×1.56））**，
+> 保留来源：**语义锚点（从最近第 1 条你的消息起）**）：省 ~174.9K token，**压缩后占用 ≈19%（192k）**…
+
+**账本（`anchorProbe`，插件报告文件实测）**：
+
+```json
+{ "want": { "recentUser": 1 }, "ok": true, "via": "recent-user", "seq": 7783,
+  "tokens": 1431, "margin": 8000, "budget": 40000, "clamped": true, "tried": [], "reason": null }
+```
+
+**四条结论（都是硬证据）**：
+
+1. **锚点命中**：`via: recent-user`，`seq: 7783`（找到了那条用户消息）。
+2. **锚点未被折算**（R42 语义在真机成立）：`retainBudgetHeur = 40000` **等于** `retainBudget = 40000`
+   ⇒ 没有走 `÷1.56`；`retainFactor = 1.56` **只用于回执里的"落点预估"**（40000 × 1.56 = 62k ✓ 与回执一致）。
+3. **回执两个数各是什么**：`表盘 ≈ 62k` = **锚点保留那一段**的真实口径预估；
+   `压缩后占用 ≈19%（192k）` = **压完整体**的占用（= 62k + 系统/工具 + 黏性缺口 ~130k）。
+4. **新发现（R44 修的）**：锚点段实际只有 **1.4k** 启发式（锚点=本轮用户消息，之后内容很少），
+   预算被 **MIN 下限 `MIN_RETAIN_TOKENS = 40k` 抬起**（`clamped: true`）⇒ 实际保留范围**比锚点更早**
+   （多留了 ~38.6k 旧内容，这正是 R21「宁可多留，绝不丢新需求」的保守取向）。
+   **但回执原先只说"锚点之后原样保留 ~40k"** ⇒ 会被读成"那段就有 40k"（高估落点）⇒ R44 修法：
+   m3 回报 `anchorTokens`/`anchorClamped`，回执在被夹取时补一句
+   「**下限保护**：锚点段实际只有 ~1.4k，为防丢新需求抬到 ~40k」。
+
+**验证**：**738 断言全绿**（contract **591** / static 72 / report 54 / boot 21）。
+**变异 2/2 CAUGHT**：不说明「下限保护」⇒ 红 1；无条件加该句（没夹取也说）⇒ 红 1。
+
+### R45 回执给「稳定后预计」——把 provider 未刷新的中间值说清（2026-10-16 用户实测观察）
+
+用户原话：「压缩后显示 19%，过后回落到 10%，这是我观察到的。**如果压缩后的数据符合要求，那么行为
+没问题，只需优化回执显示的百分比**。」
+
+**确认**：行为没问题（压缩确实生效）；19% 是**压缩那一刻的 provider 未刷新投影值**，稳定后 = 10%
+⇒ 问题在**回执把中间值当结果**（用户会以为"压完还剩 19%"）。
+
+**修法（R45）**：
+
+1. **压缩完成时挂「稳定观察」**（`state.m3.settleWatch[sid] = {used: usedAfter}`，仅 stale 时挂）；
+2. **下一次非 stale 实测**里量出真实回落量（tokens）⇒ 存每会话样本（≤8 条，**取中位数**抗抖动）；
+   ⚠️ **stale 实测不得记**（provider 旧报还扛着压缩前的大数 ⇒ 量出来是假的）；
+3. **回执给两个数**：
+   `**压缩后占用 ≈19%（192k）（provider 未刷新）⇒ **稳定后预计 ≈10%（100k）****`
+   —— 首次压缩（无样本）时如实写「**本会话暂无实测回落值**」，**不编数字**。
+
+**真机数字**：19% → 10% ⇒ 回落 ≈ **92k token**（≈9pp @1M 窗口）——与 R37/R38 观察到的 51%→40%、
+13%→5% 同型（回落量近似恒定 ⇒ 按 **token** 存、按比例显示）。
+
+**验证**：**742 断言全绿**（contract **595** / static 72 / report 54 / boot 21）。
+**变异 3/3 CAUGHT**：不给「稳定后预计」⇒ 红 1；没样本也硬给 ⇒ 红 2（e2e + 反例）；
+用 stale 实测量回落 ⇒ 红 1。
+
+### R46 面板行后缀也带「预计稳定后」（2026-10-16 用户同意）
+
+R45 只改了**回执**；用户同意后把**面板行后缀**（`occupancyActSuffix`，三条路径共用）也带上预计值：
+
+```
+· 压后占用 19.0%（provider 待刷新，预计稳定后 ≈10%）
+```
+
+- **同源同数**：后缀的第三个实参就是回执用的那个 `settledRatio`（pre-step 用**同一局部量**，
+  R46 接线断言钉住三条路径都传第三参）；
+- **无样本 ⇒ 保持原话**「下次请求后会回落」（**不编数字**）；
+- **非 stale ⇒ 不加后缀**（值已稳定，加了反而误导）。
+
+**顺手修掉一个脆弱判据**：R38「单源守卫」原来用 **200 字符窗口**判断"是否还有第二份内联实现"——
+R46 把函数体写长后它就误报（把共享函数自己的模板当成了内联实现）⇒ 改为**摘掉整个函数体**再找，
+并补 `body38.length > 100` 防止"函数被删空"也能过。
+
+**验证**：**744 断言全绿**（contract **597** / static 72 / report 54 / boot 21）。
+**变异 3/3 CAUGHT**：后缀忽略样本 ⇒ 红 1；没样本硬给数字 ⇒ 红 3；pre-step 少传第三参 ⇒ 红 1。
+
+### R47 口径定稿与暂缓项（2026-10-16 用户定稿）
+
+**已定稿（今后不再作为待办重提）**：
+
+1. **档位落点 = 档位名 + ~3pp**（系统提示词 + 工具定义不参与压缩）。浅压24% 实测落在 **~26%**，
+   用户确认「**符合预期**」⇒ **不再为追求"恰好 24%"去扣减固定开销**（多一个偏差源、收益为零）。
+2. **面板/回执口径已对齐**：压后中间值带「provider 待刷新」+「预计稳定后 ≈X%」（R45/R46），
+   用户实测 19% ⇒ 10% 的回落已被正确解释。
+
+**暂缓（有触发条件才做，不做不算未完成）**：
+
+- ~~**深压8% 的实测落点**~~ **（2026-10-17 由用户结清）**：用户在**别的会话**里按 8% 档实测观察过落点，
+  结论「**没问题**」——注意那是**优化前**（R49/R50 之前）的观测。
+  **为什么优化不影响这个落点**（论证，避免"改动过就不算数"的疑虑）：
+  R49 的 `modelPolicies` 只在用户真的配了策略时才生效（未配 ⇒ 走的仍是默认 0.8，已由
+  `engineCapProbe.via=agentPresets.serviceFor / ratio 0.8 / cap 0.75` 在线上证实）；R50 只是把
+  **折算因子的实现原样搬进** `session-facts.mjs`（公式逐字未动）+ 把采样**落盘**，
+  而落点是 `预算 × factor`（`scaleRetainBudget` 未改）；`settleDropAny` 只影响**回执里那句预测的
+  取数来源**（本会话样本 → 无样本时用跨会话中位数），**不参与预算计算**。
+  ⇒ 因此 8% 档的落点行为与优化前**逐字一致**，无需重测；若要复核，线上看一条 8% 冲压后的 hud-acts
+  记录即可（形如「压后占用 ≈X%（provider 待刷新，预计稳定后 ≈Y%）」）。
+  原始暂缓条件（保留备查）：用户原话「**8% 应该没问题，后面达压缩线了再测**」；核对项为
+  保留预算 ÷ factor、回执的「稳定后预计」、面板落点是否 ≈ 11%（= 8% + ~3pp）。
+
+### R48 DSH 0.2.1 升级兼容（2026-10-17，只做兼容、不加功能）
+
+**背景**：用户要求「**只做针对新版兼容性相关的优化**，确保更新 DSH 后插件正常运行」，升级后再做后续优化。
+复核结论见 `docs/DSH-0.2.1-COMPAT-REVIEW.md`（含 §七 独立复核）：**0 项破坏性冲突**。
+
+**逐包 diff（npm 0.2.1-rc.1 vs 安装版 0.2.0-rc.2）**：
+
+| 包 | 改动 | 插件依赖点 | 结论 |
+| --- | --- | --- | --- |
+| `dsh-compaction-basic` | **逐字节相同** | `compactIfNeeded` / `compactRegion` / `compactNow` / 锁 | 安全 |
+| `dsh-compaction` | 4 行（仅注释） | 契约类型 | 安全 |
+| `dsh-command-compact` | `lib/index.js` 0 行 | 不调用 | 安全 |
+| `dsh-session` | `lib/index.js` 0 行 | `registerMessageProjection`（两版都有） | 安全 |
+| `dsh-token-meter` | 内部重写（stateVersion 5→6、claim 状态机） | `contextBreakdown` / `contextPressure` **公开视图两版逐字相同** | 安全 + **新约束** |
+| `dsh-llm` | 63+/24− | **`createUserMessage` 导出 + 实现逐字相同** | 安全 |
+| `dsh-tools` | 383+/287− | **`defineTool` 导出 + 实现前缀逐字相同** | 安全 |
+| `dsh-typert-protocol` | +230/−28（**动了 `bindTypertRemote` / marker 区域**） | 插件用 `typertRemote` 绑定 + `remote-methods` 标记 | **需冒烟 HUD** |
+| `dsh-client-ui-*`（注入 7 包） | — | `conversation.input.right` 槽位 | 安全（槽位仍在） |
+| `schemastery` | 版本独立（3.18.4） | 配置 schema（有兜底链） | 安全 |
+
+**本轮落地（4 项）**：
+
+1. **`engines.dsh`**：**根清单 + `plugin/package.json` 都加** `">=0.2.0-rc.2 <0.3.0-0"`（npm 装读根清单、
+   本地 junction 读 `plugin/` 清单）。判定用 `semver.satisfies(v, range, { includePrerelease: true })`
+   ⇒ **必须带预发布后缀**：真 semver 7.8.5 实测 `>=0.2.0 <0.3.0` ⇒ **0.2.0-rc.2 = false**（会把当前版排除）。
+2. **R48 兼容守卫（7 条断言）**：engines 范围带预发布后缀且两清单同源 / `summarizeBreakdown` **吃扁平视图**
+   （0.2.1 的实际形状，此前只测了嵌套）/ 插件用到的**会话事件**与 **hook 事件** ⊆ 契约快照且源码里确在用 /
+   **官方运行时依赖白名单**（新增官方依赖必须再做兼容复核）/ HUD typert 冒烟提醒。
+3. **契约快照 + 刷新工具**：`docs/reference/dsh-contract.json`（`sessionEvents` 取自
+   `dsh-session@0.2.1-rc.1` 的 `known-event-types.js`＝59 项；`hookEvents` 从 asar 扫描＝19 项）+
+   `docs/reference/tools/make-contract.cjs`（**升级 DSH 后重跑刷新**）。
+   ⚠️ **服务名不纳入快照**（host 服务不以字面量 `provide()` 注册，扫描不可靠）⇒ 服务契约靠升级后冒烟。
+4. **新约束注释**（`m3.compact.mjs`）：0.2.1 的 `contextBreakdown` 要求**计量替换必须有相邻 claim**
+   （`compaction/summary|prune` 先武装影子价），否则投影**抛错** ⇒ 插件**必须继续走官方压缩服务**；
+   官方 `compactRegion` 自带配对事件 ⇒ 天然满足。
+
+**自我更正两处**（复核中发现的初判错误）：① 插件 HUD **不用 `Remote` 装饰器**，而是用 typert 低层约定
+（`typertRemote` + `remote-methods` 标记）⇒ 冒烟理由更强（0.2.1 恰好改了那片区域）；
+② 我一度以为 md 推荐的 `engines.dsh` 范围匹配不上 0.2.1 —— 查 `dsh-app-boot#satisfies` 后发现用的是
+`includePrerelease: true`，**推荐范围正确**。
+
+**验证**：**752 断言全绿**（contract **603** / static 74 / report 54 / boot 21）。
+**变异 5/5 CAUGHT**：去掉 engines / 范围丢预发布后缀 / `summarizeBreakdown` 拒吃扁平形状 /
+新增未复核官方依赖 / 快照删掉在用事件 —— 各自红 1 条。
+
+### R49 用 DSH 0.2.1-rc.2 的新能力做**正向优化**（2026-10-17，用户要求「确保上正向提升」）
+
+**前置：升级后检查全绿**（`engines.dsh` 放行 0.2.1-rc.2 ✓ / 用量行 ✓ / m3 pre-step 在跑 ✓ /
+4 个 hook 注册 ✓ / 压缩工具注册 ✓ / schemastery 已解析 ✓ / **HUD typert 客户端轮询命中** ✓ /
+事件管道含 0.2.1 新增 `job/registered|settled` ✓ / `preStepErrors` 空 ✓ / 契约守卫 752 全绿 ✓）。
+另：**rc.1 → rc.2 九个关键包逐字相同**（hash 相等）⇒ 基于 rc.1 的复核对 rc.2 完整适用。
+
+**两项落地**（都依据**官方源码实证**，且**匹配不到/无锁 ⇒ 与旧行为逐字一致**，纯增量）：
+
+1. **按「当前模型」的官方阈值**（`threshold.mjs`）：官方 `resolveTargetPolicy(config, target)` 支持
+   `config.modelPolicies[]` 按 **provider+model 精确匹配**覆盖 `thresholdRatio`/`headroomTokens`；
+   插件原先只读默认 `thresholdRatio` ⇒ 用户配了 modelPolicies 时会与"当前模型"的官方阈值错位
+   （插件线可能反而**高于**引擎线 ⇒ 失去"确定性先行"）。现按 m3 从 `model/selection` 记的 route 匹配
+   同一条策略；`via` **只在策略真的覆盖了阈值**时标 `modelPolicies`（否则取证失真），并把命中的 route
+   写进 `engineCapProbe`（报告里一眼看出"按哪条策略钳的"）。
+2. **压缩锁避让**（`m3.compact.mjs`）：官方 `assertCompactionInactive` —— **未匹配的 `compaction/start`
+   即持久锁**，官方 `/compact` 与插件共用，且 `/compact` 仅限空闲 ⇒ 同时发起必有一方吃 `busy`。
+   现只用**已文档化的会话事件**记账（`compaction/start` 记锁；`compaction/end`、`session/end-seed` 清锁），
+   pre-step 与 idle 两条路径都让路，且**让路发生在消费意图之前**（意图保留 ⇒ 下一步可重试，F5 同款纪律）。
+   ⚠️ **锁带 10 分钟 TTL**：陈旧锁不得让插件永久失去压缩能力（最坏情况 = 旧行为）。
+   刻意**不采用**未公开的 `session.seq` / 反向扫日志（脆弱耦合）。
+
+**顺手修掉一个既有隐患（R49.1，被测试暴露）**：pre-step 的 `catch` 引用了 `try` 块内 `const sid`
+⇒ **错误分支自身 ReferenceError**（`preStepErrors` 记上了，但 `lastPreStepError` 与「吞掉、本轮照常继续」
+全丢，异常还冒泡给 DSH）。真机从未触发（`preStepErrors` 为空）⇒ 一直潜伏。修法：`sid` 提到 `try` **之外**、
+块内只赋值；⚠️ **也不能在 catch 里重算**（payload 的 `session` 可能就是抛错源，取一次抛一次）。
+
+**验证**：**762 断言全绿**（contract **613** / static 74 / report 54 / boot 21）。
+**变异 6/6 CAUGHT**：不查锁 / 锁无 TTL / 不读 modelPolicies / 不做 provider+model 匹配 /
+`compaction/end` 不清锁 / 复现 R49.1 原缺陷 —— 各自红 1–2 条。
+
+### R50 解耦 + 简化 + 强制性优化 + 全面 review（2026-10-17，用户要求「自己安排，完成所有优化内容，
+完成全面 review、simplify、强制性优化、解耦、测试验收」）
+
+**① 解耦：抽出会话事实账本 `plugin/session-facts.mjs`（叶子模块）**
+四类「由测量与事件喂养、只被读、不决定行为」的事实从 `m3.compact.mjs`（800+ 行，决策 + 记账混杂）
+搬出：**折算因子**（R39）/ **稳定回落样本**（R45 + R50 落盘）/ **压缩锁**（R49）/ **当前模型路由**（R49）。
+纪律：模块间**零互引**（宿主用 `?ts=` 动态 import 后**注入工厂**）；事实状态仍落 `state.m3.*`
+⇒ 消费方（threshold 读 route、m2 读样本、m1 报告快照）**零改动**；m3 里只剩**一行一个的薄委托**。
+
+**② 强制性优化（不是"尽量"，是结构性保证 + 守卫断言）**
+- **缺依赖必须退化**：不注入事实账本 ⇒ `factor=1 / 无样本 / 无锁`，且**不得抛错**（最坏 = 旧行为）；
+- **让路必须在消费意图之前**：`lockSkip(...)` 在源码里必须早于 `tool.takeIntent(sid)`（否则工具已回
+  `scheduled`、实际没压且不会重试 —— F5 真机踩过的静默降级）；
+- **持久化必须被消费**：只落盘不消费等于白做 ⇒ 断言 m3 用 `settleDropAny` 出数、回执按 `settleScope`
+  标明来源。
+
+**③ 优化①（落地）：稳定回落样本落盘 + 跨会话参考**
+写 `plugin/.data/settle-drop.json`（`{version,savedAt,bySid}`，照 compact-tier.json 范式）⇒ 跨重启 /
+跨 toggle 仍在；本会话无样本时给**跨会话中位数**并标 `scope:'global'`，回执据此写
+「**参考其他会话**实测回落」——**绝不冒充**本会话实测（R45 的诚实原则不变）。
+
+**④ 简化**：pre-step 与 idle 的「让路」原是两段近乎相同的代码（判锁 + 留痕 + 日志 + 返回）⇒ 收敛为
+一个判据函数 `lockSkip(sid, ratio, wanted, where)`（改一处漏一处、日志措辞漂移的风险消除）。
+
+**⑤ 顺手修测试竞态**：`report.mjs` 读的是**活插件正在写**的 `.data/*.json`，撞上写盘窗口会拿到半截
+文件（`Unterminated string`）⇒ 套件**假红**（真机 18:26 实测）。改为**有界重读**（6 次 × 200ms，
+仍失败才抛 —— 真损坏照样报错，不掩盖）。
+
+**⑥ 全面 review 结论（评估后**不做**的项 + 理由，避免"为改而改"）**
+| 候选 | 结论 | 理由 |
+| --- | --- | --- |
+| `command/run`/`done` 识别手动 `/compact` | **不做** | 已有等价能力：`noteEngineCompaction` 用 `sourceCommandId` 区分 manual/engine（R16.13/R29） |
+| `job/*` 纳入趋势估算 | **不做** | job 输出最终落为工具结果，已被 `ratioHist` 采样覆盖 ⇒ 增量近零 |
+| `registerMessageProjection` | **不做** | 需把占用历史写进 DSH 投影注册表 ⇒ **新增对官方内部注册表的耦合**，而外部取证工具已读 `m1-report.json` |
+| 阈值对表（`headroomTokens`/输出上限） | **不做** | 会**移动用户已校准的落点**（24% 档 ⇒ 表盘 26%），净收益为负 |
+| 事实账本进报告 | **已自动覆盖** | `m1.snapshot` 用 `...state.m3` 展开 ⇒ `compactLock`/`route`/`settleDrop`/`lockSkips` 自动可见，无死代码 |
+
+**验证**：**773 断言全绿**（contract **621** / static **77** / report 54 / boot 21；static +3 是新模块
+自动被「`?ts=` 热换 / 零互引」守卫覆盖）。
+**变异 6/6 CAUGHT**：回落估计退回只用本会话样本 / 回执不标跨会话参考 / 样本不落盘 /
+`settleDropAny` 永远标 session / **让路挪到消费意图之后** / 缺事实账本不再退化。
+
+### R50.1 本域审查发现并修掉的**回归风险**（2026-10-17）
+
+R50 首版把事实账本与 m3 塞进**同一个 `Promise.all`** ⇒ 账本加载失败会连带 **M3 压缩整域失效**
+（`m3Ctl` 恒为 null ⇒ 工具回 ok、实际永不压缩、模型毫无察觉）——**正是历史上踩过的静默失效形态**，
+也违背 R50 自己写下的承诺「最坏 = 旧行为」。这是**我自己引入的**回归，被本轮 review 抓出。
+修法：catch **只挂在账本那个 import** 上（失败 ⇒ `null` ⇒ m3 内部退化为 factor=1/无样本/无锁），
+m3 自身加载失败仍照旧 reject 并留痕；宿主**代码行数净增 0**（内联写法，仍 ≤320 硬上限）。
+新增守卫断言 + 变异验证（去掉独立 catch ⇒ 红）。
+
+**验证**：**774 断言全绿**（contract **622** / static 77 / report 54 / boot 21）；变异 **7/7 CAUGHT**。
+
+### R52 独立审计发现 #1（已修）：`official()` 闭包的 TDZ —— "压了却报未执行"（2026-10-17）
+
+**来源**：**B 路独立审计**（`qoder/Qwen3.8-Flash`）。任务书里**没有**提示这条 —— 是它自己读代码
+发现的；它甚至用独立脚本复现了同款 TDZ（`THREW: ReferenceError :: Cannot access 'retainSource'
+before initialization`，且当时 `compactIfNeeded` 已真的执行）。
+
+**缺陷**：`m3.compact.mjs#compactWithOwnRange` 的 `official()` 兜底闭包引用了
+`retainSource` / `useAnchor` / `tierInfo` —— 三者声明在闭包**之后**。当 `awaitRange()` 返回 null
+（`compact-range.mjs` 加载失败 ⇒ 宿主 `rangeReady.catch` 返回 null）时，`official('no-range-module')`
+被**立刻**调用 ⇒ 对象字面量求值抛 **TDZ ReferenceError**。
+**后果比报错更坏**：`compactIfNeeded` 在 await 里**已经真的压了**，随后才抛 ⇒ 调用方 catch 写下
+`not-executed` 回执 ⇒ **模型看到"未执行"、实际已执行**（假阴性），且 `preStepOk` / HUD 记录双丢
+—— 正是本项目最怕的「静默降级」。
+
+**修法**：把**不依赖 api** 的 `anchorBudget`/`useAnchor`/`retainSource` 提到 `official()` **之前**；
+`tierInfo` 先给安全默认（`{ tier:'standard' }`）、拿到 api 后覆盖 ⇒ 正常路径行为**逐字不变**
+（这些值本来就是同一批计算，只是提前算）。
+
+**验证**：**776 断言全绿**（contract **624** / static 77 / report 54 / boot 21），新增 **2 条守卫**：
+- 行为级：`awaitRange→null` 时**不得抛**，且回报 `source:'official'` + `retainSource` + `anchorFailReason`；
+- 结构级：三项声明必须在 `const official = async` **之前**（防有人挪回去让 TDZ 复活）。
+**变异 2/2 CAUGHT**：把 `retainSource` 声明挪回下方 ⇒ 两条守卫同时红。
+顺带：`.gitignore` 补 `collab/`（派发台以仓库为 cwd 时写的运行期日志，避免污染工作区）。
+
+### R53 自审报告 + 两个自审发现的修复：落盘原子性 / 在飞标记按会话（2026-10-17）
+
+独立审计两路都没跑成（A 路免费 flash 三次未产出报告、末次卡死被终止；B 路 `qoder/Qwen3.8-Flash`
+在抓到 **R52 那条 TDZ** 之后被中断/删除）⇒ 改由**我自己**完成审计，产出
+`docs/reviews/r51-audit-self.md`（**明确声明是自审、不是独立审计**，九条假设逐条给结论，
+并按来源分级标注可信度）。
+
+**发现 #2（中）：`.data` 落盘非原子** —— 5 处 `writeFileSync(目标路径)` 直写
+（`m1-report.json` / `hud-acts.json` / `settle-drop.json` / 档位表 / 换档统计）⇒ 写入中途的
+**半截 JSON** 会被并发读者读到（面板、报告工具、插件自己下次启动的 `loadReportBase`）⇒
+报告/记录**整份丢失**（R13 那次"报告断档"同形）。现场证据：`test/report.mjs` 曾真实报过
+`Unterminated string in JSON`，当时只是加了 `readJsonRetry` **绕开症状**、缺陷一直在。
+修法：5 个域各留一份 `writeJsonAtomic`（同目录 tmp + `renameSync`；Windows 目标被占用时
+退化直写并清 tmp）——同目录 rename ⇒ 读者只见旧的或新的完整内容，永不见半截。
+⚠️ helper 复制 5 份是刻意的：本项目禁止域间 import（依赖必须由宿主注入）。
+
+**发现 #3（低）：`state.m3.ownCompact` 全局单槽** —— A 会话压缩期间，B 会话的引擎压缩被
+`isCompactionInFlight()` 误判为"自己的"而**漏记**；A 的 `finally` 清槽后，B 自己的压缩事件
+又不再被跳过 ⇒ **重复补记**（面板/报告出现双条）。修法：按 sid 分槽（`SET_CAP` 有界化）+
+`clearOwnCompaction(sid)` 只清自己 + `isCompactionInFlight(sid)` 按会话看
+（**无参仍是"任一在飞"**，旧调用点语义不变）；`noteEngineCompaction` 里 `sidE` 的计算提前到
+在飞判定之前。热换兼容：旧的单槽形状（带 `until`）读到时直接丢弃重建。
+
+**验证**：**780 断言全绿**（contract **628** / static 77 / report 54 / boot 21）。
+新增守卫：行为级（别的会话在飞 ⇒ 本会话引擎压缩照常补记；在飞判定按会话隔离）+ 结构级
+（五个写入点必须走 `writeJsonAtomic`、不得直写，且 helper 必须是 tmp+rename）。
+**变异 2/2 CAUGHT**：在飞判定改回全局 ⇒ 3 条红；报告改回直写 ⇒ 结构守卫红。
+另：R16.13 的旧夹具在 #3 修复后**真的红了**（它编码的是旧语义）⇒ 反过来证明断言有效。
+
+**如实记录的未修项**：`preStepOk` 在"引擎判定无需压"（`result == null`）时也 +1 —— 语义偏差，
+但实际压缩量另有 `shadowedTokens`/`lastPreStep.acted` 精确表达，改它会让历史报告的数前后不可比、
+零用户可见影响 ⇒ **记录不改**（详见自审报告 §4）。
+
+### R54 千问独立审计真的跑通了 —— 4 条真缺陷（全部我自审漏掉）+ 测试盲区修复（2026-10-17）
+
+第三次派发 `qoder/Qwen3.8-Flash`（用户重启后）**成功交付**：24KB 报告、62 轮、7 段结构齐全、
+写入范围守规矩（仓库里只多出它那份报告）。我**逐条复核、不采信结论**，四条全部成立：
+逐条判定与我的错误记录见 `docs/reviews/r51-audit-crosscheck.md`。
+
+- **F1（高）`lastUserText` 未解构**：`host.impl.mjs:317` 把它当**自由标识符**用，而 core 解构里没有
+  ⇒ 每次调用 `ReferenceError`，再被 `m2` 的空 `catch` 吞掉 ⇒ 思考强度提醒**永远拿不到用户文本**
+  （静默降级）。修：解构补上。
+- **F2（高）清理块引用未定义的 `pending`**：`pending` 既没解构、core 也**没导出** ⇒ 卸载/热换时
+  清理块**第一行**就抛 ⇒ 后面所有 disposer 全不执行（监听器/定时器泄漏，且 apply 期毫无异常可见）。
+  修：core 新增 `clearSchedules()`（防抖表归它清），宿主改调它。
+- **F3（中）client `alive` 作用域外引用**：`alive` 只声明在**上一个 effect**，autoClamp 那个 effect
+  在 `await` 之后引用它 ⇒ `ReferenceError`，且 `catch` 里**再抛一次** ⇒ 未捕获 rejection + 用户
+  看不到成功/失败提示。修：声明本 effect 自己的 `alive` + 返回清理。
+- **F4（中）回执只写全局镜像**：`host.impl.mjs:380` 直写 `state.m3.lastCompactVerify`，而读取端
+  `takeCompactVerify(sid)` **只读** `verifyBySid[sid]` ⇒ 这条「未执行」回执**永远读不回来**。
+  修：同时写 per-sid 槽 + 全局镜像。
+
+**测试盲区（它的 M1，最锋利的一条，已采纳）**：`test/boot.mjs` 的 `effect` 桩 `return setup?.()` 把
+卸载器**返回后直接丢弃** ⇒ 卸载路径**从未被执行**（F2 因此藏了三个版本）。已修：桩收集卸载器，
+boot 末尾**真调**并断言不抛 —— 这条行为级断言正是 F2 的回归守卫。
+
+**我自审报告的错误（必须记）**：`r51-audit-self.md` §5 的 H1 写「未再发现第三例」——**错的**。
+F1/F2/F4 全在 `host.impl.mjs` 几十行之内，我读过很多次却没看见。自审的可信度上限就在这里。
+
+**验证**：**782 断言全绿**（contract **629** / static 77 / report 54 / boot **22**）；
+**变异 4/4 CAUGHT**。其中 F1 的结构守卫首版**被自己的注释骗过**（变异 MISSED）⇒ 改为先剥注释再比对，
+复测 CAUGHT —— 这本身也是"断言假绿"的现场教训。
+
+### R55 注入内容可视化 + 参数可配 + 文案模板（2026-10-19，用户要求）
+
+用户原话：「能否将决策卡内容和提示词内容，还有相关注入的上下文线暴露到插件面板中，方便进行设置。」
+经确认**三条全要**，逐条落地（v0.1.43）：
+
+- **① 面板只读展示注入原文**：`m2.inject.mjs` 把本轮注入的**逐段原文**（用量行 / 决策卡 / 一次性说明 /
+  思考强度教学 / 换档提示 / 压缩自检回执 + `fullText`）留档到 `state.m2.lastInjection`
+  （**含「量测失败仅回执」那条路径**——否则那轮面板会显示上一轮的旧内容，比看不到更坏）；
+  `m5.hud.mjs` 经 HUD 面下发 `injected` + `config`（生效配置快照 + `tplFallback` + `engineCapProbe`）；
+  `client.js` 新增「本轮注入（只读）」区：六段原文各带复制按钮、可手动刷新，并显示本轮活值。
+  **刻意只读**：要改文本就改模板字段，注入原文不可直接编辑（避免"改了显示却不影响注入"的错觉）。
+- **② 参数补进配置区**：新增 `engineCapMargin`（阈值余量，**活读**：`threshold.mjs` 由写死常量改为
+  `marginOf()` 读 `M3.engineCapMargin`，并把 margin 纳入探针刷新条件）+ 三档保留比例
+  `retainRatioLight/Standard/Heavy`（`compact-range.mjs` 新增 `setTierRatios()`：**整组校验**
+  0<v<1 且 **light<standard<heavy**，任一非法整组拒绝；`compact-tool.mjs` 每次渲染前同步 ⇒
+  卡片/说明/工具描述三处百分比同时跟上，**不存在写死漂移**）。两者都**无需重启**，改完下一轮生效。
+- **③ 文案模板可编辑**：新增 `tplBrief` / `tplCard`（留空 = 内置）。设计取舍是**只开放"覆盖"、
+  不开放"拼接"**，并设两道护栏：**必须含 `{tool}`**（否则模型不知道调哪个工具）⇒ 缺了就回退内置
+  并在 `state.m3.tplFallback` 留痕（面板可见）；模板只包在**内置产出之后** ⇒ `renderCard` 的
+  「占用未达门槛 ⇒ null」语义不被破坏（模板不能凭空造卡）。占位符表见 README §6.1。
+
+**验证**：**827 断言全绿**（contract **674** / static 77 / report 54 / boot 22）；**变异 6/6 CAUGHT**。
+其中 M5（模板绕过内置）**首版 MISSED**——结构断言只要求"文件里某处出现 `b == null ? b :`"，
+而另一个出口还在 ⇒ 改成**逐个出口检查**并补一条**行为级**断言（未达门槛时模板也必须返回 null），
+复测 CAUGHT。这已是**同一个月内第二次**"结构断言被自己蒙混过关"（R54 的 F1 守卫被注释骗过）——
+结论：**结构守卫必须配行为级断言**，且模式匹配要**限定到目标位置**，不能全文件 `test`。
+
+**过程中一次自我更正（必须记）**：实现途中我一度断言 m2 第 517 行 `renderBrief(effCrit, r.window)`
+是"位置参数 bug"（说明会教 80% 而非生效 75%）——**错的**。m2 有**自己的局部包装**
+`renderBrief(effCrit, win)`（第 272 行），内部正确传了对象。我只看了调用点、没看定义就下结论。
+教训与 R54 同源：**先读定义，再断言**。
+
+### R56 配置卡「整卡静默消失」根因修复（2026-10-19，用户实测驱动）
+
+**用户实测**：「不是啊，这个本地插件，在这个界面也是可以渲染内容的」+「没有看到。」——并附上
+`dsh-connect-zcode`（同为本地 link 插件）**正常渲染完整配置卡**的截图 ⇒ 证明这一屏**就是**配置页，
+问题在**我们自己的客户端组件**上。（我此前"入口不对/那是详情页"的判断**是错的**，已撤回。）
+
+**真因**（`plugin/client.js`）：`const pct1` 定义在 **`hintFor` 函数体内部**（第 406 行），而
+**summary 分支**（详情页那一行 `智能压缩线 x% ｜ 强制压缩线 y%`）在 `hintFor` **外面**调用它
+⇒ 渲染期 `ReferenceError: pct1 is not defined` ⇒ 被 `CardBoundary` 捕获 ⇒ `return null`
+⇒ **整张配置卡静默消失**，页面上什么都没有，**只在控制台留一条 `console.warn`**。
+用户看到的"空白"正是这一行本该在的位置。
+
+**定位过程（可复用）**：
+1. `cordis_inspect_query`（host Config）⇒ `status: "schema"` + **完整投影 12 个字段** ⇒ host 侧无罪；
+2. `cordis_inspect_query`（client Slots）⇒ 我们的注册 `active: true` 在 `plugins.bundle.config`
+   ⇒ 插槽与注册无罪（该插槽定义：渲染在 bundle 页描述与行之间，`view:'page'`）；
+3. 读 `CardBoundary` ⇒ **出错即 `return null`** ⇒ "什么都没有"的形态有了归属；
+4. 对比 `dsh-connect-zcode/lib/client.js`（同插槽、正常渲染）⇒ 排除插槽契约差异；
+5. 核 `PilotPanelCard` 的 hook 顺序（都在 301–361，早于 504 的 summary 分支）⇒ 排除 hooks 违规；
+6. 逐个核页面分支引用的标识符的最小声明缩进 ⇒ 锁定 `pct1`。
+
+**修法**：`pct1` 提到**组件作用域**（第 413 行，3 tab）。守卫（contract 3 条）：
+`pct1` 必须声明在组件作用域 ✓；只有一处声明且不在嵌套作用域 ✓；`CardBoundary` 必须留痕 ✓。
+**变异**：把 `pct1` 缩回 `hintFor` 内部 ⇒ **2 条断言同时红** ✓ CAUGHT。
+
+**⚠️ 这是本项目第三次同型事故**：R54 的 F1（`lastUserText` 未解构）、F3（`alive` 作用域外引用），
+以及 §6.17 记录的 `PriceCalculator`（`engineCap` 未经 props 传入）——**同一形状、同一后果**：
+渲染期 `ReferenceError` 被错误边界吞掉 ⇒ 表现为"什么都没显示" ⇒ 排查成本极高（本次耗时约 1 小时）。
+**纪律**：改 `client.js` 时，凡在 JSX/分支里使用的标识符，都要确认它在**使用点的作用域内**；
+`node --check` 只查语法，**对未定义标识符完全无效**。
+
+**已知缺口（如实记录）**：现有守卫是**结构级**（缩进锚定 + 名字对账），不是**作用域分析**。
+真正的解法是用 AST（acorn/eslint-scope）做未定义标识符扫描，或在测试里用 React 真渲染一次卡片
+（DSH 的 asar 里应有 react/react-dom，可抽出做 render 冒烟）。**本轮未做**，列为后续项。
+
+
+### R56b 配置卡「整卡静默消失」的**真根因**：`getSnapshot` 自递归（2026-10-19，真复现抓到）
+
+**背景**：R56 修掉 `pct1` 后用户复测「**还是没看到**」⇒ 说明 `pct1` 只是**潜伏的第二个 bug**
+（自递归挡在它前面，代码根本走不到 `pct1`）。教训：**修完一个渲染期异常不等于卡片能渲染**。
+
+**真根因**（`plugin/client.js` 的 `apply()`）：
+```js
+const scope = {
+  getSnapshot: () => (current !== void 0 ? current.getSnapshot() : settingsScope.getSnapshot()),
+  //                                                     ^^^^^^^^^^^^^^ 此刻它就是 scope 自己
+};
+settingsScope = scope;   // ← 把兜底指回自己 ⇒ 自环
+```
+命名空间未就绪时（`current === undefined`）⇒ `scope.getSnapshot()` → `settingsScope.getSnapshot()`
+→ `scope.getSnapshot()` → … ⇒ 渲染期 `RangeError: Maximum call stack size exceeded`
+⇒ 被 `CardBoundary` 捕获 ⇒ `return null` ⇒ **配置卡从来就没渲染过**（page / summary 两种 view 都崩，
+与用户历次截图里那块空白完全一致）。
+
+**修法**：兜底改为**独立常量** `UNAVAILABLE_SCOPE`（`settingsScope` 初始指向它，之后指向 `scope`，
+两者不再互相引用）。
+
+**怎么抓到的（可复用方法）**：把 `plugin/client.js` 装进 `vm` 沙箱（React 桩 + 宽松 DOM 桩），
+真跑 `apply(ctx)` 拿到 `plugins.bundle.config` 的注册，再**真调用**组件的 render 体。
+一次就打出 `RangeError … at Object.getSnapshot (client.js:1007:26)`。
+⚠️ 中途**我自己的探针也踩了同类坑**（树遍历把 `props` 当子节点 ⇒ 无限递归，报错帧全在探针里）
+⇒ 教训：遍历只走 `$$v` vnode，并显式处理数组子节点（`FIELDS.map` 产生嵌套数组）。
+
+**新套件（第 5 个）`test/client-render.mjs`——13 断言**：三种运行时 × 两种 view——
+A `configForms` 不可用 / B 就绪（≈真机）/ C 命名空间未列出。
+B 下**必须**渲染出 `dcp-grid`（配置表单本体）与 `dcp-inj`（R55 的「本轮注入（只读）」区）；
+A/C 下必须渲染只读占位且**不得抛**。
+**变异**：把兜底改回 `settingsScope` ⇒ **5 条断言同时红** ✓ CAUGHT。
+结构级双保险（contract §6.17c）：兜底必须用 `UNAVAILABLE_SCOPE`、且它是独立常量。
+
+**至此 R56 系列两处渲染期异常（`pct1` 作用域外引用、`getSnapshot` 自递归）都有行为级护栏**，
+`run.mjs` 从 4 套件变 5 套件（**843 断言**）。
+
+**已知缺口（已收窄）**：本套件覆盖**配置卡渲染路径**；输入框档位 chip 与弹窗 HUD 仍未做真渲染冒烟。
+
+
+### R56c 用户转来派发台会话的排查清单：逐条核对结果（2026-10-19）
+
+用户转来一段（来自派发台插件会话的）排查清单：面板不显示"几乎一定是"客户端半边没注册进槽位；
+keyed 槽位 key 写错静默不渲染；`dsh.client` 要 `{platform:'web', immediately:true, inject:[…]}`
+（inject 写错 ⇒ 整个客户端半边 pending ⇒ 面板永不出现）；改完刷新，用 `cordis_inspect_query`
+看 occupants 有没有 `active:true`；若没有，按 ① boot 日志 pending ② 槽位 `available:false`
+③ key 与宿主派发键不一致 的顺序查。
+
+**逐条核对（全部有证据）**：
+- **槽位与 key**：`listSubTree({root:'plugins.bundle.config'})` ⇒ `available: true`，
+  我们的 occupant `registrant: dsh-context-pilot-client` / `key: dsh-context-pilot`（= 包名，
+  owner 按 `pkg.name` 派发）/ **`active: true`** ⇒ 注册路径**完全健康**，①②③ 三条都不成立。
+- **inject 清单**：我们的 7 项与 **dsh-connect-zcode（卡片正常渲染）逐字相同**。
+  ⚠️ 我一度用 `asar list --filter` 判定 `dsh-client-ui-slots` / `dsh-client-ui-primitives`
+  "不存在"⇒ **假警报**：它们是**客户端模块 id**（由客户端运行时提供），不是 asar 里的目录；
+  判据是"我们的 occupant 用同一份清单仍 active:true"⇒ **清单无罪**。（自我更正已记录。）
+- **`immediately: true`**：**已补上**（与 dsh-dispatch 对齐）并加静态守卫；
+  但 **dsh-connect-zcode 没有它也能渲染** ⇒ 它**不是**本次的原因。
+- **真因**（清单三条之外）：注册成功、但**渲染期抛异常被 CardBoundary 吞掉**——
+  `getSnapshot` 自递归（R56b，v0.1.45 已修）。⇒ 面板"不显示"的第四种形态：
+  **槽位里有你那条 active:true，但组件渲染时抛错 ⇒ 页面空白**。这类只能靠**真渲染**发现
+  （`test/client-render.mjs`），Slots/Config inspect 与源断言都看不出来。
+
+### R56d 配置卡"静默消失"第三轮：让失败**可见** + 探针贴近真机（2026-10-19）
+
+用户重启后（v0.1.46）仍看不到配置卡。本轮查清并处理三件事：
+
+**1. key 无罪（证据）**：profile 里有两个 junction（`node_modules\dsh-context-pilot` 与
+`node_modules\@local\dsh-context-pilot`）**都指向 `F:\My Code\dsh-context-pilot\plugin`**，
+两者 package.json 的 `name` 都是 `dsh-context-pilot` ⇒ 与 owner 派发的 `pkg.name` 一致；
+实时 Slots 也显示我们的 occupant `active:true`。owner 的门槛是
+`bundles = keysOf("plugins.bundle.config")`（读 `entry.options.key`）⇒ **我们的 key 在集合里**
+⇒ **卡片是被派发、被渲染的**。⇒ 排除"键写错 / 没注册"。
+
+**2. 探针补盲（`test/client-render.mjs` 13 → 24 断言）**：旧探针**不跑 `useEffect`**、不校验
+Hook 顺序 ⇒ 漏掉两类同样会被边界吞掉的异常。现补：真执行 effect（含 promise 拒绝兜底）、
+同一 view 连渲两次校验 Hook 序列一致、捕获沙箱 `console.warn/error` 并断言"渲染全程零告警"。
+补完后三场景 × 两视图 **24/24 通过** ⇒ **组件本身健康** ⇒ 空白另有原因（下条）。
+
+**3. `CardBoundary` 失败必须可见（本轮产品级改动）**：原先失败 `return null` ⇒ 页面**一片空白、
+零线索**（只有控制台一条 warn，而用户不会开 F12）⇒ 三轮排查都卡在这里。
+现改为渲染一行**自解释诊断**：`⚠️ 配置卡渲染失败（已隔离…）` + `错误：<message>` + 提示看控制台。
+⇒ 用户下次截图即可定位，不必开 F12。隔离粒度不变（坏的只是这一张卡）。
+
+**下一步判据（三种结果都信息量十足）**：硬刷新（Ctrl+Shift+R）后——
+① 看到**完整表单** ⇒ 修好了（此前浏览器很可能跑的是缓存的旧 client.js）；
+② 看到**⚠️ 诊断块 + 错误消息** ⇒ 边界抓到具体错误 ⇒ 直接可修；
+③ **仍然一片空白** ⇒ 卡片根本没被派发 ⇒ 回 owner 派发侧继续查。
+
+**守卫**：contract 1 条（失败可见 + 带错误消息）、client-render 2 条（结构 + 行为）；
+变异（改回 `return null`）⇒ **2 条同时红** ✓ CAUGHT。
+
+### R56e 照 `PANEL-HOWTO.md`（dsh-connect-zcode 的实测经验文档）逐条自查（2026-10-19）
+
+用户转来 zcode 仓库新写的 `PANEL-HOWTO.md`（四处必配 + 生效链路表 + 「面板一直不显示」10 条排查表 +
+最小骨架自检）。逐条对照本插件：
+
+**已满足（有断言/实测）**：
+- ① `package.json`：`dsh.client`（platform=web / immediately / 7 项 inject）+ `exports["./client"]` ✓；
+  `inject` 里有 `@deepseek-ai/dsh-client-ui-settings`（面板可写的关键）✓。
+- ② **信封红线**：`client.js` **零静态 import**、`require` 实参集合只有 `{react}` ✓、
+  `window.__ModuleLoader__.load({ id: "dsh-context-pilot" })` ✓ ⇒ **不构成拒启**。
+- ③ `slots.register` 的 key = 包名 `dsh-context-pilot` ✓（profile 两个 junction 的 `name` 都是它）。
+- ⑤ `/plugins/<包名>/status`：**本插件不适用**——我们没有 status 路由，面板数据走 host 的
+  `getHud` remote 面（文档那条是给"用 webServer 路由供数"的插件写的）。
+
+**本轮补上（文档 §1④，我们确实缺）**：
+- **`NS_EXACT`**：原先只有模糊匹配 `NS_PATTERN = /context-pilot/i`。文档明确警告：模糊可能绑到
+  **别的**命名空间 ⇒ 控件全灰/永远只读，甚至绑错后写入失败。
+  现改为**精确优先**（`entry.ns === NS_EXACT`，`NS_EXACT = "dsh-context-pilot"` = patch 的 `- id:`）
+  **+ 模糊兜底**（改名/多实例仍能工作）。
+- static 新增 5 条（照抄文档 §5 的最小骨架自检 + 文档建议的"常量副本一致性"）：
+  信封红线、信封 id、`NS_EXACT` 存在、`NS_EXACT === cordis.patch.yml 的 - id:`、精确优先顺序。
+
+**结论（对"面板仍不显示"）**：文档 §4 的第 1/2/3 条都已被证据排除（清单齐全、信封合规、
+组件真渲染 24/24 通过、occupant active:true）。**剩下的最可能就是它的第 9 条：client bundle 有缓存
+⇒ 页面没重载**（用户只重启了 DSH，浏览器可能仍跑旧 JS）。⇒ 第一动作：**硬刷新（Ctrl+Shift+R）**，
+并按文档 §0 的"排查第一动作永远是打开浏览器控制台搜插件名"——v0.1.47 起我们的卡片失败会**自报错误**，
+所以刷新后要么出现表单、要么出现带错误消息的诊断块。
+
+### R57 面板易用性（2026-10-19，用户实测反馈；另一个会话已修好面板显示）
+
+用户看到面板后的两条要求：① **模板输入框尺寸太小**；② **把决策卡等内置文案改成一个按钮，点击查看，
+按钮放在输入框旁边**。
+
+**① 放大输入框**：原先模板框与只读 `<pre>` **共用 `.dcp-inj-p`**（`rows:3`）⇒ 被压得很小。
+现独立 `.dcp-tpl`：`rows:8` + `min-height:150px` + 等宽字体 + `resize:vertical` + 满宽。
+
+**② 内置文案按钮**：每个模板框**旁边**一枚「查看内置文案」⇒ 点击在该行下方展开 `<pre class="dcp-builtin">`
+显示**内置原文**（模板留空时插件实际会用的那段），可逐字复制后再改；再点收起。
+
+**内置原文从哪来（关键设计）**：client 半**拿不到**渲染器 ⇒ 若在 client 复制一份必然漂移。
+⇒ 由 host 落档：`compact-tool.mjs` 的两个渲染包装器在**应用模板之前**拿到内置原文，
+经 `keepBuiltin()` 存入 `state.m3.lastBuiltin`；`m2.inject.mjs` 在**两处** `lastInjection`
+（正常路径 + 仅回执路径）随 `injected` 一起下发 ⇒ client 直接读 `inj.builtinBrief` / `inj.builtinCard`。
+**零接线改动**：`host.impl.mjs` 仍 318/320 行（m5 的 deps 里没有 compact-tool 渲染器，
+新增依赖会顶破行数上限 ⇒ 选这条不碰接线的路径）。
+
+**守卫**：client-render 3 条（rows ≥ 8 且 class=dcp-tpl、按钮存在、内置文案来自 `inj.*`）、
+contract 2 条（compact-tool 落档、m2 两处下发）。
+
+### R57b 空模板被显示成 `0`（2026-10-19，用户实测；含同源第二个 bug）
+
+用户反馈：「不是8，是0，里面默认是写个0，应该为空白才对」——**真 bug**，且连带一个更严重的后果。
+
+**根因**（`plugin/client.js#toUi`）：
+```js
+const base = storedValue === void 0 || storedValue === null ? field.def : storedValue;  // 空模板 ⇒ ""
+const n = Number(base);            // ← Number("") === 0
+if (!Number.isFinite(n)) return base;   // 0 是有限数 ⇒ 直接返回 0 ⇒ 输入框里显示 "0"
+```
+⇒ 面板把「留空」渲染成了 `0`，用户会以为模板该填数字。
+
+**同源第二个 bug**（`parseInput`）：`tpl` 字段落到**数值分支** ⇒ `raw.trim() === ""` 判 `null`
+⇒ 保存时走「输入不合法」错误路径 ⇒ **用户无法把模板清回留空**，即「留空 = 用内置文案」这条
+产品承诺根本走不通（清空保存必被拒）。
+
+**修法**：`toUi` 与 `parseInput` 都把**文本类字段**（`text` / `tpl`）当字符串处理——
+`toUi` 原样返回（`undefined/null → ""`），`parseInput` 直通字符串。`canon` 本就对非数值字段
+返回字符串（`""` 是字符串）⇒ 无需改动。
+
+**守卫**：client-render 1 条（空模板的 `value` 必须是 `""`，不是 `0`）+ contract 2 条
+（`toUi` 文本直通、`parseInput` 把 tpl 当字符串）。**变异**：撤掉 `toUi` 的文本直通 ⇒ 套件红 ✓ CAUGHT。
+
+### R58 内置文案按钮显示"暂无"的判据（2026-10-19，用户实测）
+
+用户看到「查看内置文案」展开后是**空的**。判据与结论：
+- **不是** client 的问题：同一屏里输入框已变大、按钮已出现、空模板已显示空白 ⇒ client 半（v0.1.49/50）
+  已生效；`injected`（用量行 / 本轮活值）也有数据 ⇒ HUD 面通着。
+- **是 host 半没重载**：内置原文由 `compact-tool.mjs` + `m2.inject.mjs`（**host 模块**）落档并随
+  `injected` 下发；`PANEL-HOWTO.md` §0 的生效链路表写明「`index.js`（host 半）⇒ **toggle 插件**或重启 DSH」，
+  而用户只刷新了页面 ⇒ host 仍是旧版 ⇒ `builtinBrief`/`builtinCard` 为 null。
+⇒ 处置：把"暂无"提示改成**可操作**的（明确写出"请先 toggle 插件（关→开）加载新版 host"），
+并加断言钉住这条提示（R58，client-render）。这也是文档 §0 那条纪律的客户端体现。
+
+### R59 「本轮活值 / 生效配置」并进板块标题行（2026-10-19，用户实测）
+
+用户原话：「然后下面的那些内容移到**版本**里面显示」→ 随后更正：「我的意思是移到**板块**里面，写错字」。
+即把「本轮活值 …」与「生效配置 …」两行从**板块最底部**移到「本轮注入（只读）」**板块标题行**——
+原先要读完六段注入原文才看到活值，与"先看结论"的阅读顺序相反。
+
+**改法**：`injSec` 的标题行从「只有标题」改为**可换行 flex 行**（`.dcp-inj-h` 加
+`display:flex;flex-wrap:wrap;gap:4px 12px`，并让行内的 `.dcp-inj-n` 去掉 `margin-bottom`），
+依次放：板块名 → 最近一轮 → 刷新按钮 → 本轮活值 → 生效配置；同时**删掉底部**原来的
+`key:"vals"` 那行与板块末尾的 `cfg ? …` 行（防同一信息渲染两次）。
+
+**守卫（4 条，client-render）**：① 标题行块（`dcp-inj-h`）内含活值与生效配置（**源码形状**断言——
+渲染层断不到，因为 `inj` 由 `hudRemoteSvc.getHud()` 填充、沙箱不桩这条远端链路 ⇒ `inj` 恒 null）；
+② 底部不再残留 `key:"vals"`；③ 标题行确实渲染且含刷新按钮；④ 标题行是 `flex-wrap`。
+**变异**：把活值行挪回底部 ⇒ R59 红 ✓ CAUGHT。
+
+### R60 补「思考强度教学」输入框 + 六段注入原文改为按钮展开（2026-10-19，用户实测）
+
+用户两条：「圈红的应该移到板块里面显示，**或者按钮点击显示**」+「还确实（缺）一个**思考强度教学**的输入框」。
+
+**① 六段注入原文默认收起**：原先「本轮注入（只读）」把六段原文（用量行/决策卡/一次性说明/思考强度教学/
+换档提示/压缩自检回执）**无条件整块铺开**——一屏上千行，把面板撑得没法用。现每段一行
+`[标题] [查看] [复制]`，`<pre>` 只在 `injOpen === title` 时渲染（新增 `injOpen` state，与 `tplOpen` 同层）。
+
+**② 新增「思考强度教学模板」（`tplEffBrief`）**——这是本轮唯一的新配置字段，贯通 **7 处**：
+| 处 | 改动 |
+|---|---|
+| `plugin-config.schema.mjs` | `.volatile()` 字符串字段（面板可写；DSH 只放行 volatile ✓） |
+| `core.mjs#M3_DEFAULTS` | `tplEffBrief: ''` |
+| `core.mjs#mergeConfig` 读取集 | += `'tplEffBrief'`（与 M3_DEFAULTS 同集合，契约有断言） |
+| `core.mjs` 模板校验 | `['tplBrief','tplCard','tplEffBrief']`（≤8000 字符） |
+| `compact-tool.mjs` | 新增并导出 **`renderTemplated(which, text, extraVars)`** —— 给**别的域产出**的文案套壳 |
+| `m2.inject.mjs` | `effBriefBuiltin` = effort 域原文；`effBrief` = 套模板（`{tool}` 覆盖为 `set_reasoning_effort`）；两处 `lastInjection` 带 `builtinEffBrief` |
+| `client.js` | FIELDS 第 3 个 `tpl` 行；内置文案映射扩成三支 |
+
+**为什么需要 `renderTemplated`**：「思考强度教学」原文由 **effort.mjs** 产出（`effortApi.renderBrief`），
+compact-tool **拿不到**原文 ⇒ 不能像 brief/card 那样自己渲染。故 compact-tool 只提供**通用套壳**，
+规则与另两个模板完全一致：必须含 `{tool}`，缺则回退内置并留痕（`tplFallback`）。
+`{tool}` 在此语境被覆盖为 `set_reasoning_effort`（否则模板会指向压缩工具，模型会调错工具）。
+
+**守卫**：contract 4 条（导出 `renderTemplated` / m2 套模板且工具名正确 / 两处下发 `builtinEffBrief` /
+面板映射三支）+ client-render 2 条（模板框 ≥3 个 / 原文默认收起靠按钮展开）；另有**契约自动新增 3 条**
+（三端一致性守卫认出新字段：schema ↔ FIELDS ↔ mergeConfig 读取集）。
+**变异**：不套模板 ⇒ contract 红 ✓；原文改回无条件展开 ⇒ client-render 红 ✓ ⇒ 两条都 CAUGHT。
+
+### R61 六段原文改为「整段一个」开关 + 刷新按钮说清用途（2026-10-19，用户实测）
+
+用户三条反馈：「本轮注入的内容应该移到面板里面，查看按钮重复了，上面的没有刷新按钮。」
+追问后用户明确：**保持在配置卡里**（「就上面那个看板，比如可以放在强压缩冷却下面，到时是在一个板块内」）
+⇒ 位置不动（它本来就在表单最后一行「强制压缩冷却」之下、作为独立板块）。
+
+**① 查看按钮重复** ⇒ 六段原文原先每行一个「查看」（6 个一模一样的按钮）⇒ 改为**整段一个**开关：
+板块标题行新增「**展开全部原文 / 收起全部原文**」，六段一起开合；每行只留「复制」（复制不需要先展开）。
+状态从 `injOpen`（string|null）改为 `injAll`（boolean）。
+
+**② 「上面的没有刷新按钮」** ⇒ 刷新**本来就在**板块标题行（标签只写「刷新」、不够显眼）⇒ 改标签为
+「**刷新注入数据**」并加 title 说明"重新拉取本轮注入原文与生效配置（内置文案也走这条）"——
+因为「查看内置文案」和六段原文是**同一份** `inj` 载荷，一次刷新全部更新。
+
+**守卫**：client-render R61 一条（`injAll` 状态 + 整段开关文案 + 确认 `setInjOpen` 已彻底移除）。
+（本轮先写错断言顺序：代码是 `injAll ? "收起" : "展开"`，断言写成 `"展开" : "收起"` ⇒ 套件红 ⇒ 已修 ✓。）
+
+### R62 三条实测反馈同源修复：板块位置 / 按钮无反应 / 内置文案为空（2026-10-19）
+
+用户三条：「本轮注入那些，移到强制压缩下面，再一个板块，现在没包含进去」+「2 个按钮点击没什么反应」
++「查看内置按钮点击显示空的」。
+
+**根因（后两条同源）**：`inj === null`——host 侧 `state.m2.lastInjection` 为空（本进程还没发生过注入）。
+于是 ①「展开全部原文」没有内容可展开 ② 点击「刷新注入数据」数据没变、无任何反馈 ③ 三个「查看内置文案」
+拿不到 `builtinBrief/builtinCard/builtinEffBrief` ⇒ 全是空。
+
+**① 板块放进卡片**：`injSec` 原先与 `.dcp-grid`（带边框那张卡）**平级** ⇒ 视觉上落在卡片外面。
+现改为 `.dcp-grid` 的**最后一个子节点** ⇒ 落在「强制压缩冷却」行之下、**同一张卡片内**，作为独立板块
+（`.dcp-inj` 自带顶部分隔线）。
+
+**② 按钮有反应**：`pullInj` 改为**返回**本轮注入对象；新增 `refreshInj()`——点「刷新注入数据」后回一句
+状态（有数据：「已刷新注入数据（最近一轮 HH:MM:SS）」；无数据：「已刷新：host 侧本轮还没有注入记录…」）。
+「展开全部原文」在 `inj === null` 时**置灰禁用**，title 说明「本轮还没有注入记录，没有原文可展开」。
+
+**③ 内置文案随时可读**：原先 `state.m3.lastBuiltin` 只在**模板渲染时**落档 ⇒ 首轮注入前面板永远空。
+现：
+- `compact-tool.ensure()`（工具注册期，宿主 pre-step 最前面调用）按**当前配置**预渲染一份 brief/card
+  内置文案（注入发生后被真实活值版本覆盖）；
+- `m2` 把 effort 域的**内置原文**长期留档在 `state.m2.lastEffBriefBuiltin`（思考强度教学原文别的域拿不到）；
+- `m5` 的 HUD `config` 载荷新增 `builtins: { ...state.m3.lastBuiltin, effBrief: state.m2.lastEffBriefBuiltin }`；
+- client 的「查看内置文案」由「只读 `inj.*`」改为 **`inj.* ?? cfg.builtins.*`**。
+
+**守卫**：contract 4 条（映射回落三支 / ensure 预渲染 / HUD builtins / m2 留档）+ client-render 2 条
+（板块在 .dcp-grid 内且在 actions 之前 / 刷新有反馈且无注入时禁用展开）。
+**变异**：撤掉 ensure 预渲染 ⇒ contract 红；去掉 `disabled: inj === null` ⇒ client-render 红 ⇒ 两条都 CAUGHT。
+
+### R63 去掉「内置文案」与本轮注入的重复展示（2026-10-19，用户实测）
+
+用户问：「下面显示的全部，跟上面的内置文案不是一样的么？2 处重复的？」
+
+**分析（用户是对的）**：模板**留空**时，注入的内容**就是内置文案本身** ⇒「查看内置文案」展开的
+和下方「本轮注入」里同名段落**逐字相同**，纯属重复展示。差异只在**设了模板之后**：那时注入的是
+模板渲染结果，内置文案才是"没设模板时会用的话"这类参照物。
+
+**规则（去重）**：`tplIsDupOfInj(field)` = 「该模板值为空」**且**「已有本轮注入记录」⇒
+- 为真：**不显示**「查看内置文案」按钮，改显示一句灰色说明：
+  「留空 = 内置文案；本轮注入的「决策卡」就是它（见下方板块，不重复展示）」；
+- 为假（模板非空，或还没有注入记录）：照旧显示按钮 + 可展开内置原文——这两种情况下它不是重复。
+
+**注意**：R62 才刚让内置文案"随时可读"，本轮的规则保留了那个收益（无注入记录时仍可查看），
+只是在**有注入且模板留空**这种重复情况下折叠掉。
+
+**守卫**：client-render 2 条（判重函数与提示文案存在 / 非重复时仍可查看）。
+**变异**：把 `inj !== null` 改成 `false`（= 永不判重）⇒ client-render 红 ✓ CAUGHT。
+
+### R64 「本轮注入」只显示 2 行不是丢了（2026-10-19，用户实测「只剩 2 个？」）
+
+**分析（不是 bug）**：六段里只有 **用量行** 与 **决策卡** 是每轮都可能有的；另外四段是**按时机**注入的：
+- 一次性说明 / 思考强度教学：**只在会话首轮**注入一次；
+- 换档提示：只在建议换档时；
+- 压缩自检回执：只在压缩实际执行后。
+普通一轮里它们确实为空，而 `injBlock` 原先「**内容为空 ⇒ 整行不渲染**」⇒ 面板上只剩 2 行，
+用户无法区分「这轮没注入」和「功能坏了/丢了」。
+
+**改法**：六行**恒显**（`inj === null` 时仍整段不渲染，走既有统一提示）。空的那行不再给「复制」按钮，
+改为灰色说明 **「本轮未注入（<时机>）」**，并给每段标注时机：
+用量行「每轮都注入」/ 决策卡「占用达智能压缩线时注入」/ 一次性说明与思考强度教学「只在会话首轮注入一次」/
+换档提示「只在建议换档时注入」/ 回执「只在压缩实际执行后注入」。
+
+**守卫**：client-render 1 条（六行恒显 + 空行写明原因 + 旧的「空即不渲染」写法已消失）。
+**变异**：把空行的原因说明去掉（退回静默隐藏）⇒ client-render 红 ✓ CAUGHT。
+
+### R65 撤掉「本轮注入」整段，改为三个模板行「查看 / 复制内置文案」（2026-10-19，用户定稿）
+
+用户：「太乱了，下面的本轮注入可以不要。上面的 3 个输入框，增加查看内置的文案按钮，和复制内置文案的按钮。就可以了。」
+
+**删**（R55~R64 的注入可视化整段）：`injBlock` / `injSec` / `injAll` 状态 / `refreshInj` / 板内
+「刷新注入数据」「展开全部原文」按钮、以及 `.dcp-grid` 里的 `injSec` 节点。
+同时删掉随之失去意义的 R59（活值并入标题行）、R63（与本轮注入判重）、R64（六行恒显）三段逻辑。
+⇒ 面板回到「一张卡片 + 三个模板行 + 保存/计算器」的简单形态。
+
+**留**：`inj` / `cfg`（用于内置文案数据源）与 `pullInj`（挂载时拉一次 HUD，给 `cfg.builtins` 兜底）。
+
+**加**：三个模板行各两个按钮——「**查看内置文案**」（展开/收起 `<pre>`）与「**复制内置文案**」
+（直接写剪贴板，**不需要先展开**；无数据时提示「先 toggle 插件（关→开）让 host 下发」并给可见反馈）。
+数据仍统一走 `builtinTextOf(field)`：`inj.builtin* ?? cfg.builtins.*`（host 侧 R62 已保证随时可读）。
+
+**为什么这样更好**：内置文案与「本轮注入」在**模板留空时逐字相同**（用户上一轮已指出重复），
+同一份内容只留一个入口即可；而模板非空时，内置文案仍是"没设模板时会用的话"这一必要参照物。
+
+**守卫**：contract 1 条（不再渲染注入区 + 两个按钮都在）+ client-render 7 条（三个 textarea、rows≥8、
+空模板显示空白、按钮数各 ≥3、注入区源码已消失、数据仍来自 host、复制有反馈、toggle 提示）。
+**变异**：删掉「复制内置文案」按钮 ⇒ contract + client-render 同时红 ✓ CAUGHT。
+
+### R66 「强制压缩线」与「阈值余量」到底哪个生效（2026-10-19，用户实测）
+
+用户指着这两个值问：「这 2 个值有点冲突，看下具体哪个生效。」
+
+**结论：不冲突，但旧提示说不清**。三层关系（host 侧同一套公式：`criticalCapOf = engineThreshold − margin`，
+`effCrit = min(M3.criticalRatio, criticalCapOf)`）：
+
+1. **引擎阈值**：DSH 自己的自动压缩线（截图里为 80%）。
+2. **上限** = 引擎阈值 − 阈值余量 = 80% − 5pp = **75%**（面板从 HUD 的 `criticalCap` 拉到的就是它）。
+3. **生效强制线** = **min(你设的强制压缩线, 上限)**。
+
+⇒ 当前「强制压缩线 0.75」与「上限 75%」**恰好相等**，所以生效值就是 75%，看起来像"两个 0.75/0.05 在打架"。
+实际是：**上限是硬顶，你的值只能更小**——
+- 强制压缩线调到 0.6 ⇒ 生效 60%（你的值赢）；
+- 调到 0.9 ⇒ 生效仍 75%，且**保存时会被自动钳回 0.75**（面板有自动钳制）；
+- 阈值余量调到 0.10 ⇒ 上限变 70% ⇒ 生效 70%（即使强制压缩线仍显示 0.75）。
+
+**旧提示的两个毛病**：① 余量被**写死成「5 个百分点」**（用户改了余量也不更新）；② **不显示最终生效值**。
+**改法**：`hintFor` 改为按**活值**动态生成——
+- 强制压缩线：「上限 = 引擎阈值 − 余量 X 个百分点（当前上限 75%）；**生效强制线 = min(你的值, 上限) = 75%**」；
+- 阈值余量：「当前引擎阈值 80% − 余量 5pp = 上限 75%；**生效强制线 = 75%**（与你设的强制压缩线取较小者）」。
+余量取 `cfg.engineCapMargin`（活值，非法回退 0.05），引擎阈值由 `上限 + 余量` 反推。
+
+**守卫**：contract 1 条（提示必须含「引擎阈值 − 余量」与 `Math.min(v, engineCap)` 与「生效强制线」）。
+**变异**：把 `Math.min(v, engineCap)` 改成 `v`（不再取较小者）⇒ contract 红 ✓ CAUGHT。
+
+### R67 上限随「阈值余量」实时重算，强制压缩线联动钳制（2026-10-19，用户定正确语义）
+
+用户：「设置应该是 DSH 内置的强制压缩线 − 余量 = 生效强制压缩线。现在设置余量，强制压缩线没有动态变化。
+比如现在是 0.05，设置 0.8 会被钳回 0.75；如果我设置 0.1，应该自动钳回 0.7。」
+
+**旧实现的两个断点**：
+1. `engineCap` 只在**挂载时**由 HUD 拉一次（= 引擎阈值 − 当时的余量）⇒ 改余量**不会重算上限**；
+2. 三处钳制（输入即时 / 保存 / 计算器回读）全部引旧 `engineCap` ⇒ 余量变大后强制压缩线仍停在旧值。
+
+**新模型（单一直径）**：
+```
+引擎阈值      = 拉到的 engineCap + 拉取时的余量     // host: criticalCapOf = engineThreshold − margin
+上限 capNow   = 引擎阈值 − **当前草稿里的余量**      // 余量一改，上限立刻变
+生效强制线     = min(强制压缩线, capNow)
+```
+- 新增 `marginSaved` / `engineThresholdNow` / `marginDraft` / `capNow` 四个派生值（全部`useState`之上纯计算）；
+- **草稿联动 effect**：`capNow` 一旦低于当前强制压缩线 ⇒ 立刻把草稿改成 `capNow`（输入框当场显示 0.70）
+  ⇒ `dirty` 变真 ⇒ 保存按钮可用 ⇒ 保存即落盘（**刻意不自动写盘**：还没点保存就改线上配置会让用户意外）；
+- 输入即时钳制、保存钳制、计算器回读、两处提示全部改用 `capNow`；
+- 反向不会"偷偷放大"：把余量改小（上限升高）时**不会**自动把用户的 0.70 抬回去。
+
+**举例**（引擎阈值 80%）：余量 0.05 ⇒ 上限 75%；改成 **0.10 ⇒ 上限 70%** ⇒ 强制压缩线当场显示 **0.70**（脏），
+点保存后与余量一起落盘；再把余量改回 0.05 ⇒ 上限回 75%，但你的 0.70 **保持不动**（只在你主动调大时才变）。
+
+**守卫**：contract 新增 2 条（重算公式 + 草稿联动 / 输入与保存都用 capNow），并把 7 条钉死旧 `engineCap`
+写法的断言升级为 `capNow` 语义。**变异**：把 `capNow` 退回 `engineCap` ⇒ contract 红 ✓ CAUGHT。
+
+### R68 强制压缩线显示成 `0.7000000000000001`（2026-10-19，用户实测「小数位有问题」）
+
+**根因**：上限是**浮点减法**算出来的——`engineCap + marginSaved − marginDraft` = `0.75 + 0.05 − 0.1`
+= **0.7000000000000001**（IEEE754 经典误差）。R67 的联动钳制直接 `String(capNow)` 写进草稿 ⇒ 输入框显示一长串。
+
+**修法**：加 `roundRatio = (x) => Math.round(Number(x) * 1e4) / 1e4`，`capNow` 一律先归一：
+`Math.max(0, roundRatio(engineThresholdNow - marginDraft))` ⇒ 显示 `0.7`。
+选 **4 位小数**的理由：比例类参数 0.0001 = 0.01%，已远超实际需要（上限本身是"引擎阈值 − 几个百分点"，
+精度要求到 0.1% 就够）；同时保留 R55 的 `0.745` 这类一位以上小数不被截断（那是 `pct1` 的显示路径，4 位不受影响）。
+
+顺带说明：**保存路径拿到的 cap 也是归一后的值**（`cap = capNow`），所以落盘也不会写进浮点长串。
+
+**守卫**：contract 1 条（必须有 `roundRatio` 且 `capNow` 用它归一）；R67 那条断言同步升级为含 `roundRatio` 的写法。
+**变异**：去掉归一 ⇒ **R67 + R68 两条同时红** ✓ CAUGHT。
+
+### R69 「最近切换」时间加上日期（2026-10-21，用户要求）
+
+用户：「把最近换档的时间加上日期显示。」（截图里 chip tooltip 只显示 `（01:09:35）`）
+
+**为什么需要日期**：`lastSwitch` 是**落盘数据**（`~/.dsh` 下按 sid 存），跨天、跨重启后仍会显示——
+只有 `时:分:秒` 的话完全看不出是哪天，用户看到 `01:09:35` 会误以为是"今天凌晨"（可能是几天前）。
+
+**改法**（`plugin/effort.mjs#hudPayload`）：原 `new Date(ls.at).toLocaleTimeString('zh-CN', {hour12:false})`
+改为自写 `fmtSwitchAt(ms)` ⇒ **`YYYY-MM-DD HH:MM:SS`**（本地时区）。选自写而不继续用 locale 的原因：
+不同 locale 的 `toLocaleString` 分隔符/顺序不一致（`2026/10/21 14:41:39` vs `2026-10-21 14:41:39`），
+会把 chip tooltip 的排版搞乱；自补零则跨环境稳定。
+
+**守卫**：contract 2 条源码级（必须有 `fmtSwitchAt` 且格式为 `YYYY-MM-DD HH:MM:SS`、不再用
+`toLocaleTimeString`；且自补零不依赖 locale）+ **1 条行为级**（`hudPayload.lastSwitch.at` 必须匹配
+`/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/`）。
+**变异**：退回 `toLocaleTimeString` ⇒ **行为级 + 源码级同时红** ✓ CAUGHT。
+
+### R70 趋势外推不准：单轮增量 → 最近 N 轮均值 + 压缩后重置基线（2026-10-21，用户实测）
+
+用户：「这个趋势计算好像不太准确。」（卡上「趋势（按最近一轮增量粗估）：本轮 +14k token，约 18 轮触强制线」，
+但同一张卡的另一处写着「距 75% ≈37 轮」）
+
+**三个真实缺陷**：
+1. **只看上一轮单轮增量**：一轮贴图 / 大 diff / 一次大工具输出就能把「还有几轮」算成 1 轮
+   （用户此前真见过「约 1 轮就触 75%」，而当时占用才 38%）。
+2. **压缩后基线不重置**：压缩把上下文大幅改小 ⇒ 下一轮 `used − prev` 是**负数** ⇒ `delta > 0` 不成立
+   ⇒ 趋势行**整段消失**；若某轮又跳回高位，还会算出一个离谱轮数。
+3. **两处轮数取整不一致**：`turnsToLine` 用 `Math.ceil`，「两个方向」里的 `turns` 用 `Math.floor`
+   ⇒ **同一张卡出现 18 与 37 两个互相矛盾的数字**（用户指的就是这个）。
+
+**修法**（`plugin/m2.inject.mjs#trendOf` + `plugin/compact-tool.mjs#renderCardBuiltin`）：
+- 增量改为**最近 `TREND_SAMPLES = 4` 轮正增量的均值**（抗单轮尖峰），并把**样本轮数**写进文案
+  （「近 3 轮均值粗估」——让读者知道这个外推基于几轮）；
+- 检测到上下文**骤降**（`> max(2% 窗口, 2000 token)`）即判定「刚压缩」⇒ **清空样本、重置基线**，
+  该轮**不给外推**，改说「刚刚压缩过（上下文骤降）⇒ 基线已重置，下一轮起重新累计」；
+- 两处轮数统一 `Math.max(1, Math.round(...))`；
+- 仍保留「粗估」字样：增量本身波动大，任何外推只能当量级参考。
+
+**字数预算**：卡片文本每请求下发，`desc + brief + card ≤ 3000` 是硬约束（R16.15）。本轮新增文案
+一度把合计顶到 **3002** ⇒ 精简措辞（「按最近…」→「近…」、「平均每轮」→「每轮」、「若这个轮数很小，
+现在就是…」→「轮数很小时就是…」）压回预算内。
+
+**守卫**：contract 4 条源码级（均值窗口/骤降重置/压缩后文案/取整同口径）+ **2 条行为级**
+（`deltaSamples: 3` ⇒ 文案含「近 3 轮均值粗估」；`resetByCompaction: true` ⇒ 含「刚刚压缩过」且**不含**轮数外推）。
+**变异**：关掉骤降检测 ⇒ contract 红 ✓ CAUGHT。
+
+### R71 双份独立审查 + 交叉验证，落地 13 项（2026-10-24，用户要求「派发审查、交叉验证、强制优化/解耦」）
+
+**过程**：用派发台分别派两份**只读**审查（同口径提示词：四条硬约束 + 五个维度 + 严格表格 + 待验证清单），
+然后由 Lead **逐条回源码验伪**再落地——13 项采纳、3 项驳回/降级、1 项由 Lead 独立发现（两份都没提到）。
+
+⚠️ **模型实际不是 GLM-5.3**：runner 日志明确「模型替换：--model GLM-5.3 → GLM-5.3-Flash
+（免费额度权益只授予 GLM-5.3-Flash；用未授予的模型会被上游判 1005 exceed）」。所以两份报告是
+**同模型、不同思考强度**（max / high）的两次独立运行，**不构成真正的跨模型交叉验证**；
+真正的 GLM-5.3 需要 plan 套餐通道（当前 userDisabled 且撞额度）。此限制不改变验伪结论的有效性。
+
+**采纳并落地（13）**：
+
+| # | 修法 | 出处 | 性质 |
+|---|---|---|---|
+| 1 | `core.writeReport` 用 `{size,mtimeMs}` **stat 指纹门控**，指纹一致即跳过全量 `JSON.parse` | 两份一致（P1） | 强制优化（热路径） |
+| 2 | m2 中步路径补 **noFactory 守卫**（两处），回执不再「取出即丢」 | 两份一致（P1） | 正确性 |
+| 3 | `m3.preStepCompaction` 把 `wanted` 提到函数体开头，catch 报**真实 trigger** | 单份（F-11） | 正确性 |
+| 4 | 面板挂载 **两次 `getHud("")` 合一**，并改 `getHud(resolveSid())` | 审查 #6 + F-10 | 优化（RPC）/口径 |
+| 5 | `effort.bySid` 加 `EFFORT_SID_CAP = 200` 并淘汰最旧 | 两份一致 | 有界化 |
+| 6 | `state.m2.nudged` 加 64 键上限（与 decisionRepeat 同款） | 两份一致 | 有界化 |
+| 7 | `session-facts.median` 改**真中位**（偶数取两中值平均） | 单份（#9） | 正确性（诚实口径） |
+| 8 | 面板底部删掉**已退役 8 个月的「压缩标记通道」说明** | 两份一致（双方都定 P1） | 口径漂移 |
+| 9 | 删死导出 `messageTextLength`、死解构 `TAG`/`HISTORY_CAP`、重复的 25 行头注释 | 单份（F-03/04/05） | simplify |
+| 10 | 删 **6 个零引用 CSS 类**（`.dcp-inj*`，R65 删注入区后的残留） | **Lead 独立发现**（两份均漏） | simplify |
+| 11 | `m2` 重复取 `getCompactToolApi()` 合并为一个 `api` | 单份（F-06） | simplify |
+| 12 | 落盘记录里的时间改自拼 `HH:MM`（R69 同纪律，不再依赖 locale） | 单份（#7） | 正确性 |
+| 13 | `{tool}` 覆盖值改从 `effortApi.TOOL_NAME` 取，不再硬编码 | 单份（#10） | 解耦 |
+
+**驳回 / 降级（3）**：
+
+- ❌ 「删注释+死解构**能放宽 host.impl 行预算 ~25 行**」——`static.mjs` 数的是**代码行**（去注释/空行），
+  删 25 行注释省 **0 行**；删解构里的两个标识符也不减少行数；`messageTextLength` 在 core.mjs、不占该预算。
+  实测收益 **0 行**（可读性收益另算）。**这类"收益估算"必须回代码核口径**。
+- ❌ 「`⚠️` emoji 违反本项目前端规范（禁 emoji）」——全仓 20+ 处 `⚠️` **都在注释里**，用户可见仅 1 处
+  （R56b 诊断块），且**找不到该规范的出处** ⇒ 不算违规，不改。
+- ⚠️ boot 冒烟依赖真实 sleep（1.5s/2.5s/1.6s）——本机 5.1–5.2s 稳定通过，无 CI 记录佐证 ⇒ 记为观察项，不改。
+
+**未落地但记录在案**：`F-14`（range 模块未就绪 + 低占用 + 模型意图 ⇒ 回落 `official` 可能 retain≈0）
+需要单独拍板（低概率、高破坏）；`contract` 里存量的"源码形状"断言**不改写**，只约束增量走行为级。
+
+**守卫**：contract 新增 10 条（含 2 条**反向断言**：不得再出现 `messageTextLength` / `压缩标记通道` / `.dcp-inj{`），
+其中 3 条在写断言时**先抓住了我自己漏改的两处**（死导出残留、死解构残留）——正是反向断言该干的事。
+**变异**：关掉 stat 门控 / 去掉 noFactory 守卫 / 退回上中位 ⇒ **全部 CAUGHT**。
+
+**测试**：907 断言全绿（contract 717 / static 84 / report 54 / boot 22 / client-render 30）。
+### R72 真 GLM-5.3 跨模型审查 + 7 条 P1 落地（2026-10-24，用户要求「两个模型都有免费额度，重新跑」）
+
+**先修了派发通道的真 bug**：上一轮 "GLM-5.3" 被 runner **静默替换**成 GLM-5.3-Flash。根因在
+`dsh-dispatch/collab-kit/zcode-run.mjs:896-910`（ZB-40 的模型⇄权益校验）：它只读额度对象的**单一**
+`q.model`（默认 Flash）就判定「权益只授予这一个」，而同一份数据里 `perModel` 明确有 GLM-5.3
+196.1M/200M 余额 ⇒ 权益是**逐模型**授予的。改为按**授予集合**（`model ∪ models ∪ perModel[].model`）
+判定：在集合内就照用，只有确实不在集合里才替换。修后实测 `modelId=GLM-5.3`、`providerError=null` ✓
+（改动在 dsh-dispatch 仓库，已单独提交；原文件备份 `.bak-20261024`）。
+
+**真 GLM-5.3 的审查质量明显更高**：913s / 305 次工具调用 / 14,924 字符，报出 **7 条 P1 + 20 余条 P2**，
+其中一条直接指出 **R71 的修复不完整**（H3）。本轮落地 13 项：
+
+| # | 修法 | 性质 |
+|---|---|---|
+| H1 | `lastUserText` 把 `session.surface`（SurfaceManager 对象）当数组判 ⇒ **恒返回空串** ⇒ effort 的「用户要求深入/快速」两个换档触发**从未工作过**。改读 `surface.nodes`，并兼容数组形态 | 正确性（功能复活） |
+| H2 | `official()` 是**同一条 retainTokens=0 通道**：F-14 只堵了 `no-range-module`，其余 `surface-mismatch`/`boundary-exhausted`/`invalid-boundary` 在低占用时仍会把近端砍光 ⇒ 统一收口为 `guardOfficial`（未越强制线 ⇒ 收手+计数+留痕；越线才回落） | 正确性（数据安全） |
+| H3 | 中步回执：R71 只补了「别裸调用」，但 `takeCompactReceipt`（取出即标 read=true）在工厂判定**之前** ⇒ 回执仍「取出即丢」。顺序改为先判工厂、再取回执 | 正确性（R71 补正） |
+| H4 | `renderTemplated`：`tplVars` 的键带花括号（`'{tool}'` 固定为压缩工具），而 `extraVars` 是裸键 ⇒ **覆盖不掉** ⇒ 思考强度教学把换档工具教成 `compact_context`（模型照调会真的触发一次压缩）。改为折成 `'{k}'` 键覆盖、不再写裸键 | 正确性（教错工具） |
+| H5 | `action` 只有二分判断 ⇒ `set_tier`/`Set-Tier` 等打错字**静默落成真压缩**。改为值不合法即返回 `ok:false`（可见失败、可纠正） | 正确性（危险侧静默） |
+| H6 | 面板提示指向**不存在的「刷新页面」按钮**（R65 撤注入区时按钮被连带删除、文案残留）⇒ 改为「重新打开本面板」 | 口径漂移 |
+| C1 | `ensure()` 预渲染 card 传 `ratio:null`，而卡片首行守卫 `ratio == null ⇒ null` ⇒ 决策卡内置文案**恒空**（R62 只达成了 brief）。改传演示值并标 `demo:true` | 功能缺口 |
+| C2 | 预设按钮用 `dataset:{active}`（React 不支持该 prop）⇒ CSS `[data-active]` **永不命中**，选中高亮从未生效。改 `"data-active"` | 正确性 |
+| C3 | 自动钳回落盘未过 `roundRatio` ⇒ host 下发的浮点尾差写进配置（R68 只归一了显示值） | 正确性 |
+| C9 | host 允许 `ratio` 有值而 `occupancyWindow` 为 null ⇒ 提示渲染「距智能压缩线 **NaN**」⇒ 窗口缺失时只报状态 | 正确性 |
+| C10 | 清空「阈值余量」输入框时 `Number("")===0` 通过校验 ⇒ 草稿期上限瞬时变成引擎阈值全额 ⇒ 空串按「未填」回退已存值 | 正确性 |
+| S1 | 宿主的 `compactWithOwnRange` **同名转发零生产调用者**（唯一消费者是一条源码形状断言）⇒ 删掉，代码行预算 **318 → 314**（余量 6 行） | simplify |
+| H7 | `test/static.mjs` 注释仍写「当前 294」⇒ 改为实测 314 并警示余量 | 文档 |
+
+**记在案但未落地**（20 余条 P2，按 GLM 报告编号）：C4 换档让位时序、C5 carry 路径误登记、C6 宿主
+`verifyBySid` 无界、C7 原子写降级无留痕、C8 slim 快照仍全量测量、C11 `hudLastAct` 死字段、
+C12 schema 无范围约束、S2 `diag()` 死出口+注释失实、S3 候选链两段同构、S4 envelope 解包两份、
+E1 m2 教学线不含动态余量、E2 用户模板可超 3000 预算、E3 意图消费后失败不重试、E4 effort 取证字段挂 m3、
+E5 报告损坏无备份、E7 run.mjs 无 timeout、E8/E9/E10/E11 小项。
+
+**守卫**：contract 新增 13 条（含 H4/H5/C1 三条**行为级**：模板 `{tool}` 必须解析成换档工具、
+`set_tier` 必须 ok:false、`ensure()` 后决策卡内置文案非空）。**变异**：H4 退回裸键 / H1 退回读对象 /
+H5 关校验 / C1 退回 `ratio:null` ⇒ **全部 CAUGHT**。
+
+**测试**：923 断言全绿（contract 733 / static 84 / report 54 / boot 22 / client-render 30）。
+### R73 P2 批次（真 GLM-5.3 报告的第二梯队，2026-10-24，用户「继续」）
+
+承接 R72 记录的 20 余条 P2，本轮落地 10 条（其余见文末）：
+
+| # | 修法 | 性质 |
+|---|---|---|
+| C4 | 换档「他人显式指定」让位判据补 `acceptFrom`（**接受时刻**的当前档）。原判据只看 `applied`，而 `applied` 只在首次 apply 成功后才写 ⇒「工具刚接受、还没 apply」的窗口里用户手改档 → 判不出"他人指定" ⇒ 插件**强写自己的档、覆盖用户选择** | 正确性（覆盖用户） |
+| C5 | `setTier` 加 `explicit` 标记：carry 路径（只带锚点、没真传 tier）也写表，但**不算申报** ⇒ `hasTier=false`、`tierState='none'`。原先 carry 会把未申报会话标成「已申报 standard」（「系统代压」提示消失），并把落盘恢复的 `restored:true` 覆盖成 `set` | 正确性（取证口径） |
+| C6 | 宿主 `verifyBySid`（m3 模块缺失时的兜底写）**无上限** ⇒ 与 m3 的 `SET_CAP` 同口径淘汰最旧键 | 有界化 |
+| E2 | 用户模板超 3000 字符原先**静默放行**（`≤3000` 只是内置文案的回归断言）⇒ 加 `state.m3.tplOversize` 留痕 + warn。**不截断**：截断可能正好截掉 `{tool}`，比多花 token 更糟 | 留痕（诚实口径） |
+| E5 | 报告文件损坏时原先「按首写覆盖」⇒ **历史整份丢失**（`writeJsonAtomic` 只防半截写）。改为先 `rename` 成 `.corrupt-<ts>` 备份、再首写重建 | 正确性（数据保护） |
+| E7 | 门禁 `test/run.mjs` 的 `execFileSync` **无 timeout**（套件挂起 ⇒ 整个 run 永挂）、汇总正则取**第一处**匹配（回显里的假串会被读走）⇒ 加 120s 超时 + 取最后一处 + 超时提示 | 基础设施 |
+| E10 | 意图表 TTL 清扫原先只在「查询」路径触发（登记路径不扫）⇒ 有界性靠「宿主每 pre-step peek」这个**前提**成立；现登记前也 `sweepExpired()` | 有界化 |
+| E11 | `effort.bySid` 淘汰按插入序 ⇒ 可能淘汰**正在活跃、且有未 apply 的 want** 的槽（= 那次换档静默失效）⇒ 淘汰时优先挑 `want == null` 的槽 | 正确性 |
+| E8 | `wire.host.mjs` 契约注释里残留已退役字段 `acts?: string[]` ⇒ 改为 `actsDetail` | 口径漂移 |
+| S2 | `compact-tool.mjs#diag()` 注释声称「宿主 buildSnapshot 会调它把意图表落进报告」——**不实**（m1.snapshot 无此调用）⇒ 如实改为「未接线，若要看到现场需真接线」 | 虚假声明 |
+
+**仍未落地（后续）**：C7 原子写降级无留痕、C8 slim 快照仍全量测量（`≤50 会话 × measure`，
+每 120s 心跳的 RPC 大头）、C11 `hudLastAct` 死字段、C12 schema 数值无范围约束（三端口径不一）、
+S3 候选链两段同构、S4 envelope 解包两份、E1 m2 教学线不含动态余量、E3 意图消费后失败不重试、
+E4 effort 取证字段挂在 `state.m3`、E9 关键词正则与教学文案各写一份。
+
+**守卫**：contract 新增 11 条（含 **3 条行为级**：carry 不算申报 / 真传 tier 才算申报 /
+模板超预算留痕且不截断）。**变异**：C5 退回 carry 也算申报 / C4 去掉 acceptFrom / E2 关掉留痕
+⇒ **全部 CAUGHT**（E2 第一版只有源码断言、被"只关条件"的变异逃逸，补行为级后抓住）。
+
+**测试**：935 断言全绿（contract 745 / static 84 / report 54 / boot 22 / client-render 30）。
+### R74 收尾批次：原子写降级留痕 + 死配置字段（2026-10-24，用户「继续」续做）
+
+| # | 修法 | 性质 |
+|---|---|---|
+| C7 | 5 份 `writeJsonAtomic` 的 **rename 失败降级直写**分支原先**无任何留痕**（Windows 上 EBUSY/EPERM 不罕见）⇒ 半截 JSON 风险在这条路径上回来了，而发生了也无从取证。5 份都补 `log('warn', 原子写降级为直写…)`，并把 `catch {` 改为 `catch (e) {` 以带上错误信息 | 留痕（数据安全可观测） |
+| C11 | 删除配置 schema 里的死字段 `hudLastAct`：描述称「host 自动写入」，但 host 只写**内存** `state.m5.hud`（publishHud），从不写 settings 的这个键 ⇒ 用户读它永远是空串 | simplify / 口径 |
+
+**守卫**：contract 新增 2 条（C7 断言 5 份副本都留痕；C11 断言 schema 不再有该字段）。
+**变异**：删掉 m5 那一份留痕 ⇒ contract 红 ✓ CAUGHT。
+
+**测试**：937 断言全绿（contract 747 / static 84 / report 54 / boot 22 / client-render 30）。
+
+**至此 R72 清单里"低风险可机械落地"的 P2 已全部清空**。剩余 8 条都需要产品/风险判断，暂不动：
+- **C8** slim 快照仍全量测量（`≤50 会话 × measure`，每 120s 心跳的 RPC 大头）——省 RPC 会让 slim 条目**失去 top2 读数**，属取舍
+- **C12** schema 数值字段无范围约束（UI 与 host 有守卫、schema 没有，三端口径不一）——加 `.min/.max` 后非法 `set()` 会被拒，**改变现有行为**
+- **S3** core 的 dshLlm/dshTools 候选链两段 ~50 行同构——合并要动启动期加载逻辑，回归面大、收益是纯可读性
+- **S4** client 两份 envelope 解包（面板内联一份、弹窗一份）——需要把 `unwrapEnv` 提到模块作用域，失败形态（null vs `{ok:false}`）要先统一
+- **E1** m2 教学用的线索不含 m3 的动态余量（5–20pp）——需要把 m3 的 `effCritical` 抽成注入函数，属接线改动
+- **E3** 意图消费后执行失败不重试（只有回执补偿）——重新登记意图有失败循环风险，需上限设计
+- **E4** effort 取证字段挂在 `state.m3` 下（m2 教学计数在 `state.m2`）——迁移会改报告字段名，影响存量断言与面板读取
+- **E9** 换档关键词正则与教学文案各写一份——纯可读性，收益最小
+### R75 收尾三条：界线单源 / 意图失败重挂 / 解包统一（2026-10-24，用户「继续」）
+
+| # | 修法 | 性质 |
+|---|---|---|
+| **E1** | **生效强制线单源化**：m3 把内联的 `effCritical` IIFE 抽成 `effectiveCriticalOf(agent)`（含 `eth − clamp(5pp,20pp,单步最大增量)`），pre-step 与 idle 两处共用，并导出；宿主注入给 m2，m2 的**教学线**改为复用同一函数（注入失败则退回 `min(配置, 引擎阈值−余量)`，行为与 R72 之前逐字一致）。原先 m2 自己算一套 ⇒ 单步增量大时**实际触发线比卡上教的更低** ⇒「约 N 轮触线」系统性偏晚 —— 这正是用户两次反馈「趋势不准」的第二层根源（第一层是 R70 的增量口径） | 正确性（教学=实际） |
+| **E3** | **意图消费后失败重挂**：`takeIntent` 在真正执行**之前**就删条目，执行抛错（busy/摘要失败/abort）后意图已没了 ⇒ 模型收到「未执行」只能靠自己记得再调。新增 `rearmIntent(sid)`（上限 **1 次**），m3 的 catch 里在 `wanted` 时调用。⚠️ 首版把 `retry` 存在**意图条目**上 —— 条目被 take 删掉后计数归零 ⇒ 上限形同虚设（**行为级测试当场抓住**）；现改为独立 Map 计数（有界 64），并在新意图登记时重置预算 | 正确性（重试系统化） |
+| **S4** | client 的 remote 信封解包**收敛为一份**：`unwrapEnv` 提到模块作用域，面板 `pullInj` 与弹窗共用（原先面板内联一份、弹窗一份，失败形态还不同：`null` vs `{ok:false}`） | simplify（单一协议实现） |
+
+**守卫**：contract 新增 6 条（含 **3 条行为级**：E1 动态余量 15pp ⇒ 生效线 65%、无历史 ⇒ 75%；
+E3 重挂一次成功、第二次被上限拦住且两个计数各 +1）。**变异**：E1 退回固定 5pp / E3 关掉上限 /
+S4 改名 ⇒ **全部 CAUGHT**。
+
+**测试**：943 断言全绿（contract 753 / static 84 / report 54 / boot 22 / client-render 30）。
+
+**R72 清单剩余**：C8（slim 快照测量取舍，需产品判断）、C12（schema 范围会改变 set() 行为，需拍板）、
+S3（启动期候选链合并，回归面大）、E4（effort 取证字段迁移会改报告字段名）、E9（纯可读性，不建议动）。
+### R76 收尾三条：候选链合并 / 非法配置留痕 / 关键词单源（2026-10-24，用户「继续」）
+
+| # | 修法 | 性质 |
+|---|---|---|
+| **S3** | core 的两条官方包候选链（`createUserMessage` / `defineTool`）**逐字同构各 ~50 行** ⇒ 合并为参数化的 `candidatesOf({envKey, rel})` + `loadFromOfficial({pkgImport, exportName, envKey, rel})`，两个 loader 各 4 行。**行为逐字不变**（尝试顺序、probe 形状、via 命名、失败语义全部保留）。⚠️ 合并时踩到一个坑：把 bare import 改成变量后，R48 的「官方运行时依赖 ⊆ 白名单」扫描（按 `await import('@deepseek-ai/…')` 字面量匹配）变成空集 ⇒ **测试当场红**；现保留为 `pkgImport: async () => await import('...')` 字面量闭包 | simplify（去 ~40 行重复） |
+| **C12（保守变体）** | schema 的数值字段没有范围约束（UI 有硬限、host 有守卫、schema 没有 ⇒ 三端口径不一）。**不改校验/写入行为**（加 `.min/.max` 会让非法 `set()` 被拒，需单独拍板），只加**留痕**：`state.cfgRejected = {at, field, why, value}` + `cfgRejects` 计数，每个 `field|why` 只 warn 一次。用户「存了但没生效」从此可查 | 留痕（可观测） |
+| **E9** | 换档关键词原先只以**正则字面量**存在，教学文案另用人话分两类 ⇒ 改词容易只改一处。改为 `WANT_DEEP_WORDS` / `WANT_FAST_WORDS` 数组为单一来源、`wordsRe()` 派生正则；文案仍用「命中的那个词」不复制词表 | simplify（单一事实来源） |
+
+**守卫**：contract 新增 4 条（S3 合并 + **反向**「仍保留字面量 await import」防 R48 扫描失效；C12 留痕
+与 5 处调用；E9 单一来源）。**变异**：E9 退回正则字面量 / C12 关掉比率留痕 / C12 删掉助手 ⇒ **全部 CAUGHT**
+
+⚠️ 本轮修断言时自己踩过一次坑：C12 的计数写成 `reject('`，而前两处实参是变量 ⇒ 断言恒红（虚假通过的反面：恒定失败也会掩盖变异结论），已改为数 `reject(` 并复验。
+
+**测试**：947 断言全绿（contract 757 / static 84 / report 54 / boot 22 / client-render 30）。
+
+**R72 清单只剩 2 条**，都需要产品判断：**C8**（slim 快照测量：省 RPC 会让 slim 条目失去 top2 读数）、
+**E4**（effort 取证字段迁移到 `state.effort`：会改报告字段名，影响面板与存量断言）。
+### R77 遗留清单收尾：C8 先量化 / E4 评估后不改（2026-10-24，用户「按你的建议走」）
+
+R72 遗留清单的最后两条，按「用证据决定，不凭感觉改」处理：
+
+#### C8（slim 快照仍全量测量）——**先量化，不改**
+
+**评估**：`slimSnapshot` 只裁**载荷**（留 top2 读数），而 `buildSnapshot` 仍逐个枚举 ≤50 会话做
+`measure` + `stateOf`。所以「省 RPC」必须动枚举本身，而枚举正是 top2 读数的来源。
+触发源：heartbeat 120s / agent/status 1.5s 防抖 / m5-publish 400ms 防抖 / m2-inject 500ms
+⇒ 活跃期理论上可能 1–2 次/秒 × 数十次本地 measure，**但也可能完全无害**（会话数通常远小于 50、
+measure 是进程内调用）。**此前只有猜测、没有数据**，而 R5 的「1117→4」正是靠 slim 里那些读数
+才看清的 —— 不能为了可能存在的开销先削取证。
+
+**落地**：只加 3 个计数（**零行为变化**）：`state.snapBuilds` / `measureCalls` / `stateOfCalls`，
+随快照写进 `diag`（**slim 档也带**，因为高频档才是成本所在）⇒ 报告里可直接读量级。
+
+**判据（观察后执行）**：若实测 ≈1 次/秒 × 数十会话 ⇒ 做「slim 只测**当前会话**、其余跳过枚举」的
+折中（top2 变薄，FULL 条目仍完整）；若只有心跳量级 ⇒ **该条直接划掉**。
+
+#### E4（effort 取证字段挂在 `state.m3` 下）——**不改**
+
+**依赖面实测**：contract 24 处（全是断言）/ effort 17 / core 11 / m2 2 / host 1，
+而 **client.js 0、m5.hud.mjs 0** ⇒ 纯内部诊断，不面向 UI、不进 HUD 载荷；**但进报告**
+（本项目把报告当"重启取证入口"，可能有外部读取者）。
+
+**结论**：迁移会改**报告字段形状** + 动 24 条断言，收益只是「读到这里不会误判属域」——
+用可能破坏取证数据形状去换观赏性收益，不划算。**改为在字段处加注释**声明属域与来历
+（R3 收敛遗留），字段名以 `effort*` 前缀区分即可。
+
+#### R72 遗留清单至此清空
+
+| 原条目 | 结论 |
+|---|---|
+| C4/C5/C6/C7/E2/E5/E7/E10/E11/E8/S2 | ✅ R73 **已修** |
+| C11 | ✅ R74 **已修**（删死字段） |
+| S3 / C12（保守变体）/ E9 | ✅ R76 **已修/已留痕** |
+| **C8** | ⚠️ **先量化**（计数已加，判据见上） |
+| **E4** | ❌ **评估后不改**（注释声明属域） |
+| E1 / E3 / S4 | ✅ R75 **已修** |
+
+**测试**：949 断言全绿（contract 759 / static 84 / report 54 / boot 22 / client-render 30）。
+**变异**：删掉 C8 测量计数 / 删掉 E4 评估注释 ⇒ 全部 CAUGHT。
+### R78 按调查报吿落地：卡片策略一致 + 锚点优先 + 档位中性化（2026-10-26）
+
+依据：`docs/context-compression-reasoning-investigation-2026-10-26.md`（以下称"报告"）。
+报告核心结论是「**没有"低于某百分比就更聪明"的通用规则**，应先修**决策卡的信息一致性**，再谈选档策略」，
+本轮逐条落实它 §5（已复现错误）与 §8（优化建议）里可确定的部分；报告本身未改动（它是只读调查交付物）。
+
+#### ① 报告 §5.1 已复现 bug：卡片预算与实际策略不一致 —— 已修
+
+**根因**：`m2.retentionTeach()` 固定读 `compact-range.RETAIN_RATIO = 0.16` 生成「现行生效预算」，
+而执行侧按**会话档位** `resolveTier(tierName, window)` ⇒ 同一张卡出现「当前档位 24%」与
+「现行 160k/16%」并存（报告用真实运行报告 + 独立渲染复现）。
+
+**修法**：新增 `m2.strategyOf(win, sid, measure, session)`，卡片预算一律从**本会话实际策略**派生：
+- 档位模式 ⇒ `resolveTier(会话档位, 窗口)`——**与 m3 执行侧同一函数**，不可能漂移；
+- 锚点模式 ⇒ `resolveAnchorBudget({session, measurement, want, window, textOf})`（含余量/下限/夹取）；
+  解析不到就明说「压缩时按实际边界解析」——**绝不编造数字**；
+- 失败一律退回档位口径 ⇒ 卡片永远有可信数字。
+
+#### ② 报告 §5.2 锚点状态不可见 —— 已修
+
+卡片新增「**当前策略**」行：锚点模式显示 `模式 + 具体锚点（按文本「…」/从最近第 N 条起）+ 预计预算
++ 解析失败原因 + 未命中回退的目标档位及其预算`；档位模式显示 `档位 + 真实预算 + 已登记/兜底/落盘恢复`。
+
+#### ③ 报告 §8.1「预算与总占用混用」—— 已分离
+
+「当前策略」行明确写「这是**近端保留预算**（不是压后总占用）」；占用/趋势/损失仍由原有行负责，两者不再混说。
+
+#### ④ 报告 §8.3 决策顺序收敛为两步 + §4.2 省略语义对称 —— 已改
+
+- 原卡片把「按比例」列在①、「按位置」列在②，示例还写 `tier 浅压24%` ⇒ 示例偏向 + 锚点认知成本高。
+- 现在：**① 按位置**（能锁定任务起点 ⇒ `keepFrom`，原样保留、不折算，能压掉更早的无关历史）；
+  **② 锁定不了才按比例选档**，且「选浅压时**说明要保留什么**」。
+- 补充省略语义不对称：**不传 `tier` = 沿用**已登记档位；**不传 `keepFrom` = 清除**锚点（要持续用锚点必须每次带）。
+
+#### ⑤ 报告 §4.1 对 24% 的单向偏向 —— 已中性化
+
+三档描述改为**信息需求判据**（「最省：边界清晰、旧资料可从文件重读」/「默认：边界拿不准」/
+「保留最多原始细节：跨文件联调/复杂排错，证据不能过早只剩摘要」），删掉「近端细节不再需要」这类
+模型难以确信的单向措辞；卡片里的三档 token 折叠数也移出（brief 仍给数字），顺带满足 ≤3000 字符预算。
+
+**未做（需真实模型调用/实验，报告 §9）**：8%/16%/24% 的任务成功率 A/B。报告明确说本次没有做，
+我们也无法在不产生大量真实调用与费用的情况下给出可信结论 —— 这条留给后续实验。
+
+**守卫**：contract 新增 6 条（4 条行为级：三档预算各自正确、锚点模式可见、解析失败明示、档位描述中性；
+2 条结构级：m2 用 resolveTier + getAnchor 派生）。**变异**：卡片忽略档位预算（回固定 16%）/
+锚点模式不显示 / 档位描述退回单向偏向 ⇒ **全部 CAUGHT**。
+
+**测试**：955 断言全绿（contract 765 / static 84 / report 54 / boot 22 / client-render 30）。
+
+**补充（渲染自查发现的第二处不一致）**：改完策略行后我实际渲染了一张卡，发现**损失行仍按传入的
+`retainTokens`（160k）算**，而策略行已显示 240k ⇒ 同一张卡两处数字矛盾（与报告 §5.1 同型）。
+已修：卡片预算统一以**档位预算**为准（`tierBudget` 缺省才回落 `retainTokens`），并补一条断言
+「策略行与损失行必须同源」（变异：把损失行改回 `retainTokens` ⇒ CAUGHT）。
+**教训**：这类"两处各算一套"的问题，只有**真的渲染出来看**才会暴露——测试断言覆盖了策略行、
+未必覆盖损失行。以后改文案/数字口径应加一步"渲染实测"。
+### R79 「档位切换（智能思考）」同类问题排查与修复（2026-10-26，用户问「档位切换是否有类似问题」）
+
+沿 R78（压缩决策卡）的检查思路，对**换档域**做同样审计：找「显示写死值 ≠ 实际配置 / 状态不可见 /
+两处各算一套」这类问题。
+
+#### 排查结论
+
+**确认同类问题 4 处（已修 4 处）**：
+
+| # | 问题 | 与 R78 哪条同型 | 修法 |
+|---|---|---|---|
+| 1 | 工具描述与一次性教学里**写死「默认 30 秒」**，而冷却可由面板 `effortCooldownMs` 调整 | §5.1「卡片固定 16%」**完全同型** | 新增 `cooldownSec()` 现读活值；两处文本改用活值 |
+| 2 | 换档"没成功"的原因（foreign 让位 / 无路由 / 非法档 / 冷却 / 同值）只有**全局计数** `effortSkips`，面板 tooltip 与报告都看不到 | §5.2「锚点失败不可见」 | `bumpSkip(kind, sid)` 增加 per-sid **最近一次跳过**（有界，`EFFORT_SID_CAP`）+ 中文标签映射；`hudPayload` 返回 `lastSkip{at,kind,label}` |
+| 3 | chip 在 `pending` **存在但不带档位**（只换模型/选「默认」）时把 `effort` 判空 ⇒ **整个 chip 消失**，即使 `lastUsed` 有值 | 显示层 bug（同类：状态存在但展示缺失） | 回退顺序改为「带档位的 pending → lastUsed → 任意 pending」 |
+| 4 | host 早已在 `hudPayload` 返回 `pending/pendingChanged/pendingFrom`，但 **client 不取** ⇒ tooltip 永远看不出"用户刚改档、本步骤即生效"（而模型侧的用量行后缀会标） | §8.1「两处口径不一致」 | client 透传三个字段；tooltip 增「用户刚改，本步骤即生效——不是保持」与「最近一次未生效：<原因>（时间）」两行 |
+
+#### 核对后**确认不是问题**的部分（避免误报）
+
+- **轮首读档已做 pending 优先**（结论⑪：`routeOf` 优先 `modelSelection` 投影的 pending）⇒ 模型不会读到
+  "本轮根本不会用"的旧档；用户手动改档那一轮后缀会显式标注「这是用户改的，不是保持」（R36）。
+- **可选档位是动态单一来源**：`read()` → `llm.resolveModelInfo(provider, model)`，教学/后缀/提醒/工具校验
+  全部读它；不存在第二份硬编码清单。
+- **冷却锚点落在「工具接受时刻」**（R15.1），不是 apply 时刻 ⇒ chip 不会永远显示"就绪"。
+- **工具参数 `effort` 是 required** ⇒ 不存在压缩档位那种「不传=沿用」的省略语义歧义；
+  也没有 `keepFrom` 那种「不传=清除」的不对称。
+- **单档模型**：`canSwitch` 是唯一判据，文本四出口与工具可见性都读它（不会出现"工具已隐藏、文本还教你调用"）。
+
+#### 未做（属策略增强，不是"同类问题"）
+
+换档提醒目前只有三类触发（用户关键词 ×2、≥8 轮未换档）。**没有**基于"任务难度客观信号"（如工具连续
+失败、刚发生压缩、报错堆积）的触发——这需要数据验证是否值得，不在本次范围。
+
+**守卫**：contract 新增 4 条（2 条行为级：冷却活值 45s、lastSkip 冷却标签；2 条结构级：chip 回退 +
+lastSkip 透传/来源）。**变异**：冷却改回写死 30 / 不记 per-sid 跳过 / chip 回退退回旧写法 ⇒ **全部 CAUGHT**。
+
+**测试**：960 断言全绿（contract 770 / static 84 / report 54 / boot 22 / client-render 30）。
+### R80 换档教学重构：应换则换 / 任务完成优先 / 适配档位优先（2026-10-26，用户要求）
+
+用户要求：「确保 Agent 能明确需求应换则换，以任务完成优先，适配的档位优先。」
+
+#### 诊断：原先为什么"不会换"、"换错方向"
+
+| 缺陷 | 后果 |
+|---|---|
+| 触发项只有"语气词 + 自指判断"（"需要更深推理时升档"） | "需不需要"交给模型自己判 ⇒ 等于没有触发条件（与压缩侧"有 75% 硬线"形成对比） |
+| 只说"升/降"，**不说"换成哪一档"** | 模型知道该换，但可选集随 provider/model 变（同一 model 在不同 provider 档位不同），它不知道目标档位 ⇒ 倾向不动 |
+| **降档被表述为"省额度"** | 与"任务完成优先"直接冲突 —— 省钱成了目标，模型在难任务上也不敢升 |
+| 每轮后缀只有"需要时先说再调用" | 每轮唯一可见的提醒位，却是自指判据 + 每轮同文 ⇒ 习惯化 |
+
+#### 改动（4 处）
+
+1. **一次性教学**新增两个核心段：
+   - **「选档看任务，不看'省不省'（按相对位置选）」**：最高档=多文件因果排查/根因定位/设计取舍/并发·性能·安全类；中间档=常规多步实现与修改；最低档=机械批量改动或简单查询；**只有两档时：需要深思⇒高档、需要快速⇒低档**。→ 解决"不知道换到哪一档"。
+   - **「该换就换，以任务完成优先」**：判据出现就换，**不要为了"怕打断缓存"而将就**；一次换档的缓存损失远小于"档位不足导致返工/漏判"；反过来已匹配就**不要乱换**。
+2. **降档语义改写**：`降档是**适配工作量**，省额度只是附带结果`（原先写"降档可省额度"）；工具 description 同步改为"按任务选档 + 以一次做对为先"。
+3. **决策行给三种示例**：`档位决策：升 最高(max)` / `降 低(low)` / `保持 高(high)`——原先只有"保持/降"示例，**升档没有可抄模板**（R36 已记录过模型照抄模板的现象）。
+4. **每轮后缀加一句可判定判据**：`（可选 …；**难则升、机械则降，以一次做对为先**；先说再调用 …）`——把"需要时"换成可核对的判据。成本约 +15 字符/轮。
+
+#### 精度：不再给"做不到"的建议
+
+换档提醒新增**到顶/到底守卫**：已在最高档时深度信号不再提示"可升档"、已在最低档时机械信号不再提示"可降档"（原先模型照做只会被工具拒绝或原地不动）。**渲染实测**：`到顶 ⇒ null`（不注入）✓。
+
+#### 关键词表扩充（"无语气但有难度"的需求也能触发）
+
+升档侧新增：`重构/迁移/审计/并发/性能/安全/兼容/取舍/复盘/定位`；降档侧新增：`列出/查看/确认/统计/替换/批量/只改/不用改`。
+原先只认"彻底/根因/快点/简单"这类**语气词** ⇒ 用户说"帮我迁移一下"这种无语气但确实需要深思考的需求不会触发。
+
+#### 未做
+
+基于**客观难度信号**（工具连续失败、报错堆积、刚发生压缩）的触发需要在真机上验证收益，本轮不做。
+
+**守卫**：contract 新增 9 条（7 条行为级：映射存在、任务优先措辞、三示例、后缀判据、到顶不提示、到底不提示、
+升/降提示含理由、任务词触发；另 2 条随后缀形状更新）。**变异**：删映射 / 降档退回"省额度" / 后缀退回自指 /
+去掉到顶守卫 ⇒ **全部 CAUGHT**。
+
+**测试**：969 断言全绿（contract 779 / static 84 / report 54 / boot 22 / client-render 30）。
+### R81 本轮（换档 + 压缩）修改的全面 Review（2026-10-26，用户要求「全面 review」）
+
+**范围**：R78（压缩决策卡策略一致/锚点可见）、R79（换档遥测/chip）、R80（换档教学重构）。
+**方法**：把改动路径**端到端重读**（m2 策略派生 → compact-tool 渲染 → effort 教学/提醒/遥测 → client chip），
+并用「显示 vs 执行」「两种模式 vs 一种预算」「成功 vs 失败后的残留状态」三组对照去找不一致；
+再**实渲染**卡片/后缀/提醒逐字读一遍；每条修复都配断言 + 变异。
+
+#### 发现并已修（6 条）
+
+| # | 严重度 | 问题 | 证据/影响 | 修法 |
+|---|---|---|---|---|
+| 1 | **P1** | **锚点模式下 loss 行仍按档位预算算**：锚点 40k、档位 240k、占用 570k 时，卡片说"会摘要掉 ~330k"，**实际会摘要 ~530k** | 低估损失 200k ⇒ 直接误导"现在压划不划算"（与 R78 修的 §5.1 同类，但这次是我自己引入的） | 按"此刻真正会执行的策略"取预算：`execBudget = 锚点预算 ?? 档位预算`，标签随之变（"锚点预计保留预算" / "本档位保留预算"） |
+| 2 | P2 | 卡片写「**上次**解析失败」，但这是**本轮现算**的结果 | 措辞失真（用户会以为历史状态） | 改为「锚点**本次**未能定位（原因）」 |
+| 3 | P2 | 锚点模式下「两个方向」是"若改按档位"的对比，却未标注 | 会被读成当前计划 | 标题改为「两个方向（**若改按档位**）」 |
+| 4 | P2 | chip tooltip 因插入 `lastSkip` 的 `null` 分支出现**空行** | tooltip 中间空白（观感 + 信息密度） | `].filter(Boolean).join("\n")` |
+| 5 | P2 | 换档**成功后**未清该会话的「最近一次未生效」 | tooltip 会拿旧失败原因误导"这次也没成" | 接受成功时 `skipLastBySid.delete(sid)` |
+| 6 | P3 | R78 删掉「现行生效」句后 `keep` 变量成为**死代码** | 无人读取 | 删除 |
+
+#### 核对后确认**没问题**的部分
+
+- **档位预算与执行同源**：`strategyOf` 用 `resolveTier`（m3 执行侧同一函数）；`retainTokens/retainRatio` 与
+  卡片 loss/tierLine 全部由它派生，不再有第二套数字。
+- **`measure` 透传链路完整**：`m3.measureRatio` 返回 `measure` → `renderUsageText` 透出 → `renderPolicyCard(actx.measure)`
+  → `resolveAnchorBudget`，锚点预算可真实解析（不是猜）。
+- **跳过原因链**：6 个 `bumpSkip` 调用点全部带 sid；per-sid 映射有界（`EFFORT_SID_CAP`）；
+  `hudPayload(lastSkip).label` 走中文映射；成功接受会清空。
+- **每轮后缀成本**：`+约 15 字符/轮`（仅在有可选集时追加），与 R15 的 +8 字符同量级，可接受。
+- **教学长度**：effort brief 一次性 +约 600 字符（每会话一次），不进入每请求热路径。
+- **不写死档位名**：教学全部用"相对位置/最高·中间·最低档"，可选集由 `resolveModelInfo` 动态给。
+
+#### 保留的风险与限制（如实记录，未改）
+
+1. **锚点预算每轮现算**：卡片每轮调一次 `resolveAnchorBudget`（surface 走查）。仅在"该会话登记过锚点"时发生
+   （调查报告：24h 内 2 条），成本可接受；若将来锚点使用率高，应加 memo（按 sid+surface 长度）。
+2. **nudge 的"到顶/到底"守卫假设** `efforts` 按强度升序（实测 low→high→max）。乱序 provider 只会让守卫失效
+   （多给一条无效提示），不影响换档本身；已在代码注释声明。
+3. **关键词误报**：深/快两类同时命中时**深优先**（取"升档"= 任务完成优先的安全方向）；
+   `性能/设计/定位` 这类词在机械任务里也可能误触发升档提示，属可接受噪声（提示不是强制）。
+4. **`checkEffort` 在可选集未知时不否决**（设计如此）：此时任意档位都会被接受、由 llm 侧兜底。
+   ⚠️ 我的第一版测试正好栽在这里（没给 llm 桩 ⇒ "非法档"被放行 ⇒ 测试前提不成立）——已记入测试注释。
+5. **两档模型**（如 workbuddy/hy4 只有 high）：教学已给"只有两档时：需深思⇒高、需快⇒低"，但无可切档时三处静默
+   （`canSwitch` 单判据）不提示——这是既有设计，未变。
+
+**守卫**：contract 新增 6 条（3 行为级：锚点损失用锚点预算、失败原因成功后清空、锚点模式方向标注；
+2 结构级：tooltip 过滤、nudge 排序假设注释；1 条文案更新）。**变异**：锚点损失退回档位预算 /
+成功后不清 lastSkip / tooltip 不过滤 ⇒ **全部 CAUGHT**。
+
+**测试**：974 断言全绿（contract 784 / static 84 / report 54 / boot 22 / client-render 30）。
+### R82 Qoder 交叉审查（Qwen3.8-Flash）落地：卡片口径对齐执行侧（2026-10-26，用户派发）
+
+**背景**：用户用派发台指派 **Qwen3.8-Flash**（xhigh）与 **DeepSeek-Flash**（max）对 R78–R81 做只读交叉审查。
+Qwen 那份已落地（66 轮工具调用、11,397 字符、报 16 条）；DeepSeek 那份仍在跑。
+我逐条回源码验伪后落地 **9 条**（2 P1 + 4 P2 + 3 P3），其余记为已知限制。
+
+#### 证实并修复
+
+| Qwen 编号 | 严重度 | 问题（我验伪结论：**成立**） | 修法 |
+|---|---|---|---|
+| **F1** | **P1** | 卡片用**名义档位预算**算损失，而执行侧在 `resolveTier` 之后还有一步 `÷retainFactor`（`m3.compact.mjs:480-481`）⇒ 名义 240k、实际只留 ~171k，会给出「近端**一点都不丢**」的**假承诺**；同一会话的回执却按真实口径念数 ⇒ 同一数字两处口径相反 | `strategyOf` 注入 `retainFactorOf`；卡片 `execBudget = 锚点 ? anchorBudget : round(tierBudget/factor)`，标签变「保留预算（真实口径 ×f）」；策略行补「执行侧按真实口径 ×f ⇒ 实际约 X」 |
+| **F2** | **P1** | 三档预算是 `win = 预算÷名义比例` 反推出来的；`resolveTier` 夹取后（默认档 + ≤250k 窗口就会抬到 40k 下限）⇒ 反出 **2.5× 假窗口**，「两个方向」的留量/丢量/距线轮数全错（实测卡说 13 轮、真实 5 轮） | m2 把**真实 window** 传进卡片；三档预算改由 `resolveTier(name, window)`（**执行侧同一函数**）现算；夹取时显示**真实占比**并标「已抬到下限」 |
+| F6 | P2 | schema 承诺的模板变量 `{window}` **恒展开为空**（调用方从不传 window） | 与 F2 同一处修：`window` 进 renderCard/renderBrief 入参，`{window}` 现在有值 |
+| F3 | P2 | 换档工具 description 在 `registerTool()` 时**冻结**（`if (toolRegistered) return true`）⇒ 面板改冷却不会重注册，写活秒数反而变成"写死注册那一刻的值"（与 R78 修的固定 16% 同型） | description **不再写秒数**，改为「时长可在面板配置；被拒时返回剩余秒数」；brief 仍为活值（每次注入现渲染） |
+| F4 | P2 | nudge 的"到顶守卫"把 `s.nudgeAtTurn = turn` 写在守卫**之后**、并用 `return null` 吃掉整条分支 ⇒ ①白烧 4 轮提醒额度；②同句里本可给且真实可行的**降档**提示被吞（实测「重构…直接改名」在 max 档返回 null） | 守卫前移：`const up = atTop ? null : WANT_DEEP_RE.exec(text)`，命中任一才写提醒位；深优先语义保留 |
+| F5 | P2 | `effortEnabled` 默认 **false** 时工具已被 `retractTool` 撤掉，但压缩决策卡与自检回执仍教模型「调用 set_reasoning_effort」；回执判据 `!effGate ⇒ 允许提及` 把「功能关闭」与「读档失败」混为一谈（违反 m2 自述铁律） | 回执：`allowSwitchTalk = M3.effortEnabled === true && (!effGate \|\| effGate.canSwitch)`；卡片：新增 `allowSwitchTalk` 入参，false 时整条「顺带换档」省略；工具名改为 `switchToolName \|\| 'set_reasoning_effort'` 注入 |
+| F7 | P3 | 同值调用返回 `ok:true / applied:'already'`（**成功**），却仍按"未生效"记 lastSkip ⇒ chip tooltip 显示「最近一次未生效：与当前档位相同」 | 只记全局计数，不写 per-sid lastSkip |
+| F11 | P3 | `strategyOf`（含锚点 surface 走查）在**卡片门槛之前**执行 ⇒ 低占用（卡不出现）时每轮白付走查 | `renderPolicyCard` 首行按 `ratio < markerMinRatio` 早退 |
+| F12 | P3 | 压缩自检里仍写「进入机械阶段可**降档省额度**」，与 R80 统一后的「降档是适配工作量」口径冲突 | 改为「降档适配工作量（省额度只是附带结果）」 |
+
+#### 未落地（记入已知限制）
+
+F8 `cooldownMs=0` 时文案写「1 秒」而实际无冷却；F9 loss 的 `used` 兜底仍读 `retainTokens/retainRatio`（两套取数，今日等价）；
+F10 `anchorLabelOf` 逐字两份（m2 与 m3）；F13 冗余/死码（`const tb = t` 别名、`skipLabel` 导出无消费者、
+`resolveAnchorBudget` 的 `deltaTokens` 分支不可达）；F14 「≤3000」守卫的样本余量仅 27 字符（最坏配置 3131，已越线）；
+F15 锚点模式下 `used`（表盘口径）与 `anchorBudget`（启发式口径）跨口径相减；F16 锚点失败原样把 `text:not-found` 等内部 token
+写进模型可见文本（回执侧 R23 已改成中文，卡片侧没跟上）。
+
+#### 我这轮自己犯的两个错（被测试/渲染抓到）
+
+1. 新断言写死小数位（`171.4k`），而测试桩的 `kfmt` 走内部默认输出 `171k` ⇒ 断言恒红；已改为只钉量级与口径标签。
+2. 模板断言忘了 `{tool}` 必填（缺则回退内置），导致 `{window}` 测试走的是内置文本 ⇒ 已补 `{tool}`。
+
+**守卫**：contract 新增 8 条（5 行为级：F1 真实口径、F2 夹取现算、F6 `{window}` 展开、F5 门控、F7 同值不算未生效、
+F4 到顶仍给降档；2 结构级：F5b 回执门控、F11 门槛前移）。**变异**：F1 退回名义预算 / F2 退回 t/r / F4 到顶仍命中 /
+F5 回执不看开关 ⇒ **全部 CAUGHT**。
+
+**测试**：982 断言全绿（contract 792 / static 84 / report 54 / boot 22 / client-render 30）。
+### R83 双模型交叉审查结果与冲突裁定（2026-10-26，用户派发 Qoder 免费模型）
+
+**派发情况**：Qwen3.8-Flash ✓ 完成（66 轮 / 16 条）；DeepSeek-Flash **两次均失败**
+（exit=124 超时、零输出，原因是模型侧排队拥塞：首跑 `queue_count` 一度 6792、重跑 45 分钟仍在排）；
+改用同属 Qoder 免费的 **Kimi-K3.1-Pro** 补位 ✓ 完成（8 轮 / 7 条）。
+
+#### ⚠️ 核心事件：两位审查者对 F1 给出**相反结论**，而**我先落地的那个是错的**
+
+| 来源 | 结论 |
+|---|---|
+| Qwen3.8-Flash | 「卡片用名义预算算损失，执行侧要 ÷retainFactor ⇒ 实际只留 171k ⇒ 卡片给假承诺」，要求把 `used` 与 `tierBudget/factor` 比 |
+| Kimi-K3.1-Pro | 「**单位错了**：`used` 与 `tierBudget` 都是真实口径，`t/factor` 是交给范围选择的**启发式预算**，跨单位相减会高估损失」 |
+
+**回源码裁定（`m3.compact.mjs:475-478` 注释原文）**：
+> `tierBudget` 保持"档位承诺"（**回执/报告报它，真实口径**）；交给范围选择的是**折算后的启发式预算**。
+
+而 `factor = 表盘真实 used ÷ 启发式可见量`（`session-facts.mjs:72`）⇒ **启发式 = 真实 / factor**。
+所以 240k 是**真实保留承诺**，`240k/1.54≈156k` 只是"选择预算" ⇒ `used(200k) < tier(240k)` 判「近端不丢」**本来就是对的**。
+
+**结论：Kimi 正确，Qwen 的 F1 是误诊，我 R82 的"修复"把单位搞反了 ⇒ R83 回退。**
+教训：交叉审查出现相反结论时，唯一裁判是**源码与不变量**，不是"多数票"；我上一轮直接采信了第一份报告。
+
+#### R83 落地（4 条）
+
+1. **回退 F1 的跨单位相减**：`execBudget = 锚点预算 ?? tierBudget`（不再除 factor）；
+   factor 仅作**口径标注**：「（真实口径；交给范围选择的启发式预算 ≈171k token）」，与回执同源。
+   断言反转：`used=200k / tier=240k / factor=1.4` ⇒ 必须判**「近端一点都不丢」**且**不得**出现「摘要掉」。
+2. **F5-a（Kimi）**：卡片原先在 `effGate` 之前渲染 ⇒ 单档模型（工具已隐藏）仍被教「顺带换档」。
+   现卡片渲染**下移**到判据之后，并传入同一 `allowSwitchTalk`（含 `canSwitch`，不只 `effortEnabled`）。
+3. **F5-b（Kimi）**：回执门控**单点化**为 `effortTalkAllowed(agent)`；`renderCompactReceipt` 默认值
+   `true → **false**`（"没说"≠"可以提"）；三条路径（首步 / 非首步 / **量测失败**）全部显式传值。
+   原先非首步 `allowMid` 初值 true、量测失败路径不传第二参 ⇒ 两条旁路绕过开关判据。
+4. **F7（Kimi）**：同值成功（`applied:'already'`）不仅要"不记新 lastSkip"，还要**清掉旧的**——
+   序列「接受 max → 改 low 被冷却拒 → 再调 max 返回 already」最后一步已成功，tooltip 仍显示"冷却未生效"。
+
+#### 未落地（记入已知限制）
+
+- **N1**（client，P2）：只换模型、pending 不带档位时，chip 的 route 取 `lastUsed`（可能属旧模型）⇒ tooltip 可能出现
+  "旧模型 + 新档位"混行；无 lastUsed 时 chip 仍会隐藏。需真机抓 `modelSelection` 投影形状后再改（改动在 client 层）。
+- **N2**（client，P2）：`lastSkip` 更新不改变投影 ⇒ chip 只在投影变化/挂载+2.5s 补拉时取 HUD ⇒ 失败原因可能长期不可见。
+  接事件通知需要改 HUD 推送链路，属独立改造。
+- **F1-附**：factor 在 1.01–1.05 区间时，卡片标注阈值（>1.05）与执行侧（凡 >1 都折算）不同。
+  现仅影响**标注是否显示**（数值计算已按真实承诺，不折算），不构成数字错误。
+
+**守卫**：contract 新增 3 条（F1 纠正的行为级反转、F5-a 顺序、F7 三步序列）+ 2 条形状更新。
+**变异**：F1 退回跨单位相减 / F5-a 卡片不接门控 / F5-b 回执默认放行 / F7 不清旧原因 ⇒ **全部 CAUGHT**。
+
+**测试**：985 断言全绿（contract 795 / static 84 / report 54 / boot 22 / client-render 30）。
+### R84 遗留三项的安排与落地（2026-10-26，用户问「未做的3个怎么安排」）
+
+**安排原则**：先做「零风险且能立刻收敛口径」的，再做「需真机观察才能定方案」的，最后做「需要改链路」的。
+**依赖证据**：本轮先核实了两个事实，避免拍脑袋：
+① `modelSelection` 投影形状——我方 `effort.routeOf` 已在用：`pending` 可存在但**不带档位**，`lastUsed` 是**上一次请求**的完整对象；
+② **没有 HUD 推送到 client 的通道**（只有 `settingsScope.subscribe` 与设置变更通知）⇒ chip 的"实时失败原因"不是小改。
+
+| 项 | 安排 | 状态 |
+|---|---|---|
+| **F1-附**（factor 1.01–1.05 标注阈值与执行侧不一致） | 今天做：标注判定改为**按 2 位小数**（与 factor 落盘精度 `toFixed(2)` 同源）⇒ 对齐执行侧「凡 >1 都折算」，又不产生 `×1.00` 噪声；标注同时写出 `×f` 本身（与回执同格式） | ✅ 本文 |
+| **N1**（只换模型时 chip 可能混行/消失） | 今天做：**路由行与档位行解耦**——路由取 `pending || lastUsed`（本轮会用），档位取 host `currentLabel`（pending 优先的真实生效值）；隐藏条件由 `!effort` 改为 `!tierLabel` | ✅ 本文 |
+| **N2**（`lastSkip` 更新不触发 chip 拉取 ⇒ 失败原因可能长期不可见） | **分两级**：A 先做「面板可见」（面板打开/刷新即拉 HUD，无需新通道，约 1h，低风险）；B 若确需 chip 实时，再新增 wire 通知（约 2–3h，中风险，要改 client+wire 两侧） | ⏳ 待安排 |
+
+#### 本轮落地细节
+
+1. **F1-附**：`compact-tool` 的 factor 判定 `>1.05` → 先 `Math.round(f*100)/100` 再 `>1`；
+   标注文案补上 `×${factor.toFixed(2)}`。断言：`factor=1.04` 必须出现「×1.04」与「启发式预算」；`factor=1` 不得出现标注噪声。
+2. **N1**：client chip 拆成 `routeSel`（模型行）/ `effortObj`（档位兜底）/ `tierLabel = host.currentLabel || effort`（显示与隐藏判据）。
+   断言：`routeSel` 结构、模型行取 `routeSel.provider`、`tierLabel` 三处同时在位。
+
+#### 剩余积压（不在"三项"里，但同一批审查的产物）
+
+R82 时记为已知限制的 7 条 P3（F8 `cooldownMs=0` 文案、F9 `used` 兜底两套取数、F10 `anchorLabelOf` 两份、
+F13 死码/无消费者导出、F14 ≤3000 守卫样本余量、F15 跨口径相减标注、F16 锚点失败内部 token 中文映射）。
+建议打包成**一次「清理版」**（约 2h，低风险，全部是文案/死码/断言样本，不碰执行路径）。
+
+**守卫**：contract 新增 3 条（F1-附 两条行为级 + N1 一条结构级）+ 1 条形状更新。
+**变异**：F1-附 阈值退回 1.05 / N1 路由退回合并对象 ⇒ **全部 CAUGHT**。
+
+**测试**：988 断言全绿（contract 798 / static 84 / report 54 / boot 22 / client-render 30）。
+### R85 剩余项全部落地：N2 + 7 条 P3（2026-10-26，用户「剩下的都优化」）
+
+上轮遗留：N2（`lastSkip` 在 chip 不可见）+ F1-附 + R82 的 7 条 P3。F1-附 已在 R84 完成，本轮清掉其余 8 项。
+
+#### N2：不加通道、不加轮询，改「悬停即刷新」
+
+先核实事实：**没有 HUD 推送到 client 的通道**（只有 `settingsScope.subscribe` 与设置变更通知），而 `lastSkip` 更新不改变
+`modelSelection` 投影 ⇒ chip 只会在「投影变化 / 挂载 +2.5s 补拉」时取 HUD，失败原因可能长期不可见。
+两条路成本对比：新增 wire 通知改 client+wire 两侧（中风险）；**在 chip 的 `onMouseEnter` 里拉一次**（零新通道、零轮询，
+且"用户要读 tooltip 的那一刻"正是需要最新值的那一刻）⇒ 选后者。实现：`pullRef` 复用同一个 `pullOnce`，不复制逻辑。
+
+#### 7 条 P3
+
+| 编号 | 问题 | 修法 |
+|---|---|---|
+| F8 | `cooldownMs=0`（面板可设）时文案写「当前 1 秒」，执行侧完全不拦 | `cooldownSec()` 对 0 返回 **null**，教学改说「换档冷却**已关闭**（面板设为 0）」 |
+| F9 | loss 行的 `used` 兜底**又读一遍** `retainTokens/retainRatio`（R78 前旧口径） | 统一用 `t / r`（与上面同一份） |
+| F10 | `anchorLabelOf` 在 m2 与 m3 **各写一份**，措辞可能漂移 | 权威实现移入 `compact-range.anchorLabelOf`；m2 **委托**它（不再各写一份）；m3 因 `official()` 之外拿不到同步 range api 保留同体实现，但注明权威来源 + **漂移守卫**（contract 断言两处对同一 want 输出一致；经查 host.impl 已**正好 320 行**上限，无法再加注入） |
+| F13 | `const tb = t; tr = r;` 无意义别名；`skipLabel` 导出无消费者 | 删别名（直接用 t/r）；`skipLabel` 移出导出对象（内部仍在用） |
+| F15 | 锚点模式 loss 是「表盘真实 `used` − **启发式** `anchorBudget`」跨口径相减 | 标签改为「锚点预计保留预算（**启发式口径**）」 |
+| F16 | 卡片把 `text:not-found` 等**内部 token** 写进模型可见文本（R23 已定规矩，回执改了、卡片没跟上） | 新增 `anchorFailLabel()` 中文映射（单一出口，卡片+回执共用）；异常只报类别不拼 `msg(e)`（可能含路径） |
+| F14 | 「desc+brief+card ≤3000」只在**温和样本**下成立；最坏可达配置实测 **3131 越线**（无人知道） | ① 把三档的**中性判据搬到一次性说明**（每会话一次），卡片只留「名字 + 一个字」（-85）；② 决策顺序行去重（-59）；③ 依赖/自检行合并（-25）⇒ 最坏 **2967**；④ 新增**最坏配置守卫**断言 |
+
+**实测轨迹**：最坏配置 `desc 376 + brief 1155 + card 1576 = 3107` → 首轮裁到 3032 → 最终 **2967**（余量 33）。
+
+#### 本轮又抓到自己两个 test-design 缺陷（同一类：测试绕过被测路径）
+
+1. F16 第一版测试**直连 `renderCard` 传中文**⇒ 变异「m2 回退英文」**MISSED**；补「m2 卡片路径走映射」的结构守卫后才 CAUGHT。
+   与之前「没给 llm 桩导致非法档被放行」同型：**单测绕过了真实调用链**。
+2. 删文案时忘了三处被断言钉住的短语（"不要为了压缩而停下"、"多留 ⇒ 压后高、下次压缩更早"）⇒ 两次红后回退。
+
+**守卫**：contract 新增 10 条（F8/F10/F13/F14/F15/F16/N2 等，含 1 条最坏配置预算）。**变异**：
+F8 冷却 0 仍报 1 秒 / F16 回退英文 / N2 去掉悬停 / F14 加回长文案 / F10 单源截断漂移 ⇒ **全部 CAUGHT**。
+
+**测试**：999 断言全绿（contract 809 / static 84 / report 54 / boot 22 / client-render 30）。
+
+### R86 让「锚点优先」真正生效：判据可执行 / 缺省沿用 / 每轮可见（2026-10-27，用户问「Agent 会优先锚点吗」）
+
+#### 起因：文案说优先、机制支持，但**实际用量为 0**
+
+| 层次 | 事实 |
+|---|---|
+| 文案 | 卡片写「决策顺序（两步，**锚点优先**）」，说明写「语义锚点（比比例更准）」 |
+| 机制 | `m3.compact.mjs:698` 压缩时先读已登记锚点 → 覆盖档位预算；失败才退档位（回执留痕） |
+| **实际** | 本机真实报告统计：`retainSource = tier` **452 次**、`anchor:*` **0 次** ⇒ 模型从未用过锚点 |
+
+四个结构性原因：① 选档只要复制一个名字，锚点要判断"任务边界"，认知成本高；② `tier` 会话级持久，而
+`keepFrom` **每轮都要重带**（不传即清除）；③ 卡片有 30% 门槛，低占用时模型看不到任何锚点提示；
+④ 判据是空的（"能锁定起点"没有可回答的定义），工具描述也无示例。
+
+#### 三项改动（用户批准全做）
+
+| # | 改动 | 说明 |
+|---|---|---|
+| 1 | **判据可执行 + 示例** | 卡片/说明/工具描述统一改成「**本轮与上一条用户消息之间换了话题**（新任务/收尾）⇒ 用 `keepFrom:{recentUser:1}`」；工具描述补示例 |
+| 2 | **缺省 = 沿用**（语义变更） | `normAnchor` 三态：**不传 → `carry`（沿用）** / `keepFrom:null` → `clear`（清除） / 传对象 → `set`；`setTier` 增加 `anchorAction` 参数并**复制旧锚点**；回执分别显示「沿用中 / 已登记 / 已清除」。⚠️ 旧语义「不传必清除」就此废止（卡片/说明/描述同步改写为「均 = 沿用；清除传 `keepFrom:null`」） |
+| 3 | **每轮后缀可见** | 用量行后缀追加锚点提示：已登记 ⇒ `锚点「最近第1条」沿用中`（强化"一次声明长期生效"）；未登记 ⇒ `锚点:keepFrom:{recentUser:1}`（认知成本降到最低）。约 +20 字符/轮，是低占用（卡片不出现）时**唯一**的锚点提醒位 |
+
+#### 代价与约束
+
+- 三项合计使 `desc+brief+card` 从 2967 → **2999**（上限 3000）⇒ 同步做了等量删冗（去掉重复措辞、把
+  "不是压后总占用"缩写等），最坏配置下仍 ≤3000（断言守护）。
+- 语义变更意味着：**一旦登记锚点，后续未带 `keepFrom` 的压缩都会继续按锚点**，直到显式 `keepFrom:null`。
+  这是刻意的（否则"一次声明"无从谈起），已在卡片/说明/描述三处写清。
+
+#### 验证
+
+- 新增/改写 8 条断言（沿用行为、显式清除、卡片判据、说明判据、描述示例、后缀提示、形状非法返回 carry、R73 签名）。
+- **变异**：缺省退回「清除」/ 去掉判据 / 去掉后缀提示 / 不沿用旧锚点 ⇒ **全部 CAUGHT**。
+- 测试：**1002 断言**全绿（contract 812 / static 84 / report 54 / boot 22 / client-render 30）。
+
+#### 观察指标（后续验证效果）
+
+插件报告里已有 `retainSource` 字段：跑一段时间后看 `anchor:*` 是否 **> 0**。若仍为 0，说明问题不在
+"文案/维护成本"，而在"模型判断不出任务边界"——那时应考虑**由插件给出边界候选**（例如列出最近几次
+话题切换点），而不是继续加提示词。
+### R87 三个模板框改为可折叠（2026-10-27 用户要求「3 个模板左侧可折叠/展开」）
+
+#### 问题
+面板里三个模板（一次性说明 / 决策卡 / 思考强度教学）各占 min-height 150px 的等宽文本框，
+把「总开关 + 档位比例 + 阈值」等真正常改的配置挤到上面，整页被三个空盒子撑满（用户截图即此状态）。
+
+#### 做法
+1. 每个模板字段渲染成**折叠行**：左侧 `▸/▾` caret + 名称 + 右侧状态（`留空 = 内置文案 · 点击展开编辑` /
+   `已自定义 · 点击展开编辑`）；默认**折叠**，点标题展开正文（textarea + 查看/复制内置文案按钮）；
+2. 折叠用 **class + CSS**（`.dcp-tplbody.is-collapsed{display:none}`）实现，**DOM 始终完整渲染**：
+   ⇒ 既避免"展开才建 textarea 导致草稿丢失/宽度跳变"，也让客户端渲染测试可以无状态地断言两种形态；
+3. 无障碍：标题是 `<button>` + `aria-expanded` 真实反映状态，`:focus-visible` 有焦点环（键盘可达）；
+4. 模板行改为纵向布局（`.dcp-row-tpl`），标题占满整行宽度，右侧状态用 `margin-left:auto` 对齐。
+
+#### 验证
+- client-render 新增 3 条断言：折叠头数量/默认状态/caret、折叠 class + CSS 规则、可点击 + 键盘焦点样式；
+  并把「配置行计数」从 `=== "dcp-row"` 放宽为 `dcp-row` 或 `dcp-row dcp-row-tpl`（结构变更的显式登记）。
+- **1005 断言**全绿（contract 812 / static 84 / report 54 / boot 22 / client-render 33）。
+
+#### 注意
+- 纯客户端改动 ⇒ **刷新页面即可生效**（无需 toggle 插件）；
+- 折叠状态**不持久化**：面板重开回到"全部折叠"（刻意——避免用户上次展开某个模板后，下次以为面板丢了内容）。
+### R88 压缩后的"27.8% vs 8.4%"与"24% 档却只留 40k"：显示层修复 + 锚点风险提示（2026-10-28，用户反馈）
+
+#### 起因（用户截图追问「这次压缩是否符合设计预期」）
+
+另一会话（`session-54597a24`，334 轮自主运行）的一次压缩，用户同时看到三个数字：
+
+| 用户看到 | 实际含义（已用 `plugin/.data/m1-report.json` 取证） |
+|---|---|
+| 「浅压24% 档」 | 只是**登记**。该次 `retainSource = anchor:recent-user` ⇒ 锚点优先，档位预算不参与（R39 早已如此） |
+| 面板行「压后占用 27.8%」 | 压缩刚落地瞬间的**投影**（provider 仍报压缩前的 689,631） |
+| 两秒后 DSH 显示 ~8.4% | **真实值**（provider 刷新为 88,178） |
+| 实际只留 40k | `anchorTokens = 3,426` + `anchorClamped = true` + `walkBacks = 1` ⇒ 被 `MIN_RETAIN_TOKENS = 40k` 抬起（R44 记录过的同一现象） |
+
+**结论：压缩机制符合设计（锚点优先 + 下限保护），不符合的是显示**——三个数各自都对，但拼在一起互相矛盾。
+
+#### A. 显示修复（不改压缩算法）
+
+1. **`stale` 判据补一条兜底**（`core.mjs#projectedFromPressure`）：原判据只在 `surface/sampled` 齐全时成立，真机某些时刻 `sampledSurfaceTokens` 缺失 ⇒ 永远 `false` ⇒ 面板不标「provider 待刷新」。
+   新增：`reported > projected × 1.5` 也判 stale（本次真机 689,631 vs 291,964 ⇒ 命中）。
+   ⚠️ 只作**显示标注**、不参与触发判定（方向偏高=保守，与 R29 一致）。
+2. **面板/记录行带上保留来源**：新增 `anchorActSuffix()`（`m3`），锚点路径追加 `· 锚点(下限40k，锚点段仅3.4k)`；档位路径不追加。pre-step 行由
+   `formatAct + occupancyActSuffix + anchorActSuffix` 三件拼成（单一来源，继续贯彻"同一物理量只写一处"）。
+3. `contextLedgerOf` 增 `stale` 字段（报告取证可核对）。
+
+修复后同一行变成长这样：
+```
+19:08 · 智能压缩 · 省 402.7K · 压后占用 27.8%（provider 待刷新，下次请求后会回落） · 锚点(下限40k，锚点段仅3.4k)
+```
+一眼就能看出：**这是过渡读数 + 此次走的是锚点（且被下限抬过），不是"24% 档没生效"**。
+
+#### B. 卡片风险提示（`compact-tool` 文本）
+
+判据句追加：**「锚点覆盖档位预算：长任务里可能只留几 k（≈深压），要留大段证据用档位」**——
+因为 `recentUser:1` 在长自主任务里可能只覆盖几 k，被下限抬到 40k，效果等价于深压，与"浅压24%"的直觉相反。
+
+为守住三处教学 `desc+brief+card ≤ 3000`，同步等量删冗（"（要引用之前的路径/结论/报错现场/长推理链）"→"（要引用前文细节）"、摘要说明、判据短句等）。
+
+#### 验证
+
+- 新增 5 条断言：stale 三态（真机数字/仅 wire.view/无投影不可判/已刷新不误标）、`anchorActSuffix` 三态、pre-step 行拼装接线、卡片风险提示。
+- **变异 4 项全部 CAUGHT**：去掉 gap 兜底 / 锚点后缀不标下限 / pre-step 不拼后缀 / 去掉卡片风险句。
+- 测试：**1009 断言**全绿（contract 816 / static 84 / report 54 / boot 22 / client-render 33）。
+
+#### C 项（锚点下限）—— **用户 2026-10-28 决定：不改**
+
+曾考虑：把锚点预算下限从 `MIN_RETAIN_TOKENS=40k` 提高到 `max(40k, 档位预算 × 30%)`（本例会是 max(40k, 72k)），
+让"浅压24%"在锚点路径下也不至于只剩 40k。**决定不做**，理由：
+1. 下限的本意是"防丢新需求"的**安全网**，不是"保证档位承诺"；把档位预算塞进下限 = 让锚点悄悄变成"档位+位置"，
+   两者语义会混（R39 明确：锚点是**位置承诺**，按真实口径折算会越过锚点）；
+2. 真正该修的是**认知**：用户/模型要知道"锚点会覆盖档位预算"，这已由 R88-B 的卡片风险句 & R88-A 的面板标注解决；
+3. 若真需要"至少留 240k"，正确做法是**不用锚点、直接用档位**（卡片判据已写明）。
+
+⇒ 结论：锚点路径保留量偏小是**已知且已显式可见**的行为，不再增加隐式补偿。
+### R89/R90 「声明 ≠ 执行」复检：模型说压缩/调档但没调用工具时，插件当场指出（2026-10-29，用户反馈"遇到过好几次"）
+
+#### 现象（用户截图，实机多次）
+
+模型在一轮里写下 `档位决策：降 低(low)｜理由：纯机械改动…`，然后**继续干活**——
+工具列表里没有 `set_reasoning_effort`，底部仍显示 `Max`。用户以为切了，模型大概也以为切了。
+压缩同理：写了 `压缩决策：压` 却没调 `compact_context` ⇒ 未到强制线时**根本不会压**，直到越线才暴露。
+
+根因：插件只教了"先说再调用"，但**没有任何地方校验"说了之后到底调没调"**——
+教学能提高概率，却无法兜住漏执行（这正是本项目一贯的"意愿 ≠ 生效"问题）。
+
+#### 做法：把"复检"做成**下一步的纠正注入**（不替模型执行，只指出缺口）
+
+| 侧 | 输入 | 判据 | 动作 |
+|---|---|---|---|
+| **档位**（R89） | `core.lastAssistantText()`（surface 尾部筛 `assistant/message`，新能力） | 解析模型自己写的 `档位决策：升/降 <标签>`；若**目标档 ≠ 当前实际档** ⇒ 声明未执行 | `renderNudge` 提前返回：`【声明-执行不一致】你上一条写了「档位决策：降 低(low)」，但**没有调用 set_reasoning_effort** ⇒ 实际仍是 高(high)。要生效就现在调用一次；不打算换就收回那句话。` |
+| **压缩**（R90） | 同上（同一份 assistantText） | 解析 `压缩决策：压`；用**每会话**工具调用计数快照比对：声明确认后计数没涨 ⇒ 没调用 | m2 注入 `declNudge`：`【声明-执行不一致】你上一条写了「压缩决策：压」，但**没有调用 compact_context** ⇒ 压缩不会发生…` |
+
+实现要点：
+- **每会话调用计数**：`compact-tool` 新增 `toolCallsBySid` + api `toolCallsOf(sid)`（全局计数会被别的会话污染，不能复用）。
+- **不误报**：声明"保持"、或目标档 == 当前档 ⇒ 不提醒；同一档位声明 **4 轮内只提醒一次**（不刷屏）；"不压"声明会清掉快照。
+- **零 token 成本**：无声明 ⇒ 不注入（`declNudge` 为 null 时不进 `fullText`）。
+- host 的 `getLastAssistantText` 依赖与 `getLastUserText` **合并到同一行**（host.impl 代码行上限 320 不变）。
+
+#### 验证
+
+- 新增 8 条断言：R89 行为级 5 条（触发 / 4 轮内不刷屏 / 4 轮后再提醒 / "保持"不误报 / 目标==当前不误报）、
+  R90 行为级 1 条（每会话计数只增、跨会话不串）、R90 接线 1 条、R89 接线随动更新 1 条。
+- **变异 5 项全部 CAUGHT**：关掉档位复检 / 声明解析失效 / m2 不解析压缩声明 / 计数恒 0 / 提醒不进注入链。
+- 测试：**1016 断言**全绿（contract 823 / static 84 / report 54 / boot 22 / client-render 33）。
+
+> 彩蛋（本轮踩坑）：草稿里留了一行对**未定义变量** `effortTiersForParse` 的引用，而 `renderNudge` 外层是
+> `try { … } catch { return null; }` ⇒ 异常被静默吞掉、提醒永远不触发，测试只表现成"全部返回 null"。
+> 这是本项目反复强调的"吞错掩盖失效"典型；断言里的 `实际：null` 是唯一线索。
+
+#### 不做的
+
+- **不自动替模型执行**（不代调 `set_reasoning_effort` / `compact_context`）：那会伪造模型意图；
+  插件只负责"指出缺口"，执行权仍在模型（与"压缩由模型决定"的既定设计一致）。
+### R91 「声明 ≠ 执行」复检真因：只读了**最后一条** assistant 消息（2026-10-29，用户反馈"还是这个毛病"）
+
+#### 现象
+
+按 R89/R90 上线后，用户再截图：`档位决策：降 低(low)｜理由：…` 依旧没有 `set_reasoning_effort`，底部仍是 `Max`。
+**取证**（`plugin/.data/m1-report.json`）：`max compactDeclNudges = 0`、「声明-执行不一致」在 120 条历史里**一次都没出现**
+（而老的 `effortNudges = 5` 说明提醒管道本身是活的）⇒ **新规则从未命中**。
+
+#### 根因
+
+R89/R90 的输入是"模型上一条消息"，而我实现成了 **surface 尾部第一条 `assistant/message`**。
+但真机形态是：**决策行写在轮首**，之后还有几十个工具节点、最后再跟一条收尾 assistant 消息
+⇒ "最后一条 assistant" 里**没有声明**，永远匹配不到。（这也是 `lastUserText` 当年踩过的同类坑：
+surface 结构/顺序与"最近一条"的直觉不一致。）
+
+#### 修复
+
+1. `core.scanAssistantText(session, extract, opts)`（**顶层纯函数**，可单测）：
+   从尾部向前扫最多 200 个节点，收集**最近 4 条** assistant 文本拼起来（新→旧），上限 1600 字符；
+   - 形状容忍：`type` 含 `assistant` **或** `data.message.role === 'assistant'`；
+   - 兜底：任何事件文本里含「档位决策|压缩决策」也收（不同 DSH 版本字段不同，宁可多认）；
+   - `createCore` 内部 `lastAssistantText` 改为**委托**它（单一实现，防两处漂移）。
+2. **诊断字段** `state.m2.lastDeclProbe = { at, asstLen, hasTierDecl, hasCompactDecl, decl, toolCalls }`：
+   下次再失效，报告里就能看出"到底读没读到 assistant 文本 / 有没有声明"，不必再靠猜。
+3. 假会话回归：构造"声明在轮首 + 30 个工具节点 + 收尾消息"的真机形态，断言仍能扫到声明。
+
+#### 验证
+
+- 新增 5 条断言：真机形态回归、只靠 `role` 识别、只靠 `type` 识别（两分支各自独立护栏）、
+  扫到的文本能被档位正则解析出「降 低(low)」、诊断字段接线。
+- **变异 3 项全部 CAUGHT**：退化为"只读最后一条" / 不认 `role=assistant` / 不认 `type=assistant` / 去掉诊断赋值。
+- 测试：**1021 断言**全绿（contract 828 / static 84 / report 54 / boot 22 / client-render 33）。
+
+#### 教训（写进项目纪律）
+
+**"最近一条"类读取必须用真机形态的回归用例钉住**（声明在开头、后面一堆工具节点），
+否则很容易实现成"最后一条"而静默失效——本项目已第二次踩（R72 的 `lastUserText` 是第一次）。
+凡是"能不能读到"的能力，最终断言必须是**行为级 + 真机形态**，不能只做源文本断言。
+### R92 压缩记录改为**按会话分文件**存：`.data/acts/<sid>.json`，每会话 100 条（2026-10-29，用户要求）
+
+#### 起因（用户问「记录最近压缩的是所有会话同一个文件 + 会话过滤显示么？」）
+
+查证结果：**是**——所有会话都写 `plugin/.data/hud-acts.json`，显示时 `buildHudResponse(sid)` 按 sid 精确过滤（空 sid 返空）。
+但这带来两个问题：
+1. **全局 cap 50**：14 个会话共用 50 个槽位 ⇒ 活跃会话的历史会被别的会话**挤掉**（实测分布：某会话 12 条，某会话只剩 2 条）；
+2. 多会话写**同一文件**虽是原子写（不会半截），但语义上仍是共享可变状态。
+
+#### 改动
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| 存储 | 单文件 `hud-acts.json` | **目录 + 每会话一个文件**：`.data/acts/<sid>.json`（`sid` 经安全化：只留 `[A-Za-z0-9._-]`） |
+| 上限 | **全局 50** | **每会话 100** |
+| 写 | 每次全量重写 50 条池子 | 只重写**本会话**文件（更小的写放大） |
+| 读 | 读池子再 filter | 读**本会话文件**（内存缓存 LRU，最多 64 个会话；未命中才读盘） |
+| 迁移 | — | 旧 `hud-acts.json` **首次加载自动拆分**到各会话文件，旧文件改名 `.migrated` **留档不删**（幂等，可重复跑） |
+| 空 sid | 返回空 | 返回空（**不**返回全局；宁缺勿错，语义不变） |
+
+#### 生产数据实证（迁移已在真实 `.data` 上跑通）
+
+```
+旧 hud-acts.json：50 条 / 14 个会话
+        ↓ 迁移
+.data/acts/：14 个会话文件（总条数仍 50）
+hud-acts.json.migrated：存在（留档 9.7KB）
+```
+
+#### 验证
+
+- 新增 6 条**行为级**断言：每会话独立文件、文件内不混存别的会话、**每会话 100 上限**（写 105 条淘汰最旧）、
+  一会话写爆**不挤掉**另一会话（原全局 cap 根因）、空 sid 不返回全局、旧文件自动迁移 + 改名留档；
+- 同步更新 `report.mjs`（改为扫描 `.data/acts/`，校验每文件 ≤100 与 sid 一致性）与 `boot.mjs`（改读目录）；
+- **变异 4 项全部 CAUGHT**：不按会话读 / 上限退回 50 / 不迁移 / 空 sid 返回全局；
+- 测试：**1028 断言**全绿（contract 834 / static 84 / report 55 / boot 22 / client-render 33）。
+
+#### 备注
+
+- `plugin/.data/` 仍整体在 `.gitignore` / `.npmignore` 里（工作数据，不入库、不进包）；
+- 迁移是**幂等**的：万一旧实例（未 toggle）又写了 `hud-acts.json`，下次加载会再拆一次（按 `at` 去重）。
+### R93 第三次复现的真因：扫描**按预算提前停** + 截断保尾部 ⇒ 声明被挤掉（2026-10-30）
+
+#### 现象与取证（这次终于有诊断字段）
+
+用户第三次报「说换档但没执行工具」。这次 R91 加的诊断字段直接给出答案：
+
+```
+lastDeclProbe = { asstLen: 1600, hasTierDecl: false, hasCompactDecl: false, toolCalls: null }
+```
+
+- `asstLen = 1600` **正好等于上限** ⇒ 说明读到了文本，但被截断；
+- `hasTierDecl = false` ⇒ 文本里**没有**「档位决策：」——可模型明明在轮首写了。
+
+#### 根因（两处叠加，都在 `core.scanAssistantText`）
+
+1. **截断方向错**：最后 `parts.join('\n').slice(-maxLen)` 保留的是**尾部**。真机是「声明在轮首 + 后面很长的收尾消息」，
+   尾部截断必然把声明切掉。
+2. **扫描按预算提前停**：循环条件里有 `budget > 0`，而每段是按 `budget` 递减分配的 ⇒ 先吃到两条长收尾消息就把预算耗光，
+   **声明所在的那条根本没被扫到**（所以连"候选"都没进）。
+
+> 这两点解释了为什么前两次修（R89→R91）都"看起来对、实际不触发"：R91 只解决了"只读最后一条"，没解决"读多条时怎么挑"。
+
+#### 修复
+
+- 扫描**不再按预算提前停**：尾部向前扫满 `maxNodes`（默认 200），每段单独限长 `maxLen/maxMsg`（防一条超长消息独占）；
+- **声明优先保留**：扫的过程中记录"最新一条含 `档位决策|压缩决策` 的 assistant 文本"，
+  输出时把它放最前，再拼最近文本，最后才整体截断 ⇒ 声明不会被截掉；
+- 无声明时行为不变（返回最近若干 assistant 文本，供其它用途）。
+
+#### 验证
+
+- 新增真机形态回归用例：**声明在轮首 + 20 个工具节点 + 两条 900 字长收尾消息** ⇒ 必须仍能扫到并解析出「升 高(high)」；
+- **变异 CAUGHT**：把循环退回"只扫 1 条"⇒ 4 条断言变红（含 R91/R93 两个真机形态）；
+- 测试：**1029 断言**全绿（contract 835 / static 84 / report 55 / boot 22 / client-render 33）。
+
+#### 教训（第三条同类）
+
+**"能读到"的断言必须用"最坏形态"钉住**：不仅要有声明，还得有**会挤掉它的长内容**。
+前两次的用例里收尾消息只有十几个字（`总长 < 1600`），所以"尾部截断"这个 bug 一直躲着——
+真机上收尾消息动辄几百上千字，立刻暴露。以后这类回归用例必须带**超长干扰内容**。
+### R94 「声明即执行」：模型说了换档但忘调工具 ⇒ 插件自动补执行（2026-11-02 用户要求）
+
+#### 起因
+
+用户第三次反馈后（R93 已让"检测"生效——本轮注入里确实出现了「声明-执行不一致」提醒），
+用户明确要求继续优化：**"实际使用里，Agent 换档时比较大概率忘了执行工具"**。
+⇒ 光提醒不够（模型看到提醒也可能继续干活），必须**让声明的意图真正落地**。
+
+#### 做法：不是伪造工具调用，而是**替模型把声明执行完**
+
+关键发现：`effort.applyTo` 揭示切档机制 = **设置该会话的 pending `want`**，下一个请求自动改写 config；
+工具 `set_reasoning_effort` 只是"设置 want"的入口之一。因此补执行可以**复用同一条接受路径**：
+
+- `effort.reconcileDeclaredTier(agent, assistantText)`：解析声明 → 校验当前档 → 调 `runTool(..., { auto: true })`；
+  **完全复用**校验 / 幂等（已是该档）/ 冷却 / 统计；
+- 统计**分开记账**：`state.m3.effortAutoApplies` / `lastEffortAuto`（**不污染** `effortToolCalls`）——
+  否则报告里再也看不出"模型忘调"这件事是否仍然存在；
+- 注入侧（m2）在拼注入文本前调用它：成功则注入
+  `【已按你的声明自动应用】…已按声明切到 X（下一步生效）。以后请直接调用工具（能省一次往返）。`，
+  并让 `renderNudge` 跳过「声明-执行不一致」（避免自相矛盾）；
+- 新配置 `effortAutoApply`（默认 **开**，面板「声明即执行」可关）——关掉就退回"只提醒"。
+
+#### 顺带修复：工作区里一份未完成的 `readProjection` 重构
+
+发现工作区存在**非本次会话**的半截重构：把 `svc('sessionProjections').stateOf(...)` 改成注入 `readProjection`
+（core/host 已完成，m1/m3/session-facts 的测试桩未更新）⇒ 直接构造模块的 16 条用例拿不到注入，
+测量退化成本地启发式（R24/R29/R37/R39/R49 等变红）。处理：在 5 个模块里加**兼容兜底**
+`readProjOf = readProjection ?? svc('sessionProjections').stateOf`（最坏 = 旧行为），并把 3 条钉住旧函数名的断言对齐。
+
+#### 验证
+
+- 新增 6 条断言：补执行成功（from max → low）/ 单独计数 / `declApplied` 时不再报不一致 /
+  面板关掉则不补执行 / 「保持」与"已在目标档"不误动 / **四处接线**（schema + core 默认&merge + host readCfg + 面板 FIELDS）；
+- **变异 5 项全部 CAUGHT**：不真正补执行 / 计数不分来源 / 忽略 declApplied / 忽略开关 / 去掉 schema 字段；
+- 测试：**1040 断言**全绿（contract 846 / static 84 / report 55 / boot 22 / client-render 33）。
+### R95 真机事故：「引用/转述」被当成新声明 ⇒ 自动补执行把档位切错了（2026-11-02）
+
+#### 事故经过（用户当场发现）
+
+R94 上线（声明即执行）后，用户发起一句普通提问，会话**自己从 最高(max) 切到了 高(high)**。
+取证（`plugin/.data/m1-report.json`）：
+
+```
+state.m3.lastEffortAuto = { sessionId: session-9a611857…（正是本会话）, want: "high", from: "max" }
+state.m3.effortAutoApplies = 1
+m2.lastDeclProbe = { hasTierDecl: true, … }
+```
+
+⇒ **不是跨会话**（补执行始终作用于当前 `agent`），而是**我这句回复里引用了那条提醒原文**
+（其中含「档位决策：升 高(high)」），解析器在**任意位置**匹配到该模式，误判为"模型又声明了一次"。
+
+#### 根因
+
+`parseTierDeclaration` 用 `/(档位决策|压缩决策)[：:]…/` **全文匹配**，无法区分"声明"与"引用/示例/文档"。
+这类"引用了自己的提醒"在排障对话里非常常见（我们这几轮一直在讨论这些提醒文本本身）。
+
+#### 修复（精度优先：误认会切错档，漏认只是少一次补执行）
+
+`parseTierDeclaration` 与 m2 的压缩声明解析都改成**行首锚定 + 结构性排除**：
+
+1. 逐行扫描（不再全文匹配）；
+2. **代码块（``` 围栏）内**不认；
+3. 含我们自己的提醒标记（`【声明-执行不一致】` / `【已按你的声明自动应用】`）的行不认；
+4. 去掉列表/加粗前缀（`- ` `* ` `# ` `• `）后，必须**以「档位决策：」开头**才算；
+   —— 引用行（`>` 开头）因此天然被排除（`>` 不在可清洗前缀里）；
+5. 压缩侧（m2 `parseCompactDecl`）同样处理。
+
+> 顺带遵守项目纪律：原实现里还有一条 `if (/^>/.test(line)) continue;`，实测它是**冗余**的
+> （行首锚定已排除引用行）⇒ 删除，改为"把 `>` 加入可清洗前缀"这一变异来验证引用行会被挡住。
+
+#### 验证
+
+- 新增 5 条回归断言：`>` 引用行 / 行内引号转述（**不带我们的标记**）/ 代码块 / 正常声明三种写法（行首、列表、加粗）仍认得出 /
+  **事故复现**（把"引用形态"直接喂 `reconcileDeclaredTier` ⇒ 必须拒绝）/ 压缩侧结构断言；
+- 变异 4 项全部 CAUGHT（不跳过代码块 / 去掉行首锚定 / 压缩侧去掉锚定 / 把 `>` 清洗掉）；
+- 测试：**1046 断言**全绿（contract 852 / static 84 / report 55 / boot 22 / client-render 33）。
+
+#### 教训
+
+**凡是"从模型文本里解析意图"的能力，必须假设文本里会出现"对这条能力自身的引用"**。
+本项目此前吃过"引用固定文案"的亏（R78 的 16% 写死），这次是"引用提醒原文导致自我触发"——
+比写死更隐蔽：它让一个**安全网**变成了**误动作**。
+### R96 「声明即执行」只在轮首生效（中步不触发）—— 2026-11-02 实测发现
+
+#### 实测经过
+
+R95 修复"引用被当声明"后，用户要求重新测试"声明后不执行"。我在回复里写了一条**行首声明**（降 低(low)）并**故意不调用工具**，
+随后继续执行命令（同一轮的中步）。结果：**没有发生任何补执行**——`effort-stats.json` 未更新、报告无 `lastEffortAuto`。
+
+#### 根因
+
+`m2.buildInjection` 里有 `if (step !== 1) { … return { skip: 'not-step-1' } }`——**注入（以及我塞在注入路径里的补执行）只在每轮第一步跑**。
+而模型声明发生在某一步的 assistant 文本里，若它随后继续干活（多步），这笔声明要等到**下一轮首步**才会被处理：
+用户看到的现象就是"说了、也提醒过了、但档位一直没变"。
+
+#### 修复
+
+把声明复检（`reconcileDeclaredTier`）**提到所有分步门控之前**：每个 pre-step 都做一次
+（解析 + 校验 + 该切就切），与"是否注入"完全解耦；首步注入仍负责给回执文案。
+新增结构断言：复检位置必须**在 `step !== 1` 之前**（变异：把它放回门控之后 ⇒ 8 条变红）。
+
+#### 验证
+
+**1047 断言**全绿（contract 853 / static 84 / report 55 / boot 22 / client-render 33）；
+变异「复检放回门控后」CAUGHT（红 8 条）。
+### R97 前置复检的 **TDZ** 事故：`effortApi` 在函数后半段才声明 ⇒ 异常被吞 ⇒ 补执行永不触发（2026-11-02）
+
+#### 现象
+
+R96 把补执行提到"分步门控"之前、理论上每步都跑，但真机实测**依旧毫无反应**
+（`effort-stats.json` 不更新、报告无 `lastEffortAuto`），而代码看起来完全正确。
+
+#### 根因（这次是**作用域时序**，不是逻辑）
+
+`m2.buildInjection` 里：
+
+```js
+if (signal?.aborted) return …;
+const effortApi0 = effortApi;   // ← 我写的"提前复检"块在这里引用 effortApi
+…
+if (step !== 1) { … }           // 门控
+…
+const effortApi = getEffortApi();   // ← 它在这里才声明（函数后半段）
+```
+
+⇒ 前置块引用的是 **TDZ 变量**，抛 `ReferenceError`，被我自己写的 `try/catch` **静默吞掉**
+⇒ 表现与"功能没实现"一模一样。这是本项目反复强调的"吞错掩盖失效"的又一实例。
+
+#### 修复
+
+1. 前置块**就地取**：`const effortApi0 = getEffortApi?.() ?? null;`（getter 随时可调，不依赖后面那行 const）；
+2. **失败必须留痕**：新增 `state.m2.lastReconcile = { at, turn, step, asstLen, hasApi, applied, to, why }`，
+   catch 分支写 `{ error }` —— 下次再失效，报告里一眼能看出"到底有没有复检、为什么没成"；
+3. 新增**结构断言**：前置块所在行必须含 `getEffortApi`（不能引用后声明的 `effortApi`），
+   变异「改回 `const effortApi0 = effortApi;`」⇒ **CAUGHT**。
+
+#### 验证
+
+**1049 断言**全绿（contract 855 / static 84 / report 55 / boot 22 / client-render 33）。
+### R98 档位标签不再是 3~4 档硬编码：按**模型自己的可选集**解析（2026-11-02 用户提问）
+
+#### 用户问题
+
+「如果其他模型档位有多个，不止 low/high/max，也能生效么？」并补充：**Trae 的 V4.1 Flash 没有 max、有 xhigh**。
+
+#### 修复前：确实不行，而且更糟
+
+`parseTierDeclaration` 里把标签**写死**成两套：
+
+- 括号 id：`/\((off|low|high|max)\)/`
+- 中文：`关 / 低 / 高 / 最高`，且 `中` 被映射到 **high**
+
+⇒ 对 `[minimal, medium, xhigh]` 这类模型：
+「中(medium)」解析不到 id，落进中文分支 ⇒ 被映射成 `high` —— **静默切到错的档**（比不切更坏）。
+
+#### 修复后：以 `resolveModelInfo().reasoning.efforts` 为准
+
+| 顺序 | 规则 |
+|---|---|
+| ① | 括号里的 id 若在可选集 ⇒ 用它（`超高(xhigh)` → xhigh） |
+| ② | **裸 id** 若在可选集 ⇒ 用它（`Xhigh` / `medium`，Trae 这类模型常见写法） |
+| ③ | 与 `effortLabel(id)` 显示名完全相等 ⇒ 用它（`中(medium)`） |
+| ④ | 去括号后与中文标签唯一匹配 ⇒ 用它 |
+| ⑤ | **有可选集却命中不了 ⇒ `null`（不动）**——绝不猜近似档 |
+| ⑥ | 只有**完全拿不到可选集**时，才退回旧的中英文表 |
+
+配套修正：token 正则原先**排除了右括号** ⇒ `低(low)` 被截成 `低(low`，括号 id 永远匹配不到（旧代码靠中文兜底"碰巧"生效）；现一并修掉。
+
+#### 验证
+
+- 新增 3 条断言：多档模型（中/超高/裸 Xhigh、低(low)）、**没有的档位不猜**（该模型的 `最高(max)` ⇒ null）、
+  **端到端**（3 档模型 minimal/medium/xhigh，声明升 xhigh ⇒ 补执行 from medium → xhigh）；
+- 变异 3 项全部 CAUGHT：不认裸 id / 猜不到乱猜 / 无视可选集；
+- 测试：**1052 断言**全绿（contract 858 / static 84 / report 55 / boot 22 / client-render 33）。
+### R99 「叙述式声明」漏认：`档位决策：用户刚调到 X…准备升到 Y`（2026-11-02 用户截图）
+
+#### 现象
+
+用户截图：模型写了
+
+> 档位决策：用户刚调到 低(low)，但这条批注要求新增「删除账户」功能，涉及权限/自删/最后一个管理员保护，
+> 属安全相关改动，**准备升到 高(high)**（等冷却结束再调用）。压缩决策：不压｜占用 53%…
+
+底部仍是 `Low`，**没有自动补执行**。
+
+#### 根因（两处，都是"格式假设太严"）
+
+1. **档位解析**：原正则要求 `档位决策：` 后**紧跟** `升/降/保持`；真机是"叙述式"——
+   动词在句子中间（"…准备升到 高(high)"）⇒ 整行被跳过，既不补执行也不提醒。
+2. **压缩解析**：原正则要求 `压缩决策：` 出现在**行首**；真机把两种决策写在**同一行**
+   （`档位决策：…。压缩决策：不压｜…`）⇒ 压缩侧也漏认。
+
+#### 修复（保住 R95 的精度，只放宽"行内位置"）
+
+- **档位**：仍要求行以 `档位决策：` 开头（引用行 `>`、代码块、我们的提醒文本继续排除），
+  然后在该行**剩余部分**找第一个 `升/降/保持`（允许 `到/为`）⇒
+  「准备**升到** 高(high)」能认，「用户刚**调到** 低(low)」不会（"调到"不是升降意图）。
+- **压缩**：行首只要是两种声明之一即可，`压缩决策` 可在行内任意位置再定位。
+
+#### 验证
+
+- 新增 4 条断言：**截图原句**（升/high）、只有"用户刚调到"⇒不动、标准写法与 `>` 引用行不退化、
+  压缩侧同行写法结构断言；
+- 变异 3 项全部 CAUGHT：退回"紧跟动词" / 去掉行首锚定 / 压缩侧只认行首；
+- 测试：**1056 断言**全绿（contract 862 / static 84 / report 55 / boot 22 / client-render 33）。
+### R100 预防性修复：把"声明→执行"链上剩余同类失效一次性堵掉（2026-11-02 用户要求）
+
+用户要求「举一反三，还有什么其他类似情况可能导致不生效的，可以全面检查预防性修复下」。
+按"同一类失效"审计后，修复 5 项（另 1 项判定不修）：
+
+| # | 风险（会不生效 / 切错） | 修复 |
+|---|---|---|
+| 1 | **动词变体**：`切换到 / 改为 / 降到 / 提到 / 换成 / 转成` 等写法不认 | 动词类扩展为 `切换|升|降|保持|切|换|改|转|提`（双字优先） |
+| 2 | **误伤词抢占**：正文里「属安全相关**改动**，准备升到 高(high)」——「改」先被匹配 ⇒ token「动」⇒ 解析不到档 ⇒ **整行被丢** | 改为**逐个候选动词往后试**，直到某个候选的目标 token 能解析成该模型真实档位；全失败才算无声明 |
+| 3 | **行首前缀**：`1. ` `2) ` `思考：` `档位决策 ：`（冒号前空格） | 剥离"非声明性前缀"（序号/列表/加粗/思考标签），并允许冒号前空格 |
+| 4 | **多条声明取旧意图**：同一消息先写"降"又改"升" ⇒ 取第一条会切错 | 取**最后一条**能解析的声明 |
+| 5 | **冷却被拒丢意图**：真机文案「等冷却结束再调用」，但插件没有重试 ⇒ 声明白写 | 冷却拒绝时记 **per-sid pending**，后续 pre-step 冷却一过自动补执行；成功/同档时清空；最多 64 个会话 |
+| 6 | 声明后被压缩掉导致文本消失 | **不修**（概率低、成本高；有提醒兜底） |
+
+顺带修掉一个潜伏 bug：token 正则字符类里写了**裸 `|`**（`[^\s｜|，,。；;]`），`|` 在字符类外被当"或"，导致匹配行为随文本内容漂移。
+
+#### 验证
+
+- 新增 6 条断言：动词变体 + 误伤词、行首前缀三种、多行取最后、冷却 deferred、重复声明幂等（already）；
+- **变异 4/4 全 CAUGHT**：只试第一个动词 / 去掉前缀剥离 / 多行取第一条 / 冷却不留 pending；
+- 测试：**1061 断言**全绿（contract 868 / static 84 / report 55 / boot 22 / client-render 33）。
+### R101 真机 bug：教学示例写死「升 最高(max)」⇒ 模型照抄说出不存在的档位（2026-11-05）
+
+#### 现象（用户截图）
+
+模型在 Trae V4.1 Flash（可选集只有 `低(low)/高(high)/超高(xhigh)`，**没有 max**）上写了：
+
+> 档位决策：升 最高(max)｜理由：涉及金额换算语义…
+
+用户指出：**模型没有 Max 却说升到 Max，暴露的档位逻辑有问题**。
+
+#### 根因：教学文案里的示例是**写死**的
+
+`effort.renderBrief`（每会话注入一次、模型唯一学格式的地方）原本固定写：
+
+```
+`档位决策：升 最高(max)｜理由…` / `档位决策：降 低(low)｜理由…` / `档位决策：保持 高(high)｜理由…`
+```
+
+以及回执示例 `（例：`思考强度 最高(max)`）`。模型**直接照抄示例** ⇒ 对没有 max 的模型就写出不存在的档位
+⇒ 解析层（R98）正确地返回 null（不猜）⇒ **静默不生效**，用户看到"说了却没切"。
+
+#### 修复
+
+1. **示例按当前模型可选集动态生成**：
+   - 升档示例 = 可选集里**强度最高**的档（`effLow` 同理取最低）；保持示例 = **当前档**；
+   - 回执示例也用当前档，不再写死 max；
+   - 强度序用 `EFFORT_RANK`（none<minimal<low<medium<high<max<xhigh<ultra），未知 id 取中位。
+2. **不再假设 provider 返回顺序**：原 nudge 的"到顶/到底"守卫用 `indexOf === length-1` 判断，
+   而有的 provider 返回乱序（如 `[high, low, xhigh]`）⇒ 在真正的最高档上仍提示"可升档"。
+   现改为按强度序求 `topTier/bottomTier` 再比较。
+3. 教学里那句"换模型后可选集可能不同"改成纯中文表述（避免出现裸英文 id 被"中英混排"检查判为泄漏）。
+
+#### 验证
+
+- 新增 5 条断言：3 档模型示例**不得**出现「最高(max）」、4 档模型仍为「最高(max)」、
+  2 档模型示例为「高(high)/低(low)」、**逐档校验示例档位都在可选集内**、到顶判断按强度序；
+- 变异 2/2 CAUGHT（升档示例写死 max / 到顶判断退回 indexOf 顺序）；
+- 测试：**1067 断言**全绿（contract 873 / static 84 / report 55 / boot 22 / client-render 33）。
+### R102 用户纠正：「3 档」≠「没有 max」；未知档位 id 不能退化（2026-11-05）
+
+#### 用户指出
+
+> 「3 档模型，有的有 Max 的呀。」
+
+上一轮我把 Trae V4.1 Flash（`low/high/xhigh`）的形态**当成"3 档就没有 max"**，这个概括本身错了：
+3 档完全可以是 `low/high/max`。检查实现：**示例生成确实只看可选集**（`rankOf` 排序取最高/最低），
+没有按档位数猜档位名 ⇒ 主路径是对的（实测 `low/high/max` ⇒ 示例「升 最高(max)」✓）。
+
+#### 但发现一个真隐患：未知档位 id 排序退化
+
+`rankOf` 对**未知 id**（如 `turbo`/`boost`/`standard`）一律返回 3（中位）⇒ 排序退化：
+
+| 可选集 | 修复前 | 正确应为 |
+|---|---|---|
+| `[low, high, turbo]` | 升档示例 = **高(high)** ✗ | 升 = turbo |
+| `[off, standard, boost]` | 升档示例 = **standard** ✗ | 升 = boost |
+
+模型照抄错示例 ⇒ 又会出现"说出非最高档"或"以为升了其实是降"。
+
+#### 修复
+
+`rankOfIn(id, list)`：已知 id 用固定强度序（none<minimal<low<medium<high<max<xhigh<ultra）；
+**未知 id 按它在可选集里的位置插值**（0..1 → 0..6）——provider 惯例按强度升序返回，
+所以"越靠后越强"是可靠信号；单元素/找不到时仍退回中位。
+
+同时修正 nudge 的"到顶/到底"判断（同样改用 `rankOfIn`，不再依赖 `indexOf === length-1`）。
+
+#### 验证
+
+- 新增 5 条断言：**3 档且有 max ⇒ 示例为「最高(max)」**、3 档无 max ⇒ 「超高(xhigh)」、
+  未知 id（turbo/boost）不退化、**乱序可选集**（`max/high/low`）按强度序取最高、2/4 档同样正确；
+- 变异 2/2 CAUGHT（未知 id 退化中位 / 升档取末位纯位置）；
+- 测试：**1072 断言**全绿（contract 878 / static 84 / report 55 / boot 22 / client-render 33）。
+### R103 真机：已是 high 却写「升 高(high)」⇒ 插件**全程静默**（2026-11-05，另一会话）
+
+#### 现象（用户截图，非本会话）
+
+> 档位决策：升 高(high)｜理由：要确认「未分类」出现在哪个组件/交互里…
+
+底部已是 `High`。用户：**「档位已经是 high，但是还要升」** —— 模型做了个空操作，而插件**一句话都没说**。
+
+#### 根因
+
+`renderNudge` 的判定条件是 `dec.tier !== eff.current`（只在"目标≠当前"时才提醒）。
+⇒ 目标 == 当前档时整条分支不进入 ⇒ **静默**。`reconcileDeclaredTier` 同样返回 `why:'same'` 不产生任何提示。
+
+对模型而言这是"我升了档（其实没有）"，对用户而言是"为什么已经是 high 还要升"——两边都不知道发生了什么。
+
+#### 修复（最小改动，只补这一种情况）
+
+`renderNudge`：条件去掉 `dec.tier !== eff.current`；在 fresh 分支里加一条：
+
+> 【声明无实际效果】你上一条写了「档位决策：升 高(high)」，但**当前已经是 高(high)** —— 这条声明不会改变任何东西。
+> 若确实需要换档，请写**其它档位**；不需要就写「保持」。
+
+仍受 4 轮去重约束（不会每轮刷屏）。
+
+> 说明：我一开始还想顺带做"升却指向更低档"的方向矛盾检测，但那是**过度设计**、也不是用户报的问题 ⇒ **没做**（保持改动最小）。
+
+#### 验证
+
+- 断言更新：原「目标==当前 ⇒ 不误报」改为「目标==当前 ⇒ **明确提示声明无实际效果**」；
+- 变异 2/2 CAUGHT（恢复旧条件 / 目标==当前仍报"不一致"）；
+- 测试：**1072 断言**全绿（contract 878 / static 84 / report 55 / boot 22 / client-render 33）。
+### R104 真机：模型写了该模型**不存在**的档位 ⇒ 旧实现完全静默（2026-11-05，另一会话）
+
+#### 现象（用户截图）
+
+另一会话（`DeepSeek V4.1 Flash`，可选集 `low/high/xhigh`）里模型又写：
+
+> 档位决策：升 最高(max)｜理由：新板块+旧项目数据迁移+多页布局…
+
+底部仍是 `High`，用户：**「说升到 Max，没有触发」**。
+
+#### 两层原因
+
+1. **那个会话的教学是旧版**（教学每会话只注入一次；R101 的"示例按可选集生成"要**新会话**才生效）——
+   所以模型还在照抄旧的 `升 最高(max)` 示例。这一点只能靠"新会话"自然修复。
+2. **更关键的结构缺口**：模型写了不存在的档位 ⇒ `resolveDeclaredTier` 正确返回 null（**不会乱切**），
+   但解析器把整行丢弃 ⇒ 上层只看到 `no-decl` ⇒ **静默**。用户看到的是"说了但什么都没发生"，
+   模型也得不到任何反馈（它以为写了）。
+
+#### 修复：区分"没写声明"与"写了但档位不存在"
+
+新增旁路函数 `missedTierOf(text, efforts)`（**不改主解析器签名**，只回答一个问题：
+有没有一条声明行，其目标档位不在可选集）。提醒层据此输出：
+
+> 【档位不存在】你上一条的档位决策指向一个**该模型没有的档位**（当前可选：低(low)/高(high)/超高(xhigh)）。
+> 请只写可选集里的档位；或用 set_reasoning_effort 实际调用一次（它会校验并给出可选集）。
+
+- 4 轮去重（不刷屏）；
+- 排除我们自己的提醒文本（防止把"【档位不存在】…"当成新声明 → 自我循环）；
+- 可选集为空/未取到时不报（避免无信息量噪声）。
+
+#### 验证
+
+- 新增 5 条断言：不存在档位 ⇒ 明确提示并列可选集、存在档位仍走原「声明-执行不一致」（不混）、
+  无声明/自提醒 ⇒ 不报、无可选集 ⇒ 不报、4 轮去重；
+- 变异 3/3 CAUGHT（去掉分支回静默 / 去掉去重 / 不排除自提醒）；
+- 测试：**1077 断言**全绿（contract 883 / static 84 / report 55 / boot 22 / client-render 33）。

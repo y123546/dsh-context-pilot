@@ -1,0 +1,1038 @@
+/**
+ * M3 压缩域（R9 抽执行核心 / R10 搬入编排层）—— 压缩的**全部实现**。
+ *
+ * ## 分两层（R7 审计的划分，R10 起两层都在本模块）
+ * - **执行核心**：`measureRatio`（测量读数收敛）+ `compactWithOwnRange`（自选范围执行 +
+ *   `prevEnd` 回退 + 官方兜底）。依赖只有 `svc`/`tryOf`/`state`/range 取用口。
+ * - **编排层**：`preStepCompaction`（轮内先压：意图消费 / 阈值门控 / 强制线收口 / 留痕）+
+ *   `idleSweep`（idle 安全网）。它天然要碰 M2 教学（`clearBriefed`）、M5 HUD
+ *   （`publishHud`/`recordHudAct`/`formatAct`）与报告（`schedule`）——R10 把这些**全部改成显式注入**，
+ *   于是 M3 不再「隔着单例 state 与闭包去改别人的域」。
+ *
+ * ## 边界纪律（与前六把刀同构）
+ * - 依赖**全部注入**，对宿主内部件零 import ⇒ 依赖图叶子。
+ * - 由宿主 `import(\`./m3.compact.mjs?ts=${IMPL_TS}\`)` 加载（漏掉 `?ts=` 会像 P16 那样永久缓存）。
+ * - **不抛错**：`preStepCompaction` / `idleSweep` 各自整体 try/catch 并留痕；
+ *   `compactWithOwnRange` 只把**非校验类**异常上抛（外层要决定重试/上报，这是刻意的）。
+ * - 宿主 `apply` 不是 async ⇒ 宿主侧一律「懒加载 + 空值降级」（见宿主注释）。
+ *
+ * ## 语义要点（全部是实证结论，搬迁时逐字保留）
+ * - 保留比例是 **range 模块自己的常量**（= 引擎 `DEFAULT_RETAIN_RATIO` 0.16），不放进 M3 配置：
+ *   M3 的语义是「用户可配项」（且有「M3 字段必须在 schema 中」的护栏），面板可调需 schema 字段 + 重启。
+ * - 「没什么可压」且**未越强制线** ⇒ 就此收手（`source: 'none'`）。回退官方 = `retainTokens 0` = 把整段砍光。
+ * - 末端边界不合法 ⇒ 沿 surface 回退一个节点重试（`prevEnd`）；该校验发生在 `compaction/start` 之前
+ *   （引擎 lib:452 vs :469）⇒ **零副作用、零 LLM 成本**的纯读，所以敢循环。
+ * - 强制线收口：自选范围后仍越线 ⇒ 追加官方 overflow（保住「越强制线必定压到线下」的旧承诺）。
+ * - idle 与 pre-step 都钳到 `min(配置, 引擎阈值 − 5pp)` 之下（5pp 理由见 threshold.mjs）。
+ */
+
+/** R38（2026-10-16）：面板/记录行里的「压后占用」后缀——**三条路径共用一份**
+ * （引擎/手动、pre-step 自选范围、idle 扫除），避免"同一物理量三处各写一遍"（本项目多次踩坑）。
+ * `stale`（surface 比 provider 上报时缩水 >50%）⇒ 带「provider 待刷新，下次请求后会回落」：
+ * 刚压完的表盘是**过渡值**（真机：12.6% → 13 分钟后 5%，见 R37 的账本算术）。 */
+/** R88（2026-10-28 用户反馈「浅压24% 却只留了 40k」）：面板/记录行要**说清保留来源**。
+ * 锚点路径下档位预算不参与（R39），且锚点段常被 `MIN_RETAIN_TOKENS` 抬起（R44）——
+ * 面板只写「压后占用 x%」时，用户会以为档位名没生效（真机截图：24% 档、实际 40k/8%）。
+ * 输出：` · 锚点(下限40k，锚点段仅3.4k)` / ` · 锚点(保留40k)`；非锚点路径返回空串。 */
+export function anchorActSuffix(retainSource, retainBudget, anchorTokens, anchorClamped) {
+  if (!retainSource || !String(retainSource).startsWith('anchor:')) return '';
+  const kb = (n) => {
+    const v = Number(n) / 1000;
+    return v < 10 ? `${(Math.round(v * 10) / 10).toFixed(1)}k` : `${Math.round(v)}k`;
+  };
+  const budget = Number.isFinite(Number(retainBudget)) ? kb(retainBudget) : '?';
+  if (anchorClamped === true && Number.isFinite(Number(anchorTokens))) {
+    return ` · 锚点(下限${budget}，锚点段仅${kb(anchorTokens)})`;
+  }
+  return ` · 锚点(保留${budget})`;
+}
+
+export function occupancyActSuffix(ratioAfter, stale, settledRatio) {
+  if (!Number.isFinite(ratioAfter)) return '';
+  /* R46（用户 2026-10-16 同意）：面板行后缀也带上「预计稳定后」——与回执同源同数（R45 的样本中位数）。
+   * 没有样本时保持原话「下次请求后会回落」（不编数字）。 */
+  const settled = Number.isFinite(settledRatio) ? Math.round(settledRatio * 100) : null;
+  return ` · 压后占用 ${(ratioAfter * 100).toFixed(1)}%${stale
+    ? (settled != null ? `（provider 待刷新，预计稳定后 ≈${settled}%）` : '（provider 待刷新，下次请求后会回落）')
+    : ''}`;
+}
+
+/** R39（2026-10-16 用户实测后决定「让档位名副其实」）：保留预算的**真实口径折算**。
+ * 起因：档位名（保留窗口 × 24%）按**启发式** token 算，而表盘真实值 ≈ 启发式 × 1.3–1.5
+ * （6 个会话实测 1.31/1.32/1.38/1.43/1.46/1.51）⇒「浅压24%」压完表盘落在 ~40%，名不副实；
+ * 而 DSH 原生 `/compact`（只留 3.9K 消息）能压到 5%。修：`budget / factor`。
+ * ⚠️ factor **夹在 [1,2]** ⇒ **只减不增**（绝不让档位保留得比它承诺的更多）；
+ * ⚠️ factor 只允许来自**非 stale** 的实测（stale 是"刚压完的过渡值"，用它会把预算压过头）。 */
+export function scaleRetainBudget(budget, factor) {
+  const b = Number(budget);
+  if (!Number.isFinite(b) || b <= 0) return budget;
+  const f = Number.isFinite(factor) ? Math.min(Math.max(factor, 1), 2) : 1;
+  return Math.max(1, Math.round(b / f));
+}
+
+export function createM3Compaction(deps) {
+  const {
+    /* 只读依赖 */
+    svc, tryOf, readProjection, state, M3, effEnabled, criticalCapOf, engineThreshold, resolveCompactionFor,
+    /* R25：占用口径单源（core.mjs 注入；m1 报告账本用同一份） */
+    projectedFromPressure,
+    /* R39：可见组成（系统+工具+消息）单源 —— 真实口径折算要用它 */
+    summarizeBreakdown,
+    /* 工具 */
+    log, msg, pick, nfmt, errCodeOf, schedule,
+    /* 跨域回调（R10：由宿主显式注入，不再靠闭包穿透） */
+    publishHud, recordHudAct, formatAct, clearBriefed,
+    /* 取用口（模块生命周期由宿主拥有） */
+    awaitRange, getCompactTool, extractEventText,
+    /* R50：会话事实账本工厂（宿主用 `?ts=` 动态 import 后注入；未注入 ⇒ 事实退化为安全默认） */
+    createFacts, pluginDir,
+    /* 常量 */
+    COMPACT_TIMEOUT_MS, SET_CAP,
+  } = deps;
+
+  /* R94c（2026-11-02）：`readProjection` 由宿主注入（core.readProjection）；
+   * 测试桩/旧宿主未注入时退回 `svc("sessionProjections").stateOf`——最坏等于旧行为，绝不因缺注入而退化口径。 */
+  const readProjOf = (session, key) => {
+    try {
+      if (typeof readProjection === 'function') return readProjection(session, key);
+      return svc?.('sessionProjections')?.stateOf?.(session, key);
+    } catch { return undefined; }
+  };
+
+  /* ═══ R75（审查 E1）：把「生效强制线」抽成**单一函数** ═══
+   * 原先这段逻辑内联在 preStepCompaction 里，而 m2 的教学另算一套（min(配置, 引擎阈值−余量)）
+   * ⇒ 两条线不同源：单步增量大时实际触发线更低，「约 N 轮触线」系统性偏晚（用户两次反馈过趋势不准）。
+   * 现在 m2 经宿主注入的 effectiveCriticalOf 复用同一份计算，教学与实际触发不可能再漂移。 */
+  const effectiveCriticalOf = (agent) => {
+    const cap = criticalCapOf(agent);
+    try {
+      const eth = typeof engineThreshold === 'function' ? engineThreshold(agent) : null;
+      if (!Number.isFinite(eth)) return Math.min(M3.criticalRatio, cap);
+      const sidAny = String(pick(agent?.session?.id, agent?.sessionId, agent?.id, 'unknown'));
+      const hist = state.m3.ratioHist?.[sidAny];
+      let maxStep = 0;
+      if (Array.isArray(hist)) {
+        for (let i = 1; i < hist.length; i += 1) {
+          const d = hist[i].ratio - hist[i - 1].ratio;
+          if (d > maxStep) maxStep = d;
+        }
+      }
+      const margin = Math.min(0.20, Math.max(0.05, maxStep));
+      return Math.min(M3.criticalRatio, cap, Math.max(0, eth - margin));
+    } catch { return Math.min(M3.criticalRatio, cap); }
+  };
+
+
+  /**
+   * B2（审查）：measure + pressure 读取**收敛为单一来源**——
+   * `renderUsageText`（每轮注入的用量行）/ `preStepCompaction` / `idleSweep` 三处共用。
+   * 返回 `measure` 本体（`nodes = {seq,tokens,heuristicTokens}[]`，官方承诺 deeply immutable
+   * ⇒ 持有引用安全）：自选范围需要它；报告侧仍走 `compactMeasure` 的白名单，不会因此膨胀。
+   */
+  const measureRatio = (session) => {
+    const tm = svc('tokenMeter');
+    const m = tryOf(() => tm?.measure?.(session));
+    if (m.error || !m.value) return { ok: false, error: m.error ?? 'no measure' };
+    const sp = svc('sessionProjections');
+    const pressure = tryOf(() => readProjOf(session, 'contextPressure'));
+    const pressureRec = pressure.error ? null : pressure.value ?? null;
+    const total = m.value.totalTokens ?? null;
+    const surface = m.value.surfaceTokens ?? null;
+    const window = pressureRec?.contextWindow ?? null;
+    /* ═══ R24（2026-10-15 用户实测「插件说 24%、DSH 显示 41%」）：占用口径**对齐 DSH 表盘** ═══
+     * DSH 源码 `ContextMeter.js`：`contextOccupancy(p)` 用 `p?.projectedTokens ?? p?.pressureTokens`
+     *   —— 依次为「**下一请求的 prompt 预计大小**」→「**最新一次 provider 实报的 prompt 大小**」。
+     * DSH 文档（tokenMeter）：`contextBreakdown`（系统/工具/对话三行）是**启发式组成**，
+     *   「`messageTokens` includes every other visible node, **including superseded prompts**」，
+     *   且三个数都用固定启发式，「**not route image pricing or file-handle projection**」。
+     * 我们此前用 `measure().totalTokens`（同一份启发式节点总和）⇒ 与用户看到的表盘**不是同一个口径**，
+     * 真机后果：我方按 75.1% 判定越线并压掉 243K，而 DSH 口径当时只有约 41%（**提前压缩 = 白压**）。
+     * 现 `used` = DSH 口径（触发判定 + 显示都用它）；`total`/`surface` 保留供取证。 */
+    /* ⚠️ R24.1/R25：**不要在这里重写公式** —— `projectedTokens` 只存在于 token-meter 的 wire.view，
+     * 投影 state 只有 `surfaceTokens / pressureTokens / sampledSurfaceTokens`，直接退回 `pressureTokens`
+     * 会拿到**过期的** provider 实报值（真机压缩后仍是 748,806/74.9%，而表盘已是 51%→40%）。
+     * 公式的唯一一份实现在 `core.mjs#projectedFromPressure`（由宿主同 ts 注入，m1 报告账本共用）。 */
+    if (typeof projectedFromPressure !== 'function') return { ok: false, error: 'projected-from-pressure-missing' };
+    const proj = projectedFromPressure(pressureRec);
+    const projected = proj.projected;
+    const reported = proj.reported;
+    const used = proj.used ?? total;   // 连 provider 数据都没有 ⇒ 退化为本地启发式（并标明退化）
+    const basis = proj.used != null ? proj.basis : '本地启发式(退化)';
+    /* ═══ R29（2026-10-15 真机：手动 `/compact` 后表盘 13.1%，而 surface 只剩 6.2K ≈ 2.4%）═══
+     * 投影公式 `provider实报 + (当前 surface − 上报时 surface)` **假设"非 surface 开销"不变**；
+     * 大压缩后 surface 骤降、而那份旧开销（本例 350,476 − 225,221 = 125,255）仍在分子里
+     * ⇒ 投影**系统性偏高**，要等 provider 实报新 prompt 才回落。此处只**标注**（`stale`），
+     * 供显示层加一句「provider 待刷新」；⚠️ 不参与判定（方向偏高 = 保守）。 */
+    /* R88：优先用 core 的单源判定（补了"reported 远高于投影"这条更稳的判据），保留本地 fórmula 兜底。 */
+    const stale = proj.stale === true
+      || (proj.reported != null && proj.sampled != null && proj.surface != null
+        && proj.sampled > 0 && proj.surface < proj.sampled * 0.5);
+    const ratio = window && used != null ? used / window : null;
+    return { ok: true, used, total, surface, window, ratio, basis, projected, reported, sampled: proj.sampled, stale, measure: m.value };
+  };
+
+  /* ═══ R16.18：比例历史（动态余量的输入） ═══
+   * 每次 pre-step 测量都记一条 ⇒ 用「单步最大增量」估计一步能涨多少（决定余量）。
+   * 有界化：每会话 ≤ RATIO_HIST_CAP 条、会话数 ≤ RATIO_SID_CAP（防长期累积，同 tierBySid 先例）。 */
+  const RATIO_HIST_CAP = 12;
+  const RATIO_SID_CAP = 64;
+  const recordRatioSample = (sid, ratio, mr) => {
+    try {
+      state.m3.ratioHist = state.m3.ratioHist ?? {};
+      const hist = state.m3.ratioHist[sid] ?? [];
+      hist.push({ at: Date.now(), ratio, used: mr?.used ?? null });
+      while (hist.length > RATIO_HIST_CAP) hist.shift();
+      state.m3.ratioHist[sid] = hist;
+      const keys = Object.keys(state.m3.ratioHist);
+      if (keys.length > RATIO_SID_CAP) {
+        const oldest = keys.reduce((a, b) => {
+          const ta = state.m3.ratioHist[a]?.[state.m3.ratioHist[a].length - 1]?.at ?? 0;
+          const tb = state.m3.ratioHist[b]?.[state.m3.ratioHist[b].length - 1]?.at ?? 0;
+          return ta <= tb ? a : b;
+        });
+        if (oldest !== sid) delete state.m3.ratioHist[oldest];
+      }
+    } catch { /* 吞 */ }
+  };
+
+  /* ═══ R16.13：我们自己的压缩「在飞标记」（区分事件流里的自己 vs 引擎）═══
+   * 起因（用户实测）：另一个会话中途被**引擎自动压缩**两次，插件面板里一条记录都没有。
+   * 取证：会话日志 `compaction/start {turn:29, src:engine}` 而 hud-acts 里该 sid 只有旧记录。
+   * 机制：插件的 pre-step 走 `compactRegion(start, end, agent, signal)`（引擎签名**无**
+   * sourceCommandId）⇒ 其事件与引擎自动压缩在事件流里**无法区分**；故用时间窗把
+   * 「我自己的压缩」圈出来，供 session/event 监听器跳过补记（只有引擎/手动压缩才补记）。
+   * TTL 兜底：某条路径异常未清（await 抛错等）时，窗口过期即失效，不会永久吞掉引擎事件。 */
+  const OWN_COMPACT_TTL_MS = 90000;
+  /* R53（自审发现 #3，2026-10-17）：**按 sid 分槽** —— 原先是**全局单槽** `state.m3.ownCompact`：
+   *   ① A 会话压缩期间，B 会话的引擎压缩被 `isCompactionInFlight()` 误判为「我自己的」⇒ **漏记**；
+   *   ② A 的 finally 清槽又会**提前解除** B 的窗口 ⇒ B 自己的压缩被**重复补记**（面板/报告双条）。
+   * 单槽还有个更隐蔽的后果：两条路径同时压缩时，先结束的那条会替另一条「解封」，两边的记录都失真。
+   * 现在按 sid 存（有界化 SET_CAP），`clearOwnCompaction(sid)` 只清自己那个槽；无 sid 时保持旧的「全清」语义。 */
+  const markOwnCompaction = (sid) => {
+    try {
+      const prev = state.m3.ownCompact;
+      /* 兼容热换后的旧单槽形状（旧的带 `until`、无 sid 键）⇒ 直接丢弃重建。 */
+      const m = (prev && typeof prev === 'object' && !Number.isFinite(prev.until)) ? prev : {};
+      const key = String(sid ?? '');
+      m[key] = { at: new Date().toISOString(), sessionId: key, until: Date.now() + OWN_COMPACT_TTL_MS };
+      const keys = Object.keys(m);
+      if (keys.length > SET_CAP) for (const k of keys.slice(0, keys.length - SET_CAP)) delete m[k];
+      state.m3.ownCompact = m;
+    } catch { /* 吞 */ }
+  };
+  const clearOwnCompaction = (sid) => {
+    try {
+      const m = state.m3.ownCompact;
+      if (!m || typeof m !== 'object' || Number.isFinite(m.until)) { state.m3.ownCompact = null; return; }
+      const key = String(sid ?? '');
+      if (!key) { state.m3.ownCompact = null; return; }   // 无 sid ⇒ 全清（旧语义，兼容未改的调用点）
+      delete m[key];
+      if (!Object.keys(m).length) state.m3.ownCompact = {};
+    } catch { /* 吞 */ }
+  };
+  /** 是否有「我们自己的压缩」正在进行（事件监听器据此跳过补记）。
+   * 传 sid ⇒ **只看该会话**（发现 #3 的修法）；不传 ⇒ 任一在飞（保持旧调用点的语义）。 */
+  const isCompactionInFlight = (sid) => {
+    try {
+      const o = state.m3.ownCompact;
+      if (!o || typeof o !== 'object' || Number.isFinite(o.until)) return false;
+      const now = Date.now();
+      const want = sid == null || sid === '' ? null : String(sid);
+      const keys = want ? [want] : Object.keys(o);
+      return keys.some((k) => Number(o[k]?.until) > now);
+    } catch { return false; }
+  };
+
+  /* ═══ R28（2026-10-15 真机：同一会话连试 3 次 `/compact` 全失败）═══
+   * 缺口：记录只知道「失败」，**不知道失败原因**；而原因只存在于内存态 `lastEngineCompact.error`
+   * ⇒ 面板那行（用户可见、且落盘 `hud-acts.json`）写着「失败」，事后无法回答"为什么压不动"。
+   * 修：把 DSH 的失败码翻成中文短语写进**面板行**与记录。
+   * `compaction/end.error?: string`（DSH 事件 schema 原文）；已知码来自 dsh-compaction 的
+   * `ManualCompactionErrorCode`（闭集）：summary / changed / busy / cancelled / commit / persistence。
+   * ⚠️ 认不出码 ⇒ **截断原文照抄**，绝不编造原因。 */
+  const COMPACT_FAIL_LABELS = {
+    summary: '摘要无法生成', changed: '选中历史已变化', busy: '有压缩在跑或会话非空闲',
+    cancelled: '已取消', commit: '提交未干净完成', persistence: '会话保存失败',
+  };
+  const failWhy = (raw) => {
+    const s = String(raw ?? '').trim();
+    if (!s) return '原因未提供';
+    const low = s.toLowerCase();
+    const hit = Object.keys(COMPACT_FAIL_LABELS).find((k) => low.includes(k));
+    if (hit) return COMPACT_FAIL_LABELS[hit];
+    return s.length > 48 ? `${s.slice(0, 48)}…` : s;
+  };
+
+  /* ═══ R16.13：补记「非插件发起」的压缩（引擎自动 / `/compact` 命令）═══
+   * 起因（用户实测）：另一会话中途被引擎自动压缩两次，插件面板/报告里一条记录都没有。
+   * 取证：会话日志有 `compaction/start {turn:29, src:engine}`，而 hud-acts 里该 sid 只有旧记录。
+   * 机制：插件只在**自己**的 pre-step / idle 路径写记录；引擎自动压缩（context-overflow 恢复 /
+   * 引擎阈值）与命令压缩全程绕过插件 ⇒ 无记录。现由 session/event 的 `compaction/end` 补记。
+   * 去重：① sourceCommandId=context-pilot（插件 idle 路径自带标记）跳过；
+   *       ② isCompactionInFlight()（插件 pre-step 的 compactRegion 无标记，用时间窗圈定）跳过。
+   * 只在 **end** 记（start 未完成就报成功会误导）；失败也记（否则「压了但失败」同样无痕）。 */
+  const noteEngineCompaction = (event, session) => {
+    try {
+      const d = event?.data ?? {};
+      const src = d.sourceCommandId;
+      if (src === 'context-pilot') return null; // 插件 idle 路径（已在 idle 里记过）
+      /* R53（自审发现 #3）：sid 必须**先算**——在飞判定要按会话看，不能全局一刀切。 */
+      const sidE = String(pick(session?.id, session?.header?.id, ''));
+      if (!sidE) return null;
+      if (isCompactionInFlight(sidE)) return null;  // 插件 pre-step 路径（该会话的在飞窗口内）
+      const kind = typeof src === 'string' && src.startsWith('cmd') ? 'manual' : 'engine';
+      const mr = measureRatio(session);
+      const ratioAfter = mr?.ok && Number.isFinite(mr.ratio) ? mr.ratio : null;
+      /* R16.14（评审建议 7）：把「系统代你决策」显性化——若本会话**从未申报档位**，
+       * 这次强制压缩用的是兜底 standard，而模型很可能以为「我没选=系统会按需要选」。
+       * 标出来才有动机在低占用时提前用 `action:'set-tier'` 声明档位。 */
+      const declared = (() => { try { return getCompactTool()?.hasTier?.(sidE) === true; } catch { return false; } })();
+      /* R16.18：把「引擎为什么抢先」写进记录——真机问题是「上一轮 67% 说不压，新一轮却自动压了」，
+       * 根因是引擎在 **step 边界** 按自己的阈值判定、且排在插件 pre-step 之前。
+       * 附上**我方上一次估计**与**我方当时的线**，一眼可判「是不是被抢先」。 */
+      const lastSeen = (() => {
+        try {
+          const hist = state.m3.ratioHist?.[sidE];
+          const v = Array.isArray(hist) && hist.length ? hist[hist.length - 1].ratio : null;
+          return Number.isFinite(v) ? v : null;
+        } catch { return null; }
+      })();
+      const ourLine = (() => { try { const c = criticalCapOf({ session: { id: sidE } }); return Number.isFinite(c) ? c : null; } catch { return null; } })();
+      /* R29（2026-10-15 真机误报）：`preempted` 只对**引擎自动**压缩成立——手动 `/compact` 是用户
+       * 主动压的，标「引擎抢先」纯属误报（19:54 那条：手动压缩却被写成"引擎抢先…排在插件之前"）。 */
+      const preempted = kind === 'engine' && Number.isFinite(lastSeen) && Number.isFinite(ourLine) && lastSeen < ourLine;
+      const base = formatAct(kind === 'manual' ? 'engine-manual' : 'engine-auto', null);
+      /* R19：展示统一中文档位说法（这条 text 会进弹窗 tooltip ⇒ 属用户可见面）。
+       * R22：兜底也**不许回英文 id**（旧写法 `?? 'standard'` 在工具域未加载时会把 id 写进 tooltip）
+       * ⇒ 退成中性的中文说法，宁可少给数值也不给英文。 */
+      const stdText = (() => { try { return getCompactTool()?.tierText?.('standard') ?? '默认档'; } catch { return '默认档'; } })();
+      /* R37/R38（2026-10-16 真机）：压缩刚完成时表盘是**过渡值**——`providerReported` 还是压缩前的旧实报，
+       * 只按 surface 增量修正（真机：387,168 + 8,194 − 269,183 = 126,179 = 12.6%，而真实值 5%）。
+       * 面板那行必须带 `stale` 提示（后缀由 occupancyActSuffix 单源提供，三条路径共用）。 */
+      const text = base
+        + (declared ? '' : ` · 系统代压（本会话未申报档位 ⇒ 按兜底 ${stdText}）`)
+        + (preempted ? ` · 引擎抢先：我方上次估计 ${(Number(lastSeen) * 100).toFixed(1)}% ＜ 我方线 ${(Number(ourLine) * 100).toFixed(0)}%（引擎在 step 边界判定，排在插件之前）` : '')
+        + (d.error ? ` · 失败（${failWhy(d.error)}）` : occupancyActSuffix(ratioAfter, mr?.stale, settledRatioOf(sidE, mr)));
+      recordHudAct(sidE, text);
+      publishHud({ hudLastAct: text });
+      state.m3.engineCompacts = (state.m3.engineCompacts ?? 0) + 1;
+      /* R28：失败/成功都**立刻落一次报告快照**——原来这里没有 schedule ⇒ 引擎压缩（尤其失败）
+       * 可能长时间不进报告（真机：hud-acts 有 3 条失败，报告里一条都没有）。 */
+      schedule('engine-compact', 300);
+      state.m3.lastEngineCompact = {
+        at: new Date().toISOString(), sessionId: sidE, kind,
+        sourceCommandId: src ?? null, ok: !d.error,
+        error: d.error ? String(d.error).slice(0, 200) : null,
+        reason: d.error ? failWhy(d.error) : null,   // R28：中文短语（与面板行同源）
+        ratioAfter, tierDeclared: declared, preempted: !!preempted,
+        ourLastRatio: Number.isFinite(lastSeen) ? +(Number(lastSeen) * 100).toFixed(1) : null,
+        ourLine: Number.isFinite(ourLine) ? +(Number(ourLine) * 100).toFixed(0) : null,
+        recorded: text,
+      };
+      log('info', `M3.13 补记非插件压缩（${kind}${d.error ? '，失败' : ''}）：${text}`);
+      return text;
+    } catch (e) {
+      log('warn', `M3.13 补记异常（吞）：${msg(e)}`);
+      return null;
+    }
+  };
+
+  /* ═══ R16.1：压缩自检回执按 sid 存 ═══
+   * 多会话并发压缩时，全局单槽 `lastCompactVerify` 会被后完成的会话覆盖 ⇒ 另一个会话的
+   * Agent 看不到自己的回执（压缩本身不受影响，但「工具完成后自检」在那条会话失效）。
+   * `verifyBySid`：每会话一份（有界化：SET_CAP，超出淘汰最旧）；
+   * `lastCompactVerify`：保留为「最近一次」的全局镜像（HUD/报告口径不变，兼容旧取证习惯）。 */
+  const setCompactVerify = (sid, v) => {
+    try {
+      const key = String(sid ?? 'unknown');
+      state.m3.verifyBySid = state.m3.verifyBySid ?? {};
+      state.m3.verifyBySid[key] = v;
+      const keys = Object.keys(state.m3.verifyBySid);
+      if (keys.length > SET_CAP) {
+        const oldest = keys.reduce((a, b) => ((state.m3.verifyBySid[a]?.at ?? '') <= (state.m3.verifyBySid[b]?.at ?? '') ? a : b));
+        if (oldest !== key) delete state.m3.verifyBySid[oldest];
+      }
+      state.m3.lastCompactVerify = v;
+    } catch { /* 吞（留痕失败不影响压缩本身） */ }
+  };
+  /** M2 域消费回执：取**本会话**的未读回执，读到即置 read（一次性）。 */
+  const takeCompactVerify = (sid) => {
+    try {
+      const key = String(sid ?? 'unknown');
+      const v = state.m3.verifyBySid?.[key];
+      if (!v || v.read) return null;
+      v.read = true;
+      return v;
+    } catch { return null; }
+  };
+
+  /* ═══════════ R50：会话事实账本**解耦**（折算因子 / 稳定回落样本（含落盘）/ 压缩锁 / 当前模型路由）═══════════
+   * 实现已搬进 `plugin/session-facts.mjs`（叶子模块，宿主用 `?ts=` 动态 import 后**注入工厂**）。
+   * 这里只留**薄委托**（一行一个，无逻辑重复）：
+   *   · 有 `createFacts` ⇒ 全部事实由账本提供（生产路径）；
+   *   · 没有（老测试桩/宿主加载失败）⇒ 退化为**安全默认**：factor=1 / 无样本 / 无锁 ⇒ 行为回到 R45 之前，
+   *     绝不因为缺依赖而抛错或压过头（"最坏情况 = 旧行为"的底线）。
+   * 事实状态仍落在 `state.m3.*` ⇒ threshold（读 route）与 m2（读样本）**零改动**。 */
+  const facts = (() => {
+    try { return typeof createFacts === 'function' ? createFacts({ state, log, pick, svc, summarizeBreakdown, tryOf, readProjection, pluginDir }) : null; } catch { return null; }
+  })();
+  const noteRetainFactor = (sid, mr, session) => (facts ? facts.noteRetainFactor(sid, mr, session) : null);
+  const retainFactorOf = (sid) => (facts ? facts.retainFactorOf(sid) : 1);
+  const armSettleWatch = (sid, used, ratio) => (facts ? facts.armSettleWatch(sid, used, ratio) : null);
+  const noteCompactSettle = (sid, mr) => (facts ? facts.noteCompactSettle(sid, mr) : null);
+  const settleDropOf = (sid) => (facts ? facts.settleDropOf(sid) : null);
+  const settleDropAny = (sid) => (facts ? facts.settleDropAny(sid) : null);
+  const noteSessionEvent = (session, event) => (facts ? facts.noteSessionEvent(session, event) : null);
+  const compactionLockActive = (sid) => (facts ? facts.compactionLockActive(sid) : false);
+  const currentRouteOf = (sid) => (facts ? facts.currentRouteOf(sid) : null);
+  /* R49：让路留痕（取证用；也便于测试断言"真的没发起"）。 */
+  const noteLockSkip = (sid, ratio, wanted) => {
+    try {
+      state.m3.lockSkips = (state.m3.lockSkips ?? 0) + 1;
+      state.m3.lastLockSkip = {
+        at: new Date().toISOString(), sessionId: sid,
+        ratio: Number.isFinite(ratio) ? +(ratio * 100).toFixed(1) : null, wanted: !!wanted,
+      };
+    } catch { /* ignore */ }
+  };
+  /* R50 简化：pre-step 与 idle 的「让路」是同一件事（判锁 + 留痕 + 日志 + 返回 true）⇒ 收敛为一个判据，
+   * 避免两处各写一遍（R49 首版就是两段近乎相同的代码：改一处漏一处、日志措辞还会漂移）。
+   * ⚠️ **必须在消费意图之前调用**（让路时意图要保留，见 pre-step 调用点注释）。 */
+  const lockSkip = (sid, ratio, wanted, where) => {
+    if (!compactionLockActive(sid)) return false;
+    noteLockSkip(sid, ratio, wanted);
+    log('info', `${where}：官方压缩事务进行中（未匹配 compaction/start）⇒ 本轮让路`
+      + `（占用 ${(ratio * 100).toFixed(1)}%，意图保留=${wanted}）`);
+    return true;
+  };
+  /* R46：由「当前实测 + 回落样本」推出稳定后比例（面板行后缀用；无样本 ⇒ null，不编数字）。
+   * R50：本会话无样本时用**跨会话中位数**（`scope:'global'`）——持久化的意义就在这里：升级后第一次
+   * 压缩、或刚换会话时，也能给一个**有依据**的预计，而不是"暂无实测值"。 */
+  const settledRatioOf = (sid, mr) => {
+    try {
+      const rec = settleDropAny(sid);
+      if (!rec || !Number.isFinite(mr?.used) || !Number.isFinite(mr?.window) || mr.window <= 0) return null;
+      return Math.max(0, mr.used - rec.drop) / mr.window;
+    } catch { return null; }
+  };
+
+  /**
+   * 执行一次压缩：**优先自选保留范围**（近端原样保留、更早转摘要），失败则按语义退回官方策略。
+   * R16：保留预算按**会话档位**（Agent 经工具选择的 tier，会话级持久）解析；未选/非法 ⇒ standard。
+   * @returns {Promise<{result:any, source:'own'|'official'|'none', skipWhy?:string|null,
+   *   officialWhy?:string|null, retainBudget:number|null, walkBacks:number, tier?:string,
+   *   range?:{start:number,end:number}}>}
+   */
+  const compactWithOwnRange = async (agent, compaction, ctx) => {
+    const { forced, sig, sid, window, measure, tierName, retainOverride, anchorSeq, anchorFailReason } = ctx;
+    /* ═══ R52（独立审计 A/B 路发现，2026-10-17）：`official()` 闭包**引用了在它之后才声明的 const** ═══
+     * 真机形态：`awaitRange()` 返回 null（`compact-range.mjs` 加载失败 ⇒ 宿主 rangeReady 的 catch 返回 null）
+     * ⇒ 第 365 行**立刻**调用 `official('no-range-module')`，而 `retainSource`/`useAnchor`/`tierInfo`
+     * 三次声明**都还没执行** ⇒ 对象字面量求值时抛
+     *   `ReferenceError: Cannot access 'retainSource' before initialization`（TDZ）。
+     * 后果比"报错"更坏：`compactIfNeeded` 在 await 里**已经真的压了**，随后才抛 ⇒ 调用方 catch 写一条
+     * `not-executed` 回执 ⇒ **模型看到"未执行"、实际已执行**（假阴性），且 preStepOk / HUD 记录双双丢失
+     * —— 正是本项目最怕的「静默降级」。审计方才用独立脚本复现了同款 TDZ 才报过来。
+     * 修法：把**不依赖 api** 的两项提到 `official` 之前；`tierInfo` 先给安全默认、拿到 api 后覆盖。
+     * ⚠️ 正常路径（api 就绪）行为**逐字不变**：这些值本来就是在 368/377/386 行算出来的同一个值。 */
+    const anchorBudget = Number(retainOverride?.budget);
+    const useAnchor = Number.isFinite(anchorBudget) && anchorBudget > 0;
+    const retainSource = useAnchor ? String(retainOverride?.source ?? 'anchor') : 'tier';
+    let tierInfo = { tier: 'standard' };   // api 未就绪时的安全默认（官方兜底回执只读 .tier）
+    const official = async (why) => {
+      markOwnCompaction(sid);
+      try {
+        return {
+          result: await compaction.service.compactIfNeeded(agent, 'context-overflow', sig),
+          source: 'official',
+          officialWhy: why ?? null,
+          retainBudget: null,
+          /* R21.2（真机发现）：官方兜底路径**也必须带上保留来源与锚点失败原因**——
+           * 否则回执里「锚点未命中⇒已按档位兜底」这句话会丢（静默降级 = 本项目大忌）。 */
+          retainSource,
+          anchorFailReason: useAnchor ? null : (anchorFailReason ?? null),
+          tier: tierInfo.tier,
+          walkBacks: 0,
+        };
+      } finally { clearOwnCompaction(sid); }
+    };
+    /** R72（真 GLM-5.3 审查 H2）：F-14 只堵了 `no-range-module`，但 `official()` 是**同一条
+     * retainTokens=0 通道**（R5 实测：53% 占用把 surface 367,794→8,603、nodeCount 1117→4），
+     * 其余 why 同样危险：`surface-mismatch`/`no-nodes`（measurement 与 surface 竞争窗口）、
+     * `boundary-exhausted`、`invalid-boundary`。三者都可能发生在「低占用 + 模型主动请求」，
+     * 那种场景本来完全可以不压。故统一收口：未越强制线 ⇒ 收手（skipWhy=该 why），越线 ⇒ 官方兜底。
+     * `nothing-to-compact + forced` 仍会走官方（越线必压是设计承诺），因为此时 forced=true。 */
+    const guardOfficial = async (why) => {
+      if (forced) return official(why);
+      state.m3.rangePendingSkips = (state.m3.rangePendingSkips ?? 0) + 1;
+      state.m3.lastRangeSkip = { at: new Date().toISOString(), sid, why };
+      return {
+        result: null, source: 'none', skipWhy: why, officialWhy: why,
+        retainBudget: null, retainSource,
+        anchorFailReason: useAnchor ? null : (anchorFailReason ?? null),
+        tier: tierInfo.tier, walkBacks: 0,
+      };
+    };
+    const api = await awaitRange();
+    if (!api) {
+      /* R71（F-14 二道防线）：直接调用 compactWithOwnRange 的入口（测试 / idle）同样不能在低占用下
+       * 用官方 overflow 通道清场（R5 实测该 trigger retainTokens=0，1117 节点→4）。理由同上。 */
+      if (!forced) {
+        state.m3.rangePendingSkips = (state.m3.rangePendingSkips ?? 0) + 1;
+        return {
+          result: null, source: 'none', skipWhy: 'range-module-pending', officialWhy: 'no-range-module',
+          retainBudget: null, retainSource,
+          anchorFailReason: useAnchor ? null : (anchorFailReason ?? null),
+          tier: tierInfo.tier, walkBacks: 0,
+        };
+      }
+      return official('no-range-module');
+    }
+    /* R16：档位 → 保留预算。resolveTier 内含夹取（下限 40k、上限窗口 50%）与未知档位回落；
+     * 调用方负责从会话档位偏好里解析 tierName（强制线/idle/工具触发三路同源）。 */
+    /* R52：`tierInfo` 已提到 `official` 之前（先给安全默认）⇒ 这里是**覆盖**而不是声明。 */
+    tierInfo = typeof api.resolveTier === 'function'
+      ? api.resolveTier(tierName ?? 'standard', window)
+      : { tier: 'standard', ratio: api.RETAIN_RATIO, budget: api.retainBudgetTokens(window, api.RETAIN_RATIO), clamped: false, fallback: false };
+    const ratioKept = tierInfo.ratio;
+    const tierBudget = tierInfo.budget > 0 ? tierInfo.budget : api.retainBudgetTokens(window, ratioKept);
+    /* R21：语义锚点优先（`retainOverride` 由调用方在**压缩这一刻**解析好）——
+     * 解析成功 ⇒ 预算 = 锚点→末尾 token + 余量；解析失败/未登记 ⇒ 原样用档位预算（就是兜底三档）。
+     * 无论走哪条都要留痕：`retainSource` 会进 rangeProbe 与回执（静默降级是本项目大忌）。
+     * R52：`anchorBudget` / `useAnchor` 已提到 `official` 之前（那里就要用，见上方 TDZ 注释）。 */
+    /* R39/R42：**只有档位预算**按真实口径折算（因子来自非 stale 实测；只减不增，夹在 [1,2]）。
+     * ⚠️ **锚点预算绝不折算**（用户 2026-10-16 明确要求"准确保留之前的逻辑"）：锚点是**位置承诺**
+     * （"从这条消息起之后一律原样保留"），折算会越过锚点 ⇒ 违背 R21 护栏「宁可多留，绝不丢新需求」。
+     * `tierBudget` 保持"档位承诺"（回执/报告报它，真实口径）；交给范围选择的是折算后的启发式预算。 */
+    noteRetainFactor(sid, measureRatio(agent.session), agent.session);
+    const retainFactor = retainFactorOf(sid);
+    const tierBudgetHeur = scaleRetainBudget(tierBudget, retainFactor);
+    const budget = useAnchor ? anchorBudget : tierBudgetHeur;   // ← 锚点原样（不折算）
+    /* R52：`retainSource` 已提到 `official` 之前（兜底回执也要带它，见上方 TDZ 注释）。 */
+    const sel = api.selectRange({ session: agent.session, measurement: measure, retainTokens: budget, keepFromSeq: useAnchor ? anchorSeq : null });
+    /* 取证：无论成败都留一次范围读数（范围不对时这是唯一的现场）。
+     * ⚠️ **必须同时记 surface 位置（startIdx/endIdx）**：seq 是全局事件序号，**在 surface 上并不单调**——
+     * 每次压缩都会在**表头**插入一条 `source.kind='compact-checkpoint'` 的 user/message，其 seq
+     * 比所保留的旧尾部**更大**。于是真机会出现 `rangeProbe = {start: 20897, end: 19958}` 这种
+     * 「起点 seq > 终点 seq」的记录：位置是 `1 → 640`（合法且有序），只是 seq 看起来倒序。
+     * 引擎同样按**位置**校验（错误文案：`start seq N (position P) is after end seq M (position Q)`）。
+     * 2026-10-08 实测：没有位置字段时，这条记录让我白查了一轮。 */
+    state.m3.rangeProbe = {
+      at: new Date().toISOString(),
+      sessionId: sid,
+      window,
+      tier: tierInfo.tier,
+      tierClamped: tierInfo.clamped || null,
+      tierFallback: tierInfo.fallback || null,
+      retainRatio: ratioKept,
+      budget,
+      /* R21：保留来源与锚点现场（`tier` = 按三档兜底；`anchor:*` = 语义锚点生效）。 */
+      retainSource,
+      anchorSeq: useAnchor ? anchorSeq ?? null : null,
+      anchorIdx: sel.anchorIdx ?? null,
+      anchorFailReason: !useAnchor && anchorFailReason ? String(anchorFailReason) : null,
+      ok: sel.ok === true,
+      why: sel.why ?? null,
+      surfaceNodes: sel.surfaceNodes ?? null,
+      firstIdx: sel.firstIdx ?? null,
+      start: sel.start ?? null,
+      end: sel.end ?? null,
+      startIdx: sel.startIdx ?? null,
+      endIdx: sel.endIdx ?? null,
+      retainedTokens: sel.retainedTokens ?? null,
+      shadowTokens: sel.shadowTokens ?? null,
+    };
+    if (!sel.ok) {
+      /* 「没什么可压」而占用又没越强制线 ⇒ **就此收手**（见文件头语义要点）。 */
+      if (sel.why === 'nothing-to-compact' && !forced) {
+        /* R21.2（真机发现）：「无需压缩」这条提前 return 曾漏掉 retainSource / anchorFailReason ⇒
+         * ① verify 里的 retainSource 靠 `?? 'tier'` 猜出来（值碰巧对，但**语义是猜的**）；
+         * ② 锚点失败原因变 null ⇒ 回执无法显示「锚点未命中（text:not-found）⇒ 已按档位兜底」。
+         * 真机实测：只给 text 锚点（未命中）时，回执只剩「已执行但判定无需压缩」，**降级痕迹丢失**。 */
+        return {
+          result: null, source: 'none', skipWhy: sel.why, retainBudget: budget, walkBacks: 0,
+          retainSource,
+          anchorFailReason: useAnchor ? null : (anchorFailReason ?? null),
+          tier: tierInfo.tier,
+        };
+      }
+      return guardOfficial(sel.why);
+    }
+    let end = sel.end;
+    let endIdx = sel.endIdx;
+    let walkBacks = 0;
+    for (;;) {
+      try {
+        /* R16.13：本条 `compactRegion` **不带 sourceCommandId**（引擎签名无此参数）
+         * ⇒ 它产生的 compaction/start|end 事件与「引擎自动压缩」在事件流里**无法区分**。
+         * 故用「在飞标记」把窗口圈出来：事件监听器据此判定「这是我自己的压缩」并跳过补记。
+         * ═══ R48（DSH 0.2.1 兼容，逐包 diff 复核）：**必须继续走官方压缩服务，不要自己替换区间** ═══
+         * 0.2.1 的 `dsh-token-meter` 把 `contextBreakdown` 改成「claim 影子价」状态机：`compaction/summary`
+         * 或 `compaction/prune` 会先"武装"一个 claim（含 `shadowedRange`/`shadowedTokenCount`/被阴影的
+         * system seq），随后任何**计量替换**若区间不匹配或缺相邻 claim，投影会**抛错**：
+         *   `context breakdown: replace at seq … has no adjacent shadow price (armed claim covers …)`
+         * 官方 `compactRegion`/`compactIfNeeded` 会自己发出配对的 `compaction/summary` ⇒ 天然满足该不变量；
+         * **绕过官方服务直接改 surface 就会踩这个抛错**（0.2.0-rc.2 无此检查，所以这是升级后才出现的新约束）。 */
+        markOwnCompaction(sid);
+        let result;
+        try {
+          result = await compaction.service.compactRegion(sel.start, end, agent, sig);
+        } finally { clearOwnCompaction(sid); }
+        /* R39/R40：报**实际生效的那个预算**——
+         * · 档位路径：报档位承诺（**真实口径**，实际交给范围选择的是折算后的 `retainBudgetHeur`）；
+         * · **锚点路径：报锚点预算（启发式口径）且不折算**——锚点是**位置承诺**（"之后一律原样保留"），
+         *   按真实口径去缩它就会越过锚点 ⇒ 违背 R21 护栏「宁可多留，绝不丢新需求」。
+         *   （R39 第一版把这里无条件写成 `tierBudget` ⇒ 锚点生效时回执误报"档位预算 240k"，已修。）
+         * R44（真机发现）：锚点预算可能被 **MIN 下限夹取**（`clamped`）——真机 `recentUser:1` 时
+         * 锚点段只有 1431 启发式，被 `MIN_RETAIN_TOKENS=40k` 抬到 40000 ⇒ 回执若只说"锚点之后原样
+         * 保留 ~40k"会让人以为那段有 40k。把 `anchorTokens`/`anchorClamped` 一并回报，回执才能说清。 */
+        return { result, source: 'own', retainBudget: useAnchor ? anchorBudget : tierBudget, retainBudgetHeur: useAnchor ? anchorBudget : tierBudgetHeur, retainFactor, retainSource, anchorSeq: useAnchor ? anchorSeq ?? null : null, anchorTokens: useAnchor ? (Number(retainOverride?.anchorTokens) || null) : null, anchorClamped: useAnchor ? !!retainOverride?.anchorClamped : null, anchorFailReason: useAnchor ? null : (anchorFailReason ?? null), walkBacks, tier: tierInfo.tier, range: { start: sel.start, end } };
+      } catch (e) {
+        /* 末端不合法 ⇒ 回退一个 surface 节点重试（零副作用、零 LLM 成本，见文件头）。 */
+        if (api.isEndBoundaryError(e)) {
+          const prev = api.prevEnd(agent.session?.surface?.nodes, sel.firstIdx, endIdx);
+          if (!prev || walkBacks + 1 > api.MAX_WALK_BACK) return guardOfficial('boundary-exhausted');
+          walkBacks += 1;
+          end = prev.end;
+          endIdx = prev.endIdx;
+          continue;
+        }
+        /* 起点不合法 / 找不到 seq / 无 open turn 等：重试无意义 ⇒ 官方兜底。 */
+        if (api.isValidationError(e)) return guardOfficial('invalid-boundary');
+        throw e;
+      }
+    }
+  };
+
+  /**
+   * pre-step 轮内先压（M3.5 通道 1）。**绝不上抛**（失败只留痕，本轮照常继续）。
+   * 触发来源两类：① 模型调用 `compact_context` 登记的意图（`wanted`）；② 占用越过生效强制线（`forced`）。
+   */
+  const preStepCompaction = async (payload) => {
+    /* R71（Flash F-11）：wanted 原先声明在 try **内部**，catch 拿不到 ⇒ 失败回执硬写
+     * trigger:pressure，而模型主动请求压缩时真实触发是 context-overflow（与 D8/F13「回执必须
+     * 用真实触发原因」同一原则）。现提到函数体开头，catch 里按 wanted 报真值。 */
+    let wanted = false;
+
+    /* ═══ R49.1（既有隐患，测试暴露）：`sid` 必须在 `try` **之外**声明 ═══
+     * 原实现在 try 内 `const sid`，而 catch 里要用它写「未执行」回执 ⇒ catch 自身 ReferenceError：
+     * `lastPreStepError`（2026-10-08 专为"全线失败时报告里看不到原因"加的）与「吞掉、本轮照常继续」
+     * 全丢，异常还冒泡给 DSH。真机从未触发（`preStepErrors` 为空）⇒ 一直潜伏。
+     * ⚠️ 也不能在 catch 里**重算** sid：payload 的 `session` 可能就是抛错源（取一次抛一次）⇒ 会二次抛错。 */
+    let sid = 'unknown';
+    try {
+      if (!effEnabled()) return; // 总开关活读（演习模式已随 2026-10-07 面板精简退役：压缩路径无影子模式）
+      const { agent, signal } = payload ?? {};
+      if (!agent?.session) return;
+      /* A5（审查）：signal 缺失守卫——compactIfNeeded 契约首行 throwIfAborted(signal)，undefined 放行=首跑即败
+       * （M5.5 通道 A 已实证同款）。payload 未带 signal 时兜底 180s 超时信号（与 idle compactNow 同参）。 */
+      const sig = signal && typeof signal === 'object' ? signal : AbortSignal.timeout(COMPACT_TIMEOUT_MS);
+      if (sig.aborted) return;
+      sid = String(pick(agent.session.id, agent.sessionId, agent.id, 'unknown'));
+      const mr = measureRatio(agent.session); // B2：读取收敛
+      if (!mr.ok || mr.ratio == null) return;
+      const ratio = mr.ratio;
+      /* ═══ R16.18：**动态余量**——修「引擎在 step 边界抢先压缩」 ═══
+       * 真机取证（session-70a55b1a turn 47）：用户在 67% 时按卡决定不压，但新一轮里
+       * 05:15:14 `step/end s14` 之后 48ms，**引擎**就触发了压缩（`compaction/start turn=47 src=engine`），
+       * 而我们的 pre-step 要到 `step/start s15`（05:15:39）才轮到 ⇒ 我们那一步看到的仍是 <75%。
+       * 机制（引擎源码 `resolveCompactSpec`）：引擎在**每个 step 边界**按 `min(窗口×80%, 预算)` 判定，
+       * 且在同一 seam 里**排在我们的 pre-step 之前** ⇒ 只要**单个 step 的增量**把占用从「低于我方线」
+       * 推到 ≥80%，我们必然输掉这场比赛（实测该会话单步可加 6pp+）。
+       * 修法：用**实测的单步最大增量**把我们的线提前：margin = clamp(5pp, 20pp, 单步最大增量)。
+       * 这样我们总在「引擎可能到线的那一步之前」触发，档位/范围由我们说了算（而非引擎兜底 standard）。 */
+      recordRatioSample(sid, ratio, mr);
+      /* R39：**每轮都刷新折算因子**（非 stale 才更新）——否则本会话首次压缩仍用 factor=1，
+       * 「档位名副其实」要等到第二次压缩才生效。 */
+      noteRetainFactor(sid, mr, agent.session);
+      /* R45：每次非 stale 实测都尝试结算上一次压缩的「稳定回落量」。 */
+      noteCompactSettle(sid, mr);
+      /* ═══ R4（2026-10-08）：模型主动登记「下一步压缩」意图 ⇒ 轮内执行，本轮无缝继续 ═══
+       * 这是替代「marker + 伪造恢复消息」的核心：工具调用必然产生下一步 ⇒ 下一步的 pre-step
+       * 就在这里执行压缩 ⇒ 之后的步骤都在压缩后的上下文上继续，**不需要任何消息**。
+       * ⚠️ F5（R7 审查修）：意图**只能在「确实能执行」时才消费**。原实现在 `resolveCompactionFor`
+       *    之前就 takeIntent，服务解析不到就直接 return ⇒ 意图已丢、工具却早已回 `scheduled:'next-step'`
+       *    ⇒ **模型以为压过了、实际没压，而且不会重试**（最典型的静默降级）。
+       *    现在：服务不可用 ⇒ 意图保留（下一步会再试；TTL 到期由模块清扫）。 */
+      const tool = getCompactTool();
+      const intent = tool ? tool.peekIntent(sid) : null;
+      wanted = !!intent;
+      /* 诊断：本 sid 无意图、但表里还有**别的 sid** 的未过期意图 ⇒ 很可能是 session id 轮转导致
+       * 意图登记在旧键上（工具已回 scheduled，压缩却不会发生）。只留痕，**不跨会话执行**——
+       * 在别的 agent 上执行压缩比不压更糟。 */
+      if (!intent && tool?.pending) {
+        const others = tool.pending();
+        if (others.length) state.m3.compactIntentMiss = { at: new Date().toISOString(), sessionId: sid, pending: others };
+      }
+      /* C-own：生效强制线 = min(用户配置, 引擎阈值 − 5pp)——插件线必须**确定性地先行**，
+       * 引擎只是插件关闭/卸载后的安全网。 */
+      /* R16.18：**动态余量**——把我们的线提前到「引擎可能到线的那一步之前」。
+       * 引擎在 step 边界按 engineThreshold(=窗口×80%) 判定且排在我们的 pre-step 之前，
+       * 单步增量一大我们就输（真机：s14→s15 之间引擎抢先压）。margin = clamp(5pp, 20pp, 单步最大增量)。 */
+      const effCritical = effectiveCriticalOf(agent); // R75（E1）：与 m2 教学同源
+      if (!wanted && ratio < effCritical) return;
+      /* R49：官方压缩事务进行中（未匹配的 `compaction/start`）⇒ **本轮让路**——官方 `/compact` 或引擎
+       * 正在压，此刻发起必然撞 `busy`（官方 assertCompactionInactive）。⚠️ 放在**消费意图之前**：
+       * 让路时意图必须保留（F5 同款纪律：工具已回 scheduled，实际没执行 ⇒ 下一步要能重试）。 */
+      if (lockSkip(sid, ratio, wanted, 'M3.5 pre-step 先压')) return;   // R49/R50：官方事务进行中 ⇒ 让路（意图保留）
+      const compaction = resolveCompactionFor(agent);
+      if (!compaction.service) {
+        /* R15：**未执行**也要留回执——这是模型自检的唯一依据。
+         * R16.1：回执按 sid 存（`verifyBySid`），多会话并发压缩时各自有各自的回执；
+         * `lastCompactVerify` 保留为「最近一次」的全局镜像（HUD/报告口径不变）。 */
+        setCompactVerify(sid, {
+          at: new Date().toISOString(), sessionId: sid, state: 'not-executed',
+          why: 'no-compaction-service', trigger: wanted ? 'context-overflow' : 'pressure', read: false,
+        });
+        log('warn', `M3.5 pre-step 先压：解析不到作用域 compaction，跳过（意图保留待下次）`);
+        return;
+      }
+      /* ═══ R71（F-14 调查结论；真机数字见 milestones R5 一节）═══
+       * 上一段确认了「有 compaction 服务」，但还有一类**不能安全执行**的情形：
+       * `compact-range.mjs` 未就绪（热换/首载的瞬时窗口）⇒ compactWithOwnRange 会回落
+       * `official('no-range-module')` = 官方 compactIfNeeded(agent, 'context-overflow')，而该 trigger 的
+       * retainTokens = 0：R5 真机实测在**仅 53% 占用**时把 surface 从 367,794 砍到 8,603
+       * （nodeCount 1117 → 4，-97.7%）。这条路径的典型场景恰恰是「低占用 + 模型主动请求」——
+       * 本来**完全可以不压**。故：未越强制线且模块未就绪 ⇒ 不压、留 not-executed 回执、
+       * **不消费意图**（下一步模块就绪后自然重试，TTL 兜底）；已越强制线 ⇒ 仍走官方（安全网：
+       * 宁可压，也不能撞窗口被引擎无记录地压）。 */
+      if (ratio < effCritical) {
+        let rangeReady = true;
+        try { rangeReady = !!(await awaitRange()); } catch { rangeReady = false; }
+        if (!rangeReady) {
+          state.m3.rangePendingSkips = (state.m3.rangePendingSkips ?? 0) + 1;
+          setCompactVerify(sid, {
+            at: new Date().toISOString(), sessionId: sid, state: 'not-executed',
+            why: 'range-module-pending', trigger: wanted ? 'context-overflow' : 'pressure', read: false,
+          });
+          log('warn', 'M3.5 pre-step 先压：自选范围模块未就绪且未越强制线 ⇒ 本轮不压（意图保留，下一步重试）');
+          return;
+        }
+      }
+      if (wanted) tool.takeIntent(sid); // F5：确能执行才消费
+      state.m3.preStepActs += 1;
+      const t0 = Date.now();
+      /* R5：trigger 现在只表达**触发原因**；实际执行策略（自选范围/官方兜底）记在 rangeSource。
+       *   - 模型主动请求（wanted）⇒ overflow 语义（原本就是「轮内强制压一次」）
+       *   - 越强制线（forced）  ⇒ pressure 语义（原本就是「无条件兜底压」） */
+      const forced = ratio >= effCritical;
+      const trigger = wanted ? 'context-overflow' : 'pressure';
+      /* R16：档位是**会话级持久偏好**——智能压缩线（工具）与强制线都读同一个偏好；
+       * 未选/未知 ⇒ standard（16%）。这满足用户要求「两线都要有 Agent 参与选档，未选 16% 兜底」。 */
+      const tierName = tool?.getTier?.(sid) ?? 'standard';
+      /* ═══ R21：语义锚点在**此刻**解析（surface 已是最终态）═══
+       * 降级链：text 锚点 → recentUser 锚点 → 失败退 tier（三档兜底）。
+       * 工具侧只登记声明、不解析——因为锚点会随新消息移动，只有压缩这一刻的位置才算数。 */
+      const anchorWant = (() => { try { return tool?.getAnchor?.(sid) ?? null; } catch { return null; } })();
+      /* R23（用户要求「显示一律中文」）：锚点的**中文**描述——回执里显示
+       * 「语义锚点（从最近第 1 条你的消息起）」/「语义锚点（按文本「…」定位）」。
+       * ⚠️ 旧写法直接 slice `anchor:` 后的内部 token（`recent-user`/`text`）⇒ 模型可见文本里露出英文。 */
+      /* R85（F10）：⚠️ 权威实现在 `compact-range.anchorLabelOf`（卡片侧走注入/委托）。
+   * m3 在 `official()` 之外拿不到同步的 range api，故保留同体实现；
+   * contract 有**漂移守卫**：两处对同一 want 的输出必须一致。 */
+  const anchorLabelOf = (want) => {
+        try {
+          if (!want || typeof want !== 'object') return null;
+          if (want.text) return `按文本「${String(want.text).slice(0, 12)}」定位`;
+          if (want.recentUser) return `从最近第 ${Number(want.recentUser)} 条你的消息起`;
+          return '你指定的位置';
+        } catch { return null; }
+      };
+      let anchorInfo = null;
+      if (anchorWant) {
+        try {
+          const rApi = await awaitRange();
+          anchorInfo = typeof rApi?.resolveAnchorBudget === 'function'
+            ? rApi.resolveAnchorBudget({
+              session: agent.session, measurement: mr.measure, want: anchorWant,
+              window: mr.window, textOf: extractEventText,
+            })
+            : { ok: false, reason: 'no-range-module' };
+        } catch (e) { anchorInfo = { ok: false, reason: `anchor-error:${msg(e)}` }; }
+      }
+      /* 无论成败都留痕（静默降级是本项目大忌）：未登记锚点 ⇒ 不写痕（那是常态）。 */
+      if (anchorWant) {
+        state.m3.anchorProbe = {
+          at: new Date().toISOString(),
+          sessionId: sid,
+          want: anchorWant,
+          ok: anchorInfo?.ok === true,
+          via: anchorInfo?.via ?? null,
+          seq: anchorInfo?.seq ?? null,
+          tokens: anchorInfo?.tokens ?? null,
+          margin: anchorInfo?.margin ?? null,
+          budget: anchorInfo?.budget ?? null,
+          clamped: anchorInfo?.clamped || null,
+          tried: anchorInfo?.tried ?? null,
+          reason: anchorInfo?.ok === true ? null : (anchorInfo?.reason ?? 'unknown'),
+        };
+      }
+      log(
+        'info',
+        `M3.5 pre-step 先压开始：${wanted ? '模型主动请求' : '越强制线'}（占用 ${(ratio * 100).toFixed(1)}%，强制线 ${(effCritical * 100).toFixed(1)}%，档位 ${tool?.tierText?.(tierName) ?? tierName}${anchorWant ? `，锚点 ${anchorInfo?.ok ? `生效(${anchorInfo.via}, 保留 ${anchorInfo.budget})` : `未命中(${anchorInfo?.reason ?? '?'}) ⇒ 退档位`}` : ''}，via ${compaction.via}）`,
+      );
+      const out = await compactWithOwnRange(agent, compaction, {
+        forced, sig, sid, window: mr.window, measure: mr.measure, tierName,
+        retainOverride: anchorInfo?.ok ? { budget: anchorInfo.budget, source: `anchor:${anchorInfo.via}`, anchorTokens: anchorInfo.tokens, anchorClamped: anchorInfo.clamped } : null,
+        anchorSeq: anchorInfo?.ok ? anchorInfo.seq : null,
+        anchorFailReason: anchorWant && !anchorInfo?.ok ? (anchorInfo?.reason ?? 'unknown') : null,
+      });
+      let result = out.result;
+      let rangeSource = out.source;
+      let ratioAfter = null;
+      let usedAfter = null;
+      let staleAfter = false;   // R38：刚压完 ⇒ provider 还没刷新（面板行要带提示）
+      /* R24：压缩后的占用**在每条路径上都取值**（原先只在 own 分支取，且没进回执）——
+       * 不报这个数时模型只能拿档位名/保留预算自己猜：真机把「保留 ~240k」读成「回到 24%」，
+       * 而 DSH 表盘当时是 40%（`projectedTokens`）。口径见 measureRatio 的 R24 注释。 */
+      {
+        const mrA = result != null ? measureRatio(agent.session) : mr;
+        if (mrA?.ok) { ratioAfter = mrA.ratio; usedAfter = mrA.used; staleAfter = mrA.stale === true; }
+      }
+      /* 强制线收口（R16 泛化）：**无论档位/触发**，自算压完仍在线之上 ⇒ 追加官方 overflow 再压一次。
+       * 保证「越强制线必定压到线下」这条旧承诺不因换了保留策略（哪怕 Agent 选了 heavy 浅压）而丢失。 */
+      if (rangeSource === 'own' && result != null) {
+        const mr2 = measureRatio(agent.session);
+        if (mr2.ok && mr2.ratio != null && mr2.ratio >= effCritical) {
+          log('info', `M3.5 自选范围（档位 ${tool?.tierText?.(out.tier ?? tierName) ?? (out.tier ?? tierName)}）后占用仍 ${(mr2.ratio * 100).toFixed(1)}% ≥ 强制线 ${(effCritical * 100).toFixed(1)}% ⇒ 追加官方 overflow 收口`);
+          const r2 = await compaction.service.compactIfNeeded(agent, 'context-overflow', sig);
+          if (r2) {
+            result = r2;
+            rangeSource = 'own+official';
+            /* 收口后**再测一次**：否则回执报的是收口前的数（用户就是靠这个数判断「压到哪了」）。 */
+            const mr3 = measureRatio(agent.session);
+            if (mr3?.ok) { ratioAfter = mr3.ratio; usedAfter = mr3.used; }
+          }
+        }
+      }
+      state.m3.preStepOk += 1;
+      /* R45/R46：稳定后预计值**先算成局部量**——回执（verify）与面板行后缀（occupancyActSuffix）共用，
+       * 两处必须是同一个数（单源），否则用户会在两个地方看到不同百分比。 */
+      const settleRec = settleDropAny(sid);   // R50：本会话无样本时给跨会话中位数（带 scope 供回执标明来源）
+      const settledUsed = (Number.isFinite(usedAfter) && settleRec) ? Math.max(0, usedAfter - settleRec.drop) : null;
+      const settledRatio = (settledUsed != null && Number.isFinite(mr.window) && mr.window > 0)
+        ? settledUsed / mr.window : null;
+      /* R15（用户要求「工具完成后进行检查，起码 agent 自己过一遍」）：
+       * 工具只登记、执行在这里 ⇒ **回执由这里产出**，M2 域在下一次注入时把它送给模型。
+       * 这是把「工具回 ok 但实际没执行」变成**模型可见**的唯一手段（2026-10-08 真机踩过：
+       * M3 域加载失败两版，工具一直回 ok/scheduled，压缩一次都没发生，而模型毫无察觉）。 */
+      setCompactVerify(sid, {
+        at: new Date().toISOString(),
+        sessionId: sid,
+        state: result != null ? 'executed' : 'no-need',
+        trigger,
+        tier: out.tier ?? tierName,
+        retainBudget: out.retainBudget ?? null,
+        /* R21：保留来源（anchor:* = 语义锚点生效；tier = 三档兜底）+ 锚点失败原因（写了才有痕）。
+         * R23：`anchorLabel` = 锚点的中文描述（回执直接用它，不再显示 `recent-user`/`text` 这类内部 token）。
+         * R39：`retainBudgetHeur` = 折算后真正交给范围选择的启发式预算；`retainFactor` = 折算因子。 */
+        retainBudgetHeur: out.retainBudgetHeur ?? null,
+        retainFactor: out.retainFactor ?? 1,
+        retainSource: out.retainSource ?? (out.retainBudget != null ? 'tier' : null),
+        anchorLabel: out.retainSource && String(out.retainSource).startsWith('anchor:') ? anchorLabelOf(anchorWant) : null,
+        anchorTokens: out.anchorTokens ?? null,      // R44：锚点→末尾的**启发式** token（未夹取前）
+        anchorClamped: out.anchorClamped ?? null,    // R44：锚点预算是否被 MIN/MAX 夹取过
+        anchorFailReason: out.anchorFailReason ?? null,
+        rangeSource,
+        shadowedTokens: result?.shadowedTokenCount ?? null,
+        /* R24：压缩后占用（DSH 表盘口径 = projectedTokens ?? pressureTokens）——回执要念给模型听。 */
+        ratioAfter: ratioAfter != null ? ratioAfter : null,
+        usedAfter,
+        basis: mr.ok ? mr.basis : null,
+        /* R45：把「稳定后预计」一并写进回执依据——压缩刚完成的 `usedAfter` 是 provider 未刷新的
+         * 投影值（真机 19% ⇒ 稳定后 10%），回执必须给出**预计稳定值**而不是只报中间值。
+         * R46：同一组数也喂给面板行后缀（见下方 occupancyActSuffix 的第三个实参）。 */
+        settleDropTokens: settleRec?.drop ?? null,
+        settleSamples: settleRec?.n ?? 0,
+        /* R50：样本来源——`session` = 本会话实测；`global` = 跨会话中位数（回执必须据此写"参考其他会话"）。 */
+        settleScope: settleRec?.scope ?? null,
+        settledUsed,
+        settledRatio,
+        skipWhy: out.skipWhy ?? null,
+        officialWhy: out.officialWhy ?? null,
+        ms: Date.now() - t0,
+        read: false, // M2 域读到后置 true（一次性回执）
+      });
+      /* R45：刚压完 ⇒ 挂「稳定观察」——下一次**非 stale** 实测里量出真实回落量（见 noteCompactSettle）。
+       * 只在 stale（provider 未刷新）时挂：那时值会回落，正是要量的对象。R50：改由事实账本挂（含落盘）。 */
+      if (Number.isFinite(usedAfter) && staleAfter) armSettleWatch(sid, usedAfter, ratioAfter);
+      /* R5 取证口径：rangeSource 说明**实际用了哪条保留策略**（own=自选范围 / official=官方 overflow 兜底 /
+       * own+official=自选后仍越线再收口 / none=判定无需压）。retainBudget 是自选预算（token）。 */
+      const rangeInfo = {
+        rangeSource,
+        tier: out.tier ?? tierName,
+        retainBudget: out.retainBudget ?? null,
+        retainBudgetHeur: out.retainBudgetHeur ?? null,   // R39：折算后（启发式口径）
+        retainFactor: out.retainFactor ?? 1,             // R39：真实口径折算因子
+        retainSource: out.retainSource ?? null,
+        anchorTokens: out.anchorTokens ?? null,          // R44：锚点段启发式 token（夹取前）
+        anchorClamped: out.anchorClamped ?? null,        // R44：锚点预算被下限抬过？
+        anchorFailReason: out.anchorFailReason ?? null,
+        walkBacks: out.walkBacks ?? 0,
+        skipWhy: out.skipWhy ?? null,
+        officialWhy: out.officialWhy ?? null,
+        ratioAfter: ratioAfter != null ? +(ratioAfter * 100).toFixed(1) : null,
+        ownRange: out.range ?? null,
+      };
+      if (wanted) {
+        state.m3.compactIntents += 1;
+        state.m3.lastCompactIntent = {
+          at: new Date().toISOString(),
+          sessionId: sid,
+          reason: intent?.reason || null,
+          ratio: +(ratio * 100).toFixed(1),
+          trigger,
+          acted: result != null,
+          shadowedTokens: result?.shadowedTokenCount ?? null,
+          ms: Date.now() - t0,
+          ...rangeInfo,
+        };
+      }
+      state.m3.lastPreStep = {
+        at: new Date().toISOString(),
+        sessionId: sid,
+        trigger,
+        ratio: +(ratio * 100).toFixed(1),
+        acted: result != null,
+        shadowedTokens: result?.shadowedTokenCount ?? null,
+        range: result?.shadowedRange ?? null,
+        ms: Date.now() - t0,
+        ...rangeInfo,
+      };
+      if (result) {
+        /* D8/F13（R7 审查修）：HUD 文案必须用**真实触发原因**——原先写死 `'pressure'`，
+         * 于是「模型主动请求压缩」在弹窗与 hud-acts 里被标成「强制压缩」，与实际动机不符
+         * （而 `lastPreStep.trigger` 记的是真值 ⇒ 同一件事两个说法）。 */
+        const __t = formatAct(trigger, result?.shadowedTokenCount)
+          + occupancyActSuffix(ratioAfter, staleAfter, settledRatio)
+          + anchorActSuffix(out.retainSource, out.retainBudget, out.anchorTokens, out.anchorClamped);
+        publishHud({ hudLastAct: __t }); // M5
+        recordHudAct(sid, __t);
+        clearBriefed(sid); // R1：同 idle 路径——压缩后一次性说明需重讲
+      }
+      log(
+        'info',
+        `M3.5 pre-step 先压完成（${Date.now() - t0}ms）：${
+          result ? `shadowed ~${nfmt(result.shadowedTokenCount ?? 0)} tokens（seq ${result.shadowedRange?.start ?? '?'}-${result.shadowedRange?.end ?? '?'}）` : '引擎判定无需压（null）'
+        }`,
+      );
+      schedule('m3.5-prestep', 500);
+    } catch (e) {
+      const code = errCodeOf(e);
+      state.m3.preStepErrors[code] = (state.m3.preStepErrors[code] ?? 0) + 1;
+      /* R15：失败同样留回执（模型要能看见「未执行 + 原因」）。R49.1：`sid` 已提到 try 之外 ⇒ 这里安全。 */
+      setCompactVerify(sid, { at: new Date().toISOString(), sessionId: sid, state: 'not-executed', why: code, trigger: wanted ? 'context-overflow' : 'pressure', read: false });
+      /* R75（审查 E3）：意图早在执行前就被 takeIntent 消费 ⇒ 失败后原地**重挂一次**，
+       * 让"重试"成为系统行为（上限 1 次，见 compact-tool.rearmIntent）。 */
+      if (wanted) {
+        try { getCompactTool()?.rearmIntent?.(sid, 'execute-failed'); } catch { /* 吞 */ }
+      }
+      /* ⚠️ 2026-10-08：此前**只记错误码、错误正文只进 log**——压缩全线失败（preStepOk=0）
+       * 时报告里看不到原因，无法定位。现保留最近一次失败的完整信息。 */
+      state.m3.lastPreStepError = {
+        at: new Date().toISOString(),
+        code,
+        message: String(msg(e)).slice(0, 400),
+        name: e?.name ?? null,
+        stack: String(e?.stack ?? '').split('\n').slice(0, 3).join(' | ').slice(0, 400),
+      };
+      log('warn', `M3.5 pre-step 先压失败（吞掉，本轮照常继续）：${msg(e)}`);
+      schedule('m3.5-prestep', 500);
+    }
+  };
+
+  /* ═══════════ M3-b：idle 安全网（R7 起**只剩一种模式**） ═══════════
+   * 会话被撂在高占用（≥ 生效强制线）→ idle 时兜底清场，受 sweepMinIntervalMs 冷却。
+   * ⚠️ 原来的第二模式 `marker`（模型回复尾行标记 → idle 立即压缩）已随 marker 通道整体退役：
+   *    压缩现在由模型调用工具 `compact_context` 在**轮内**完成，idle 路径不再承担「模型请求」职责。 */
+  const sweepInFlight = new Set();
+  const idleSweep = (agent) => {
+    try {
+      if (!effEnabled()) return; // 总开关活读（演习模式已随 2026-10-07 面板精简退役：压缩路径无影子模式）
+      const sid = String(pick(agent?.session?.id, agent?.id, 'unknown'));
+      if (sweepInFlight.has(sid)) return;
+      const mr = measureRatio(agent?.session); // idle：只看占用比，任务文本无关
+      if (!mr.ok || mr.ratio == null) return;
+      const now = Date.now();
+      /* C-own：safety-net 同样钳到「引擎阈值 − 5pp」之下（同 pre-step，理由见 threshold.mjs） */
+      if (mr.ratio < effectiveCriticalOf(agent)) return; // R75（E1）：与 pre-step/教学同一份计算
+      if (now - (state.m3.sweeps[sid] ?? 0) < M3.sweepMinIntervalMs) return; // 兜底受冷却限制
+      if (lockSkip(sid, mr.ratio, false, 'M3 idle 扫除')) return;   // R49/R50：同 pre-step（不消耗冷却，下次还能补）
+      const reason = 'safety-net';
+      const compaction = resolveCompactionFor(agent);
+      if (!compaction.service) {
+        log('warn', `M3 idle 扫除：解析不到作用域 compaction（${JSON.stringify(compaction.probe)}）`);
+        return;
+      }
+      state.m3.acts += 1;
+      log('info', `M3 idle 扫除（${reason}）：compactNow（ratio ${(mr.ratio * 100).toFixed(1)}%，via ${compaction.via}）`);
+      /* ⚠️ F2（R7 审查修）：`add` 必须**紧贴** promise 链。原顺序是 add → 取冷却 → log → compactNow，
+       * 这段同步代码里任何抛错（审计窗口内真的发生过：日志模板引用了已删变量）都会让 sid 永久驻留
+       * `sweepInFlight` ⇒ 该会话**永久失去 idle 安全网**，而且没有任何显式日志。
+       * 现在：「可能抛的语句」全在 add 之前，add 之后立即注册 `.finally` ⇒ 结构上不存在这个窗口。
+       * ⚠️ F1（同批修）：冷却 `state.m3.sweeps[sid]` 改为**只在成功分支**记录——原实现发起前就记，
+       * 一次失败即消耗掉 `sweepMinIntervalMs`（默认 10 分钟）安全网。 */
+      sweepInFlight.add(sid);
+      markOwnCompaction(sid);
+      compaction.service
+        .compactNow(agent, AbortSignal.timeout(COMPACT_TIMEOUT_MS), 'context-pilot')
+        .then((result) => {
+          state.m3.sweeps[sid] = Date.now(); // F1：成功才记冷却
+          /* C4（审查）：`sweeps` 以 sid 为键且从不清理 ⇒ 有界化（只用于冷却判定，淘汰无害）。 */
+          const sweepKeys = Object.keys(state.m3.sweeps);
+          if (sweepKeys.length > SET_CAP) {
+            const oldest = sweepKeys.reduce((a, b) => (state.m3.sweeps[a] <= state.m3.sweeps[b] ? a : b));
+            if (oldest !== sid) delete state.m3.sweeps[oldest];
+          }
+          state.m3.actOk += 1;
+          state.m3.lastAct = {
+            at: new Date().toISOString(),
+            sessionId: sid,
+            reason,
+            via: compaction.via,
+            shadowedNodes: result?.shadowedSeqs?.length ?? null,
+            shadowedTokens: result?.shadowedTokenCount ?? null,
+            range: result?.shadowedRange ?? null,
+          };
+          const mrI = measureRatio(agent.session);   // R38：idle 路径同样报「压后占用」（带 stale 提示）
+          const __actText = formatAct(reason, result?.shadowedTokenCount) + occupancyActSuffix(mrI?.ok ? mrI.ratio : null, mrI?.stale, settledRatioOf(sid, mrI));
+          publishHud({ hudLastAct: __actText }); // M5
+          recordHudAct(sid, __actText);
+          /* R1：压缩成功 ⇒ 一次性说明（压缩流程 + 智能思考教学）已随旧对话被收走，
+           * 清除「已讲」标记让下一轮重讲一次（否则模型永久失去用法说明）。 */
+          clearBriefed(sid);
+          /* ❌ R4（2026-10-08）**已删除伪造恢复消息**（用户明确要求：「自动压缩时，不用伪造一条
+           * 我的信息重新拉起会话」）。原实现 `maybeResumeAfterMarker` → `resumeViaAnyChannel`
+           * 会走 `sessionController.prompt(...)`，其内部是
+           * `createUserMessage({content, source:{kind:'user'}})` + `agent.followup` ⇒
+           * 等于**替用户发言**。
+           * 现在改由工具 `compact_context` 在轮内完成压缩（见 preStepCompaction），
+           * 本轮自然继续，**不需要任何消息**；若模型没有主动请求，idle 压缩就只是收尾动作
+           * （占用已降，用户下一轮直接继续即可）。 */
+          log('info', `M3 idle 扫除完成：${result ? `shadowed ${result.shadowedSeqs?.length ?? '?'} nodes / ~${result.shadowedTokenCount ?? '?'} tokens` : 'null（无可压区间）'}`);
+          schedule('m3-act', 500);
+        })
+        .catch((e) => {
+          const code = errCodeOf(e);
+          state.m3.actErrors[code] = (state.m3.actErrors[code] ?? 0) + 1;
+          /* ⚠️ 2026-10-08：同 pre-step——错误正文此前只进 log，报告只见错误码
+           * （实测 actErrors={summary:2} 而 actOk=0，无从定位）。现保留最近一次失败详情。 */
+          state.m3.lastActError = {
+            at: new Date().toISOString(),
+            code,
+            reason,
+            message: String(msg(e)).slice(0, 400),
+            name: e?.name ?? null,
+            stack: String(e?.stack ?? '').split('\n').slice(0, 3).join(' | ').slice(0, 400),
+          };
+          log('warn', `M3 idle 扫除失败（${code}）：${msg(e)}`);
+          schedule('m3-act', 500);
+        })
+        .finally(() => { clearOwnCompaction(sid); sweepInFlight.delete(sid); });
+    } catch (e) {
+      log('warn', `M3 idle 扫除异常（吞）：${msg(e)}`);
+    }
+  };
+
+  return { measureRatio, compactWithOwnRange, preStepCompaction, idleSweep, effectiveCriticalOf, setCompactVerify, takeCompactVerify, isCompactionInFlight, noteEngineCompaction, noteRetainFactor, retainFactorOf, noteCompactSettle, settleDropOf, settleDropAny, noteSessionEvent, compactionLockActive, currentRouteOf };
+}
