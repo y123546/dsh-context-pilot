@@ -7,14 +7,14 @@
     "dsh": ">=0.2.0-rc.2 <0.3.0-0"
   },
   "license": "MIT",
-  "author": "Shuffle-1992",
-  "homepage": "https://github.com/Shuffle-1992/dsh-context-pilot#readme",
+  "author": "y123546",
+  "homepage": "https://github.com/y123546/dsh-context-pilot#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Shuffle-1992/dsh-context-pilot.git"
+    "url": "git+https://github.com/y123546/dsh-context-pilot.git"
   },
   "bugs": {
-    "url": "https://github.com/Shuffle-1992/dsh-context-pilot/issues"
+    "url": "https://github.com/y123546/dsh-context-pilot/issues"
   },
   "keywords": [
     "dsh-plugin",

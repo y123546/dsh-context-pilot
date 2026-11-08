@@ -48,7 +48,7 @@
 
 ```bash
 # 从 GitHub 仓库安装（本项目**不分发 npm 包**，这是推荐路径；pnpm 规格）
-dsh plugin --profile web add github:Shuffle-1992/dsh-context-pilot
+dsh plugin --profile web add github:y123546/dsh-context-pilot
 ```
 
 > **分发方式（2026-10-10 决定）**：**不发布 npm**。安装一律走上面的 GitHub 仓库规格；

@@ -308,7 +308,7 @@ ok('README 含可直接复制的安装命令（市场要求）',
 /* 2026-10-10 决定：**不发布 npm** ⇒ 分发走 GitHub 仓库，README 必须给出 git 规格，
  * 且不得让读者以为存在 npm 包（否则照抄 `add dsh-context-pilot` 会装不上）。 */
 ok('分发路径一致：README 给出 **git 规格**安装命令，且明确「不发布 npm」',
-  /dsh plugin --profile \w+ add github:Shuffle-1992\/dsh-context-pilot/.test(readmeSrc)
+  /dsh plugin --profile \w+ add github:y123546\/dsh-context-pilot/.test(readmeSrc)
     && /不发布 npm/.test(readmeSrc),
   'README 未给 git 规格或未声明「不发布 npm」⇒ 与实际分发方式不符');
 ok('LICENSE 文件存在且与清单声明一致',
